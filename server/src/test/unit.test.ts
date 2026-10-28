@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { countryFromPhone, marketFromPhone, normalizePhone } from '../lib/phone.js';
 import { decrypt, encrypt } from '../lib/crypto.js';
 import { renderPlaceholders, resolveParams, audienceWhere } from '../services/broadcasts.js';
-import { isWithinBusinessHours, matchOption, resolveMenu } from '../services/automation.js';
+import { fitTitle, isWithinBusinessHours, matchOption, resolveMenu } from '../services/automation.js';
 import { buildTemplateComponents, renderTemplateText, templateSchema, variablesIn } from '../services/templates.js';
 import { buildCreateComponents } from '../routes/templates.js';
 import { normalizeCategory } from '../services/credits.js';
@@ -115,6 +115,11 @@ describe('automation helpers', () => {
     expect(isWithinBusinessHours(hours, 'America/Mexico_City', new Date('2026-10-26T16:00:00Z'))).toBe(true);
     expect(isWithinBusinessHours(hours, 'America/Mexico_City', new Date('2026-10-27T02:00:00Z'))).toBe(false);
     expect(isWithinBusinessHours(hours, 'America/Mexico_City', new Date('2026-10-25T16:00:00Z'))).toBe(false);
+  });
+  it('fits WhatsApp button titles at word boundaries', () => {
+    expect(fitTitle('Hablar con un asesor', 20)).toBe('Hablar con un asesor');
+    expect(fitTitle('Quiero información / precios', 20)).toBe('Quiero información…');
+    expect(fitTitle('Supercalifragilisticoespialidoso', 20)).toHaveLength(20);
   });
   it('matches menu options by key, label and accents', () => {
     const menu = { prompt: 'x', options: [{ key: '1', label: 'Información', submenu: { prompt: 'y', options: [{ key: '1', label: 'Precios' }] } }, { key: '2', label: 'Soporte' }] };

@@ -9,13 +9,15 @@
     "web"
   ],
   "scripts": {
-    "dev": "npm run dev -w server & npm run dev -w web",
+    "dev": "npm run dev:server & npm run dev:web",
+    "dev:server": "tsx watch server/src/index.ts",
+    "dev:web": "npm run dev -w web",
     "build": "npm run build -w web && npm run build -w server",
-    "start": "npm start -w server",
+    "start": "node server/dist/index.js",
     "test": "npm test -w server",
     "typecheck": "npm run typecheck -w server && npm run typecheck -w web"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.12"
   }
 }

@@ -1,0 +1,6 @@
+# Caddy obtiene y renueva el certificado HTTPS automáticamente (Let's Encrypt).
+# Meta exige HTTPS válido para el webhook de WhatsApp.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy app:3000
+}

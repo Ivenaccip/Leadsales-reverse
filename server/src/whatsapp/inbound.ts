@@ -213,6 +213,16 @@ export async function processInboundMessage(ctx: AppContext, channel: ChannelRow
   return inserted;
 }
 
+// Delivery/read statuses of a campaign arrive by the thousands: refresh viewers at most every 2 s.
+const broadcastNotifyAt = new Map<string, number>();
+function notifyBroadcastProgress(ctx: AppContext, workspaceId: string, broadcastId: string) {
+  const now = Date.now();
+  if (now - (broadcastNotifyAt.get(broadcastId) ?? 0) < 2000) return;
+  broadcastNotifyAt.set(broadcastId, now);
+  if (broadcastNotifyAt.size > 1000) broadcastNotifyAt.clear();
+  ctx.realtime.emit(workspaceId, 'broadcast:update', { id: broadcastId });
+}
+
 /** Returns false when the message is unknown (not sent by LeadLibre, or not stored yet). */
 export async function processStatus(ctx: AppContext, channel: ChannelRow, st: any): Promise<boolean> {
   const { rows } = await ctx.db.query<MessageRow & { phone: string }>(
@@ -258,6 +268,7 @@ export async function processStatus(ctx: AppContext, channel: ChannelRow, st: an
   });
   if (updated) {
     ctx.realtime.emit(channel.workspace_id, 'message:update', updated);
+    if (updated.broadcast_id) notifyBroadcastProgress(ctx, channel.workspace_id, updated.broadcast_id);
     await dispatchWebhook(ctx, channel.workspace_id, 'message.status', {
       id: updated.id,
       wamid: updated.wamid,

@@ -22,7 +22,7 @@ export const DEFAULT_SETTINGS: Required<Pick<WorkspaceSettings, 'automation_mode
     menu: {
       prompt: '¡Hola! Soy el asistente virtual. ¿En qué te podemos ayudar? Responde con el número de la opción:',
       options: [
-        { key: '1', label: 'Quiero información / precios', reply: 'Con gusto. Un asesor te compartirá la información en breve.', handoff: true },
+        { key: '1', label: 'Quiero información', reply: 'Con gusto. Un asesor te compartirá la información en breve.', handoff: true },
         { key: '2', label: 'Ya soy cliente', reply: '¡Gracias por tu preferencia! Cuéntanos en qué te ayudamos.', handoff: true },
         { key: '3', label: 'Hablar con un asesor', handoff: true },
       ],
@@ -99,6 +99,14 @@ export async function handleInboundAutomation(
 
 const RESET_WORDS = new Set(['0', 'menu', 'menú', 'inicio', 'volver']);
 
+/** WhatsApp limits button (20) and list row (24) titles: cut at a word boundary with an ellipsis. */
+export function fitTitle(label: string, max: number): string {
+  if (label.length <= max) return label;
+  const cut = label.slice(0, max - 1);
+  const space = cut.lastIndexOf(' ');
+  return `${(space > max / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
 function norm(s: string): string {
   return s
     .toLowerCase()
@@ -142,12 +150,12 @@ async function sendMenu(ctx: AppContext, ws: WorkspaceRow, contact: ContactRow, 
         interactive: {
           type: 'button',
           body: { text: prompt.slice(0, 1024) },
-          action: { buttons: menu.options.map((o) => ({ type: 'reply', reply: { id: o.key, title: o.label.slice(0, 20) } })) },
+          action: { buttons: menu.options.map((o) => ({ type: 'reply', reply: { id: o.key, title: fitTitle(o.label, 20) } })) },
         },
       },
     });
   } else if (interactive && menu.options.length + (nested ? 1 : 0) <= 10) {
-    const rows = menu.options.map((o) => ({ id: o.key, title: o.label.slice(0, 24), ...(o.label.length > 24 ? { description: o.label.slice(0, 72) } : {}) }));
+    const rows = menu.options.map((o) => ({ id: o.key, title: fitTitle(o.label, 24), ...(o.label.length > 24 ? { description: o.label.slice(0, 72) } : {}) }));
     if (nested) rows.push({ id: '0', title: 'Menú principal' });
     await sendMessage(ctx, {
       ...base,

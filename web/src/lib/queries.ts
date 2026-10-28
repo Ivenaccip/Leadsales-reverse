@@ -1,0 +1,64 @@
+import { useQuery } from '@tanstack/react-query';
+import { api } from './api';
+import type { Channel, Funnel, Member, QuickReply, Tag, Template, Workspace } from './types';
+
+/** Shared reference data used across pages (cached by React Query). */
+
+export function useWorkspace() {
+  return useQuery({
+    queryKey: ['workspace'],
+    queryFn: () => api.get<{ workspace: Workspace; role: string; ai_models: { id: string; label: string }[] }>('/api/workspace'),
+  });
+}
+
+export function useFunnels() {
+  return useQuery({ queryKey: ['funnels'], queryFn: async () => (await api.get<{ funnels: Funnel[] }>('/api/funnels')).funnels });
+}
+
+export function useTags() {
+  return useQuery({ queryKey: ['tags'], queryFn: async () => (await api.get<{ tags: Tag[] }>('/api/tags')).tags });
+}
+
+export function useMembers() {
+  return useQuery({ queryKey: ['members'], queryFn: async () => (await api.get<{ members: Member[] }>('/api/workspace/members')).members });
+}
+
+export function useChannels() {
+  return useQuery({ queryKey: ['channels'], queryFn: async () => (await api.get<{ channels: Channel[] }>('/api/channels')).channels });
+}
+
+export function useTemplates(channelId?: string) {
+  return useQuery({
+    queryKey: ['templates', channelId ?? 'all'],
+    queryFn: async () => (await api.get<{ templates: Template[] }>(`/api/templates${channelId ? `?channel_id=${channelId}` : ''}`)).templates,
+  });
+}
+
+export function useQuickReplies() {
+  return useQuery({
+    queryKey: ['quick-replies'],
+    queryFn: async () => (await api.get<{ quick_replies: QuickReply[] }>('/api/quick-replies')).quick_replies,
+  });
+}
+
+export function useCredits() {
+  return useQuery({
+    queryKey: ['credits'],
+    queryFn: () =>
+      api.get<{
+        billing_mode: 'meta_direct' | 'prepaid';
+        balance: number;
+        spent_this_month: number;
+        spent_total: number;
+        billable_messages_this_month: number;
+        by_category: { category: string; messages: number; cost: number }[];
+      }>('/api/credits'),
+  });
+}
+
+/** Lookup helpers. */
+export function stageMap(funnels: Funnel[] | undefined) {
+  const m = new Map<string, { stage: Funnel['stages'][number]; funnel: Funnel }>();
+  for (const f of funnels ?? []) for (const s of f.stages) m.set(s.id, { stage: s, funnel: f });
+  return m;
+}

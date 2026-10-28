@@ -1,0 +1,57 @@
+# LeadLibre: CRM de WhatsApp (API oficial de Meta) sin mensualidad.
+#
+#   cp .env.example .env    # edita PUBLIC_URL y contraseñas
+#   docker compose up -d                      # app + PostgreSQL
+#   docker compose --profile https up -d      # + Caddy con HTTPS automático (requiere DOMAIN)
+#
+services:
+  app:
+    build: .
+    image: leadlibre:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://leadlibre:${POSTGRES_PASSWORD:-leadlibre}@db:5432/leadlibre
+      DATA_DIR: /data
+    volumes:
+      - leadlibre-data:/data
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: leadlibre
+      POSTGRES_USER: leadlibre
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-leadlibre}
+    volumes:
+      - leadlibre-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leadlibre -d leadlibre"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?Define DOMAIN en .env para usar HTTPS}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - app
+
+volumes:
+  leadlibre-data:
+  leadlibre-db:
+  caddy-data:

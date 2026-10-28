@@ -1,5 +1,9 @@
+import fs from 'node:fs';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
+
+// Local runs: read .env from the working directory (Docker passes variables directly).
+if (fs.existsSync('.env')) process.loadEnvFile('.env');
 
 const config = loadConfig();
 const built = await buildApp(config);

@@ -115,14 +115,22 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
   io.on('connection', (socket) => {
     socket.on('join', async (workspaceId: string, ack?: (r: { ok: boolean }) => void) => {
       try {
-        const { rows } = await db.query(
-          `SELECT 1 FROM memberships m WHERE m.workspace_id = $1 AND m.user_id = $2 AND m.is_active
-           UNION SELECT 1 FROM users u WHERE u.id = $2 AND u.is_superadmin`,
+        if (typeof workspaceId !== 'string' || !/^[0-9a-f-]{36}$/i.test(workspaceId)) return ack?.({ ok: false });
+        const { rows } = await db.query<{ role: string | null; visibility: string | null; is_superadmin: boolean }>(
+          `SELECT m.role, w.settings->>'agent_visibility' AS visibility, u.is_superadmin
+           FROM users u JOIN workspaces w ON w.id = $1
+           LEFT JOIN memberships m ON m.workspace_id = w.id AND m.user_id = u.id AND m.is_active
+           WHERE u.id = $2`,
           [workspaceId, socket.data.userId],
         );
-        if (!rows[0]) return ack?.({ ok: false });
+        const r = rows[0];
+        if (!r || (!r.role && !r.is_superadmin)) return ack?.({ ok: false });
         for (const room of socket.rooms) if (room.startsWith('ws:')) socket.leave(room);
-        socket.join(`ws:${workspaceId}`);
+        if (r.role === 'agent' && r.visibility === 'assigned') {
+          socket.join([`ws:${workspaceId}:restricted`, `ws:${workspaceId}:u:${socket.data.userId}`]);
+        } else {
+          socket.join(`ws:${workspaceId}`);
+        }
         ack?.({ ok: true });
       } catch {
         ack?.({ ok: false });
@@ -130,6 +138,10 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
     });
   });
   realtime.io = io;
+  realtime.resolveAssignee = async (contactId) => {
+    const { rows } = await db.query<{ assigned_user_id: string | null }>(`SELECT assigned_user_id FROM contacts WHERE id = $1`, [contactId]);
+    return rows[0] ? rows[0].assigned_user_id : null;
+  };
 
   return {
     app,
