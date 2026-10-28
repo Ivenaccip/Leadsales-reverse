@@ -26,6 +26,22 @@ export class Realtime {
     void this.emitRestricted(workspaceId, event, data).catch(() => {});
   }
 
+  /**
+   * Drops a member's (or everyone's) sockets from the workspace rooms and asks the client
+   * to join again, so permission changes (removal, deactivation, visibility) apply at once.
+   */
+  async evict(workspaceId: string, userId?: string): Promise<void> {
+    if (!this.io) return;
+    for (const room of [`ws:${workspaceId}`, `ws:${workspaceId}:restricted`]) {
+      const sockets = await this.io.in(room).fetchSockets();
+      for (const s of sockets) {
+        if (userId && s.data.userId !== userId) continue;
+        for (const r of s.rooms) if (r.startsWith(`ws:${workspaceId}`)) s.leave(r);
+        s.emit('session:refresh', { workspaceId });
+      }
+    }
+  }
+
   private async emitRestricted(workspaceId: string, event: string, data: any) {
     const restricted = `ws:${workspaceId}:restricted`;
     const scoped = /^(contact|message|scheduled):/.test(event);

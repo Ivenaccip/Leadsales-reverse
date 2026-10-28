@@ -65,6 +65,8 @@ export async function getMessage(ctx: AppContext, workspaceId: string, id: strin
  * (status = failed) and the returned row carries the error, so the chat shows it.
  */
 export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<MessageRow> {
+  const ws = await ctx.db.query<{ is_active: boolean }>(`SELECT is_active FROM workspaces WHERE id = $1`, [o.workspaceId]);
+  if (!ws.rows[0]?.is_active) throw new AppError(403, 'WORKSPACE_SUSPENDED', 'Este espacio de trabajo está suspendido');
   const contact = await getContact(ctx.db, o.workspaceId, o.contactId);
   const channel = await getChannel(ctx.db, o.workspaceId, o.channelId ?? contact.channel_id);
   const provider = providerFor(ctx, channel);
@@ -173,24 +175,35 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
   });
   ctx.realtime.emit(o.workspaceId, 'message:new', msg);
 
-  let final: MessageRow;
+  // Only Meta's answer decides success or failure: errors after a successful send
+  // (DB, webhooks) must never mark a delivered message as failed and refund it.
+  let wamid: string | null = null;
+  let sendError: any = null;
   try {
-    const { wamid } = await provider.send(contact.wa_id ?? contact.phone, wa, o.replyToWamid ?? undefined);
+    ({ wamid } = await provider.send(contact.wa_id ?? contact.phone, wa, o.replyToWamid ?? undefined));
+  } catch (err) {
+    sendError = err;
+  }
+
+  let final: MessageRow;
+  if (wamid) {
     const { rows } = await ctx.db.query<MessageRow>(
       `UPDATE messages SET wamid = $2, status = CASE WHEN status = 'pending' THEN 'sent' ELSE status END, status_updated_at = now()
        WHERE id = $1 RETURNING *`,
       [msg.id, wamid],
     );
     final = rows[0];
-    await dispatchWebhook(ctx, o.workspaceId, 'message.sent', { ...final, contact_phone: contact.phone });
-  } catch (err: any) {
-    const code = err instanceof MetaApiError ? err.code : null;
+    await dispatchWebhook(ctx, o.workspaceId, 'message.sent', { ...final, contact_phone: contact.phone }).catch((err) =>
+      ctx.log.warn({ err: (err as Error).message }, 'message.sent webhook dispatch failed'),
+    );
+  } else {
+    const code = sendError instanceof MetaApiError ? sendError.code : null;
     const error = {
       code,
-      title: err?.message ?? 'Error',
-      message: explainMetaError(code, err?.message ?? 'No se pudo enviar el mensaje'),
+      title: sendError?.message ?? 'Error',
+      message: explainMetaError(code, sendError?.message ?? 'No se pudo enviar el mensaje'),
     };
-    ctx.log.warn({ err: err?.message, code, contactId: contact.id }, 'send failed');
+    ctx.log.warn({ err: sendError?.message, code, contactId: contact.id }, 'send failed');
     final = await ctx.db.tx(async (q) => {
       const { rows } = await q.query<MessageRow>(
         `UPDATE messages SET status = 'failed', error = $2, cost = 0, pricing_reconciled = true, status_updated_at = now()

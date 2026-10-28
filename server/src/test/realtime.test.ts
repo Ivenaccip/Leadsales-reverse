@@ -78,5 +78,13 @@ describe('realtime isolation', () => {
     expect(texts(anaRt)).toEqual(expect.arrayContaining(['secreto de Ana', 'sin asignar']));
     expect(texts(betoRt)).toContain('sin asignar');
     expect(texts(betoRt)).not.toContain('secreto de Ana');
+
+    // Removing Beto from the team cuts his live feed immediately.
+    await env.api('DELETE', `/api/workspace/members/${beto.id}`);
+    await sleep(300);
+    await env.api('POST', `/api/channels/${channelId}/simulate`, { from: '5215533337777', text: 'después de quitarlo' });
+    await sleep(300);
+    expect(texts(betoRt)).not.toContain('después de quitarlo');
+    expect(texts(ownerRt)).toContain('después de quitarlo');
   });
 });

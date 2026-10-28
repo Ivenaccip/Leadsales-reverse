@@ -35,7 +35,8 @@ async function deliverWebhook(ctx: AppContext, p: { endpointId: string; event: s
   let error: string | null = null;
   try {
     await assertPublicUrl(ep.url, ctx.config.allowPrivateWebhooks);
-    const res = await ctx.fetch(ep.url, {
+    const res = await ctx.webhookFetch(ep.url, {
+      redirect: 'manual',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -47,19 +48,20 @@ async function deliverWebhook(ctx: AppContext, p: { endpointId: string; event: s
       signal: AbortSignal.timeout(10_000),
     });
     status = res.status;
-    if (!res.ok) error = `HTTP ${res.status}`;
+    if (res.status >= 300 && res.status < 400) error = `HTTP ${res.status}: las redirecciones no se siguen; usa la URL final`;
+    else if (!res.ok) error = `HTTP ${res.status}`;
   } catch (err: any) {
     error = String(err?.message ?? err);
   }
   await ctx.db.query(`UPDATE webhook_endpoints SET last_status = $2, last_error = $3 WHERE id = $1`, [ep.id, status || null, error]);
   if (error) {
-    if (status >= 400 && status < 500 && status !== 429) throw new PermanentJobError(error);
+    if ((status >= 300 && status < 500 && status !== 429) || /red privada/.test(error)) throw new PermanentJobError(error);
     throw new Error(error);
   }
 }
 
 export const jobHandlers: Record<string, JobHandler> = {
-  'wa.webhook': (ctx, p, job) => processWebhook(ctx, p.body, job),
+  'wa.webhook': (ctx, p, job) => processWebhook(ctx, p.body, job, Array.isArray(p.channelIds) ? p.channelIds : null),
   'media.download': (ctx, p) => downloadMedia(ctx, p),
   'automation.inbound': (ctx, p) => handleInboundAutomation(ctx, p),
   'ai.reply': (ctx, p) => runAiReply(ctx, p),

@@ -47,6 +47,7 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
       [id, body.billing_mode ?? null, body.is_active ?? null],
     );
     if (!rows[0]) throw badRequest('Espacio no encontrado');
+    if (body.is_active === false) await ctx.realtime.evict(id);
     return { workspace: rows[0] };
   });
 

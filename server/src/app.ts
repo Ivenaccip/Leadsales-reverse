@@ -13,6 +13,7 @@ import { Queue } from './jobs/queue.js';
 import { Worker } from './jobs/worker.js';
 import { readCookie, verifyToken } from './lib/auth.js';
 import { AppError } from './lib/errors.js';
+import { createWebhookFetch } from './lib/net.js';
 import { Realtime } from './realtime.js';
 import { adminRoutes } from './routes/admin.js';
 import { authRoutes } from './routes/auth.js';
@@ -37,12 +38,20 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
   const app = Fastify({
     logger: opts.logger === false ? false : { level: config.logLevel },
     bodyLimit: 12 * 1024 * 1024,
-    trustProxy: true,
+    trustProxy: config.trustProxy as any,
   });
   const db = opts.db ?? (await createDb({ databaseUrl: config.databaseUrl, dataDir: config.dataDir }));
   const queue = new Queue(db);
   const realtime = new Realtime();
-  const ctx: AppContext = { config, db, queue, realtime, log: app.log, fetch: opts.fetch ?? fetch };
+  const ctx: AppContext = {
+    config,
+    db,
+    queue,
+    realtime,
+    log: app.log,
+    fetch: opts.fetch ?? fetch,
+    webhookFetch: opts.fetch ?? createWebhookFetch(config.allowPrivateWebhooks),
+  };
   const worker = new Worker(ctx, jobHandlers);
 
   // JSON parser that keeps the raw body for Meta's signature check and accepts empty bodies.
@@ -116,15 +125,18 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
     socket.on('join', async (workspaceId: string, ack?: (r: { ok: boolean }) => void) => {
       try {
         if (typeof workspaceId !== 'string' || !/^[0-9a-f-]{36}$/i.test(workspaceId)) return ack?.({ ok: false });
-        const { rows } = await db.query<{ role: string | null; visibility: string | null; is_superadmin: boolean }>(
-          `SELECT m.role, w.settings->>'agent_visibility' AS visibility, u.is_superadmin
+        const { rows } = await db.query<{ role: string | null; visibility: string | null; is_superadmin: boolean; ws_active: boolean }>(
+          `SELECT m.role, w.settings->>'agent_visibility' AS visibility, u.is_superadmin, w.is_active AS ws_active
            FROM users u JOIN workspaces w ON w.id = $1
            LEFT JOIN memberships m ON m.workspace_id = w.id AND m.user_id = u.id AND m.is_active
            WHERE u.id = $2`,
           [workspaceId, socket.data.userId],
         );
         const r = rows[0];
-        if (!r || (!r.role && !r.is_superadmin)) return ack?.({ ok: false });
+        if (!r || (!r.is_superadmin && (!r.role || !r.ws_active))) {
+          for (const room of socket.rooms) if (room.startsWith(`ws:${workspaceId}`)) socket.leave(room);
+          return ack?.({ ok: false });
+        }
         for (const room of socket.rooms) if (room.startsWith('ws:')) socket.leave(room);
         if (r.role === 'agent' && r.visibility === 'assigned') {
           socket.join([`ws:${workspaceId}:restricted`, `ws:${workspaceId}:u:${socket.data.userId}`]);

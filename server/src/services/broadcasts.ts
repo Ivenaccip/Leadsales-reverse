@@ -169,14 +169,22 @@ export async function launchBroadcast(ctx: AppContext, workspaceId: string, id: 
   if (!tpl) throw badRequest('La plantilla no existe en este canal. Sincroniza las plantillas.', 'TEMPLATE_NOT_FOUND');
   if (tpl.status !== 'APPROVED') throw badRequest(`La plantilla no está aprobada (estado: ${tpl.status})`, 'TEMPLATE_NOT_APPROVED');
 
+  let est: Estimate | null = null;
   if (b.status === 'draft') {
-    const est = await estimateAudience(ctx, workspaceId, b.audience, tpl.category);
+    est = await estimateAudience(ctx, workspaceId, b.audience, tpl.category);
     if (!est.recipients) throw badRequest('La audiencia no tiene contactos (o todos se dieron de baja)', 'EMPTY_AUDIENCE');
     if (!est.sufficient) {
       throw new AppError(402, 'INSUFFICIENT_CREDITS', `Necesitas ${est.cost.toFixed(4)} créditos y tienes ${est.balance.toFixed(4)}. Recarga tu saldo.`);
     }
-    const where = audienceWhere(b.audience);
-    await ctx.db.tx(async (q) => {
+  }
+  const future = b.scheduled_at && new Date(b.scheduled_at).getTime() > Date.now() + 5000;
+
+  // Lock the row so two launches (double click, pause/resume) cannot both start it.
+  const launched = await ctx.db.tx(async (q) => {
+    const cur = await q.query<{ status: string }>(`SELECT status FROM broadcasts WHERE id = $1 AND workspace_id = $2 FOR UPDATE`, [id, workspaceId]);
+    if (cur.rows[0]?.status !== b.status) return false;
+    if (b.status === 'draft' && est) {
+      const where = audienceWhere(b.audience);
       await q.query(
         `INSERT INTO broadcast_recipients (broadcast_id, contact_id)
          SELECT $${where.params.length + 2}::uuid, c.id FROM contacts c WHERE ${where.sql} ON CONFLICT DO NOTHING`,
@@ -186,14 +194,20 @@ export async function launchBroadcast(ctx: AppContext, workspaceId: string, id: 
         `UPDATE broadcasts SET total_recipients = $2, estimated_cost = $3, template_category = $4, channel_id = $5 WHERE id = $1`,
         [b.id, est.recipients, est.cost, tpl.category, channel.id],
       );
-    });
-  }
-  const future = b.scheduled_at && new Date(b.scheduled_at).getTime() > Date.now() + 5000;
-  await ctx.db.query(
-    `UPDATE broadcasts SET status = $2, last_error = NULL, started_at = CASE WHEN $2 = 'running' THEN COALESCE(started_at, now()) ELSE started_at END WHERE id = $1`,
-    [b.id, future ? 'scheduled' : 'running'],
-  );
-  await ctx.queue.enqueue('broadcast.process', { broadcastId: b.id }, future ? { runAt: new Date(b.scheduled_at!) } : {});
+    }
+    await q.query(
+      `UPDATE broadcasts SET status = $2, last_error = NULL, started_at = CASE WHEN $2 = 'running' THEN COALESCE(started_at, now()) ELSE started_at END WHERE id = $1`,
+      [b.id, future ? 'scheduled' : 'running'],
+    );
+    await ctx.queue.enqueue(
+      'broadcast.process',
+      { broadcastId: b.id },
+      { dedupeKey: `broadcast:${b.id}`, ...(future ? { runAt: new Date(b.scheduled_at!) } : {}) },
+      q,
+    );
+    return true;
+  });
+  if (!launched) throw badRequest('La difusión cambió de estado mientras la lanzabas. Recarga la página.', 'BROADCAST_CHANGED');
   const updated = await getBroadcast(ctx.db, workspaceId, id);
   ctx.realtime.emit(workspaceId, 'broadcast:update', updated);
   return updated;
@@ -201,30 +215,83 @@ export async function launchBroadcast(ctx: AppContext, workspaceId: string, id: 
 
 const BATCH = 20;
 
-/** Job "broadcast.process": sends one batch respecting the rate limit, then re-queues itself. */
+async function pauseBroadcast(ctx: AppContext, b: BroadcastRow, reason: string) {
+  await ctx.db.query(`UPDATE broadcasts SET status = 'paused', last_error = $2 WHERE id = $1 AND status = 'running'`, [b.id, reason]);
+  ctx.realtime.emit(b.workspace_id, 'broadcast:update', await getBroadcast(ctx.db, b.workspace_id, b.id));
+}
+
+/**
+ * Job "broadcast.process": atomically claims a batch of recipients (so concurrent runs
+ * never message anyone twice), sends respecting the rate limit, then re-queues itself.
+ */
 export async function processBroadcast(ctx: AppContext, p: { broadcastId: string }): Promise<void> {
-  const { rows } = await ctx.db.query<BroadcastRow>(`SELECT * FROM broadcasts WHERE id = $1`, [p.broadcastId]);
-  let b = rows[0];
+  const { rows } = await ctx.db.query<BroadcastRow & { ws_active: boolean }>(
+    `SELECT b.*, w.is_active AS ws_active FROM broadcasts b JOIN workspaces w ON w.id = b.workspace_id WHERE b.id = $1`,
+    [p.broadcastId],
+  );
+  const b = rows[0];
   if (!b) return;
   if (b.status === 'scheduled') {
-    await ctx.db.query(`UPDATE broadcasts SET status = 'running', started_at = COALESCE(started_at, now()) WHERE id = $1`, [b.id]);
-    b = { ...b, status: 'running' };
+    const started = await ctx.db.query(
+      `UPDATE broadcasts SET status = 'running', started_at = COALESCE(started_at, now()) WHERE id = $1 AND status = 'scheduled' RETURNING id`,
+      [b.id],
+    );
+    if (!started.rows[0]) return;
+    b.status = 'running';
   }
   if (b.status !== 'running') return;
+  if (!b.ws_active) return pauseBroadcast(ctx, b, 'El espacio de trabajo está suspendido');
 
-  const recipients = await ctx.db.query<{ id: string; contact_id: string }>(
-    `SELECT id, contact_id FROM broadcast_recipients WHERE broadcast_id = $1 AND status = 'queued' ORDER BY id LIMIT $2`,
+  const claimed = await ctx.db.query<{ id: string; contact_id: string }>(
+    `UPDATE broadcast_recipients SET status = 'sending', claimed_at = now()
+     WHERE id IN (
+       SELECT id FROM broadcast_recipients
+       WHERE broadcast_id = $1
+         AND (status = 'queued' OR (status = 'sending' AND message_id IS NULL AND claimed_at < now() - interval '10 minutes'))
+       ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED)
+     RETURNING id, contact_id`,
     [b.id, BATCH],
   );
+  const pending = new Set(claimed.rows.map((r) => r.id));
+  const release = async () => {
+    if (!pending.size) return;
+    const st = await ctx.db.query<{ status: string }>(`SELECT status FROM broadcasts WHERE id = $1`, [b.id]);
+    await ctx.db.query(
+      `UPDATE broadcast_recipients SET status = $2, claimed_at = NULL WHERE id = ANY($1::uuid[]) AND status = 'sending'`,
+      [[...pending], st.rows[0]?.status === 'cancelled' ? 'skipped' : 'queued'],
+    );
+  };
+  const finish = (rid: string, status: string, messageId: string | null, error: string | null) => {
+    pending.delete(rid);
+    return ctx.db.query(`UPDATE broadcast_recipients SET status = $2, message_id = $3, error = $4, processed_at = now() WHERE id = $1`, [
+      rid,
+      status,
+      messageId,
+      error,
+    ]);
+  };
+
   const gapMs = Math.ceil(1000 / ctx.config.broadcastRatePerSecond);
-  for (const r of recipients.rows) {
+  for (const r of claimed.rows) {
     const current = await ctx.db.query<{ status: string }>(`SELECT status FROM broadcasts WHERE id = $1`, [b.id]);
-    if (current.rows[0]?.status !== 'running') return; // paused or cancelled meanwhile
+    if (current.rows[0]?.status !== 'running') {
+      await release(); // paused or cancelled meanwhile
+      return;
+    }
+    // A previous run may have sent this one and died before recording it: never send twice.
+    const already = await ctx.db.query<{ id: string; status: string }>(
+      `SELECT id, status FROM messages WHERE broadcast_id = $1 AND contact_id = $2 LIMIT 1`,
+      [b.id, r.contact_id],
+    );
+    if (already.rows[0]) {
+      await finish(r.id, already.rows[0].status === 'failed' ? 'failed' : 'sent', already.rows[0].id, null);
+      continue;
+    }
     const started = Date.now();
     const c = await ctx.db.query<ContactRow>(`SELECT * FROM contacts WHERE id = $1`, [r.contact_id]);
     const contact = c.rows[0];
     if (!contact || contact.opted_out) {
-      await ctx.db.query(`UPDATE broadcast_recipients SET status = 'skipped', processed_at = now() WHERE id = $1`, [r.id]);
+      await finish(r.id, 'skipped', null, null);
       continue;
     }
     try {
@@ -237,32 +304,36 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
         broadcastId: b.id,
         content: { type: 'template', name: b.template_name, language: b.template_language, params: resolveParams(b.params ?? {}, contact) },
       });
-      await ctx.db.query(
-        `UPDATE broadcast_recipients SET status = $2, message_id = $3, error = $4, processed_at = now() WHERE id = $1`,
-        [r.id, msg.status === 'failed' ? 'failed' : 'sent', msg.id, msg.error?.message ?? null],
-      );
+      await finish(r.id, msg.status === 'failed' ? 'failed' : 'sent', msg.id, msg.error?.message ?? null);
     } catch (err: any) {
-      if (err instanceof AppError && (err.code === 'INSUFFICIENT_CREDITS' || err.code === 'NO_CHANNEL' || err.code === 'TEMPLATE_NOT_APPROVED')) {
-        await ctx.db.query(`UPDATE broadcasts SET status = 'paused', last_error = $2 WHERE id = $1`, [b.id, err.message]);
-        ctx.realtime.emit(b.workspace_id, 'broadcast:update', await getBroadcast(ctx.db, b.workspace_id, b.id));
+      if (err instanceof AppError && ['INSUFFICIENT_CREDITS', 'NO_CHANNEL', 'TEMPLATE_NOT_APPROVED', 'WORKSPACE_SUSPENDED'].includes(err.code)) {
+        await pauseBroadcast(ctx, b, err.message);
+        await release();
         return;
       }
-      await ctx.db.query(`UPDATE broadcast_recipients SET status = 'failed', error = $2, processed_at = now() WHERE id = $1`, [
-        r.id,
-        String(err?.message ?? err).slice(0, 500),
-      ]);
+      await finish(r.id, 'failed', null, String(err?.message ?? err).slice(0, 500));
     }
     const wait = gapMs - (Date.now() - started);
     if (wait > 0) await new Promise((res) => setTimeout(res, wait));
   }
 
-  const left = await ctx.db.query<{ n: number }>(`SELECT count(*)::int AS n FROM broadcast_recipients WHERE broadcast_id = $1 AND status = 'queued'`, [b.id]);
-  if (left.rows[0].n > 0) {
-    await ctx.queue.enqueue('broadcast.process', { broadcastId: b.id });
+  const left = await ctx.db.query<{ queued: number; sending: number }>(
+    `SELECT count(*) FILTER (WHERE status = 'queued')::int AS queued, count(*) FILTER (WHERE status = 'sending')::int AS sending
+     FROM broadcast_recipients WHERE broadcast_id = $1`,
+    [b.id],
+  );
+  const { queued, sending } = left.rows[0];
+  if (queued > 0) {
+    await ctx.queue.enqueue('broadcast.process', { broadcastId: b.id }, { dedupeKey: `broadcast:${b.id}` });
+  } else if (sending > 0) {
+    // Another run is still sending, or one died mid-batch: check again once its claim expires.
+    await ctx.queue.enqueue('broadcast.process', { broadcastId: b.id }, { delayMs: 11 * 60 * 1000, dedupeKey: `broadcast-watchdog:${b.id}` });
   } else {
-    await ctx.db.query(`UPDATE broadcasts SET status = 'completed', finished_at = now() WHERE id = $1 AND status = 'running'`, [b.id]);
-    const done = await getBroadcast(ctx.db, b.workspace_id, b.id);
-    await dispatchWebhook(ctx, b.workspace_id, 'broadcast.completed', { ...done, stats: await broadcastStats(ctx.db, b.id) });
+    const done = await ctx.db.query(`UPDATE broadcasts SET status = 'completed', finished_at = now() WHERE id = $1 AND status = 'running' RETURNING id`, [b.id]);
+    if (done.rows[0]) {
+      const finished = await getBroadcast(ctx.db, b.workspace_id, b.id);
+      await dispatchWebhook(ctx, b.workspace_id, 'broadcast.completed', { ...finished, stats: await broadcastStats(ctx.db, b.id) });
+    }
   }
   ctx.realtime.emit(b.workspace_id, 'broadcast:update', await getBroadcast(ctx.db, b.workspace_id, b.id));
 }
@@ -271,7 +342,7 @@ export async function broadcastStats(q: Queryable, broadcastId: string) {
   const { rows } = await q.query<Record<string, number>>(
     `SELECT
        count(*)::int AS total,
-       count(*) FILTER (WHERE br.status = 'queued')::int AS queued,
+       count(*) FILTER (WHERE br.status IN ('queued', 'sending'))::int AS queued,
        count(*) FILTER (WHERE br.status = 'skipped')::int AS skipped,
        count(*) FILTER (WHERE br.status = 'failed' OR m.status = 'failed')::int AS failed,
        count(*) FILTER (WHERE m.status IN ('sent', 'delivered', 'read'))::int AS sent,

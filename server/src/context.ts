@@ -19,4 +19,6 @@ export interface AppContext {
   log: Logger | FastifyBaseLogger;
   /** Injectable fetch: tests replace it to fake the Graph API / Claude API. */
   fetch: typeof fetch;
+  /** fetch for tenant-supplied URLs (outgoing webhooks): refuses private networks at connect time. */
+  webhookFetch: typeof fetch;
 }

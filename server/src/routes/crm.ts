@@ -227,15 +227,22 @@ export async function crmRoutes(app: FastifyInstance, ctx: AppContext) {
     const a = await requireWs(ctx, req);
     const { rows } = await ctx.db.query(
       `SELECT q.*, mf.mime AS media_mime, mf.filename AS media_filename FROM quick_replies q
-       LEFT JOIN media_files mf ON mf.id = q.media_file_id WHERE q.workspace_id = $1 ORDER BY q.shortcut`,
+       LEFT JOIN media_files mf ON mf.id = q.media_file_id AND mf.workspace_id = q.workspace_id WHERE q.workspace_id = $1 ORDER BY q.shortcut`,
       [a.workspaceId],
     );
     return { quick_replies: rows };
   });
 
+  async function assertOwnMedia(workspaceId: string, mediaId: string | null | undefined) {
+    if (!mediaId) return;
+    const { rows } = await ctx.db.query(`SELECT 1 FROM media_files WHERE id = $1 AND workspace_id = $2`, [mediaId, workspaceId]);
+    if (!rows[0]) throw notFound('Archivo');
+  }
+
   app.post('/api/quick-replies', async (req) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const body = parse(qrSchema, req.body);
+    await assertOwnMedia(a.workspaceId, body.media_file_id);
     const { rows } = await ctx.db.query(
       `INSERT INTO quick_replies (workspace_id, shortcut, title, body, media_file_id) VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (workspace_id, shortcut) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, media_file_id = EXCLUDED.media_file_id
@@ -249,6 +256,7 @@ export async function crmRoutes(app: FastifyInstance, ctx: AppContext) {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
     const body = parse(qrSchema.partial(), req.body);
+    await assertOwnMedia(a.workspaceId, body.media_file_id);
     const { rows } = await ctx.db.query(
       `UPDATE quick_replies SET shortcut = COALESCE($3, shortcut), title = COALESCE($4, title), body = COALESCE($5, body),
          media_file_id = CASE WHEN $6 THEN $7::uuid ELSE media_file_id END

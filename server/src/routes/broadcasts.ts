@@ -147,12 +147,14 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
   app.post('/api/broadcasts/:id/cancel', async (req) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
+    await getBroadcast(ctx.db, a.workspaceId, id);
     await ctx.db.tx(async (q) => {
-      await q.query(
-        `UPDATE broadcasts SET status = 'cancelled', finished_at = now() WHERE id = $1 AND workspace_id = $2 AND status IN ('draft', 'running', 'scheduled', 'paused')`,
+      const r = await q.query(
+        `UPDATE broadcasts SET status = 'cancelled', finished_at = now() WHERE id = $1 AND workspace_id = $2 AND status IN ('draft', 'running', 'scheduled', 'paused')
+         RETURNING id`,
         [id, a.workspaceId],
       );
-      await q.query(`UPDATE broadcast_recipients SET status = 'skipped' WHERE broadcast_id = $1 AND status = 'queued'`, [id]);
+      if (r.rows[0]) await q.query(`UPDATE broadcast_recipients SET status = 'skipped' WHERE broadcast_id = $1 AND status = 'queued'`, [id]);
     });
     return { broadcast: await withStats(ctx, await getBroadcast(ctx.db, a.workspaceId, id)) };
   });

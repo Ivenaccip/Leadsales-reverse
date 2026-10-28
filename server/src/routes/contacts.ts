@@ -5,14 +5,13 @@ import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { badRequest } from '../lib/errors.js';
 import { renderPlaceholders } from '../services/broadcasts.js';
-import { settingsWithDefaults } from '../services/automation.js';
 import { CONTACT_COLUMNS, createContact, getContact, updateContact } from '../services/contacts.js';
-import { addNote, getWorkspace, isWindowOpen, sendMessage, type SendContent } from '../services/messages.js';
+import { addNote, isWindowOpen, sendMessage, type SendContent } from '../services/messages.js';
 import { cancelScheduled, scheduleMessage } from '../services/scheduled.js';
 import type { MessageRow } from '../types.js';
 import { getChannel, providerFor } from '../whatsapp/provider.js';
 import type { TemplateParams } from '../whatsapp/types.js';
-import { ADMIN_ROLES, noContent, parse, requireWs, uuid, type WsAuth } from './helpers.js';
+import { ADMIN_ROLES, agentRestricted, noContent, parse, requireWs, uuid, type WsAuth } from './helpers.js';
 
 const boolish = z
   .enum(['1', '0', 'true', 'false'])
@@ -36,11 +35,7 @@ const listSchema = z.object({
 });
 type ListFilters = z.infer<typeof listSchema>;
 
-async function visibilityFilter(ctx: AppContext, a: WsAuth): Promise<boolean> {
-  if (a.role !== 'agent') return false;
-  const ws = await getWorkspace(ctx, a.workspaceId);
-  return settingsWithDefaults(ws.settings).agent_visibility === 'assigned';
-}
+const visibilityFilter = agentRestricted;
 
 function buildWhere(a: WsAuth, f: Partial<ListFilters>, restrictToMine: boolean) {
   const params: unknown[] = [a.workspaceId];
@@ -203,21 +198,26 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
        WHERE ${where} ORDER BY c.created_at`,
       params,
     );
+    // Spreadsheet apps execute cells starting with = + - @: WhatsApp names are user-controlled.
+    const cell = (v: unknown) => {
+      const t = v == null ? '' : String(v);
+      return /^[=+\-@\t\r]/.test(t) ? `'${t}` : t;
+    };
     const csv = stringify(
       rows.map((r: any) => ({
         telefono: `+${r.phone}`,
-        nombre: r.name ?? '',
-        correo: r.email ?? '',
-        empresa: r.company ?? '',
-        embudo: r.funnel ?? '',
-        etapa: r.stage ?? '',
-        asignado_a: r.assigned_to ?? '',
-        etiquetas: r.tags ?? '',
+        nombre: cell(r.name ?? ''),
+        correo: cell(r.email ?? ''),
+        empresa: cell(r.company ?? ''),
+        embudo: cell(r.funnel ?? ''),
+        etapa: cell(r.stage ?? ''),
+        asignado_a: cell(r.assigned_to ?? ''),
+        etiquetas: cell(r.tags ?? ''),
         valor: r.deal_value,
         origen: r.source,
         creado: new Date(r.created_at).toISOString(),
         ultimo_mensaje: r.last_message_at ? new Date(r.last_message_at).toISOString() : '',
-        campos: JSON.stringify(r.custom_fields ?? {}),
+        campos: cell(JSON.stringify(r.custom_fields ?? {})),
       })),
       { header: true },
     );
@@ -312,6 +312,13 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
       req.body,
     );
     if (['delete', 'opt_out'].includes(body.action) && a.role === 'agent') throw badRequest('Solo administradores pueden hacer esta acción');
+    if (await visibilityFilter(ctx, a)) {
+      const visible = await ctx.db.query<{ id: string }>(
+        `SELECT id FROM contacts WHERE workspace_id = $1 AND id = ANY($2::uuid[]) AND (assigned_user_id = $3 OR assigned_user_id IS NULL)`,
+        [a.workspaceId, body.ids, a.user.id],
+      );
+      body.ids = visible.rows.map((r) => r.id);
+    }
     if (body.action === 'delete') {
       const r = await ctx.db.query(`DELETE FROM contacts WHERE workspace_id = $1 AND id = ANY($2::uuid[])`, [a.workspaceId, body.ids]);
       ctx.realtime.emit(a.workspaceId, 'contacts:bulk', { action: 'delete', ids: body.ids });
@@ -490,11 +497,14 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
   // ---- Scheduled messages ----
   app.get('/api/scheduled', async (req) => {
     const a = await requireWs(ctx, req);
+    const restricted = await visibilityFilter(ctx, a);
     const { rows } = await ctx.db.query(
       `SELECT s.*, c.name AS contact_name, c.phone AS contact_phone, u.name AS created_by_name FROM scheduled_messages s
        JOIN contacts c ON c.id = s.contact_id LEFT JOIN users u ON u.id = s.created_by
-       WHERE s.workspace_id = $1 AND (s.status = 'pending' OR s.send_at > now() - interval '7 days') ORDER BY s.send_at`,
-      [a.workspaceId],
+       WHERE s.workspace_id = $1 AND (s.status = 'pending' OR s.send_at > now() - interval '7 days')
+         AND (NOT $2 OR c.assigned_user_id IS NULL OR c.assigned_user_id = $3)
+       ORDER BY s.send_at`,
+      [a.workspaceId, restricted, a.user.id],
     );
     return { scheduled: rows };
   });
@@ -520,6 +530,11 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
   app.delete('/api/scheduled/:id', async (req, reply) => {
     const a = await requireWs(ctx, req);
     const { id } = parse(z.object({ id: uuid }), req.params);
+    const s = await ctx.db.query<{ contact_id: string }>(`SELECT contact_id FROM scheduled_messages WHERE id = $1 AND workspace_id = $2`, [
+      id,
+      a.workspaceId,
+    ]);
+    if (s.rows[0]) await ensureVisible(a, s.rows[0].contact_id);
     await cancelScheduled(ctx, a.workspaceId, id);
     return noContent(reply);
   });

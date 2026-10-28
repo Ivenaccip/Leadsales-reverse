@@ -130,6 +130,7 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
       throw badRequest('Para activar el agente IA agrega tu llave de API de Claude (Anthropic)', 'AI_KEY_REQUIRED');
     }
     await ctx.db.query(`UPDATE workspaces SET settings = $2 WHERE id = $1`, [a.workspaceId, JSON.stringify(next)]);
+    if (body.agent_visibility && body.agent_visibility !== ws.settings?.agent_visibility) await ctx.realtime.evict(a.workspaceId);
     return { workspace: publicWorkspace(await getWorkspace(ctx, a.workspaceId)) };
   });
 
@@ -197,6 +198,7 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
        WHERE workspace_id = $1 AND user_id = $2`,
       [a.workspaceId, id, body.role ?? null, body.is_active ?? null, body.receives_leads ?? null],
     );
+    if (body.role || body.is_active !== undefined) await ctx.realtime.evict(a.workspaceId, id);
     return { ok: true };
   });
 
@@ -214,6 +216,7 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
     }
     await ctx.db.query(`UPDATE contacts SET assigned_user_id = NULL WHERE workspace_id = $1 AND assigned_user_id = $2`, [a.workspaceId, id]);
     await ctx.db.query(`DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2`, [a.workspaceId, id]);
+    await ctx.realtime.evict(a.workspaceId, id);
     return noContent(reply);
   });
 }

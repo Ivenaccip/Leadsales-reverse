@@ -333,7 +333,16 @@ const seedRates =
     .join(', ') +
   ' ON CONFLICT DO NOTHING;\n';
 
+// WhatsApp message ids are unique per tenant: one workspace must never be able to
+// "claim" an id and make another workspace drop its message as a duplicate.
+const wamidPerWorkspace = `
+ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_wamid_key;
+CREATE UNIQUE INDEX IF NOT EXISTS messages_ws_wamid ON messages (workspace_id, wamid);
+ALTER TABLE broadcast_recipients ADD COLUMN IF NOT EXISTS claimed_at timestamptz;
+`;
+
 export const migrations: { name: string; sql: string }[] = [
   { name: '001_init', sql: init },
   { name: '002_rate_card_seed', sql: seedRates },
+  { name: '003_wamid_per_workspace', sql: wamidPerWorkspace },
 ];

@@ -23,8 +23,11 @@ function messageTime(ts: string | undefined): Date {
   return Math.abs(now - meta) < 60_000 ? new Date(now) : new Date(meta);
 }
 
-/** Entry point for every payload Meta posts to /webhooks/whatsapp (run from the job queue). */
-export async function processWebhook(ctx: AppContext, body: any, job?: Job): Promise<void> {
+/**
+ * Entry point for every payload Meta posts to /webhooks/whatsapp (run from the job queue).
+ * `allowed` lists the channels whose app secret signed the payload; null = internal (sandbox) events.
+ */
+export async function processWebhook(ctx: AppContext, body: any, job?: Job, allowed: string[] | null = null): Promise<void> {
   if (body?.object !== 'whatsapp_business_account') return;
   let retry = false;
   for (const entry of body.entry ?? []) {
@@ -33,16 +36,16 @@ export async function processWebhook(ctx: AppContext, body: any, job?: Job): Pro
       try {
         switch (change.field) {
           case 'messages':
-            await processMessagesChange(ctx, value, job);
+            await processMessagesChange(ctx, value, job, allowed);
             break;
           case 'smb_message_echoes':
-            await processEchoes(ctx, value);
+            await processEchoes(ctx, value, allowed);
             break;
           case 'message_template_status_update':
-            await processTemplateStatus(ctx, entry.id, value);
+            await processTemplateStatus(ctx, entry.id, value, allowed);
             break;
           case 'template_category_update':
-            await processTemplateCategory(ctx, entry.id, value);
+            await processTemplateCategory(ctx, entry.id, value, allowed);
             break;
           default:
             ctx.log.debug({ field: change.field }, 'webhook field ignored');
@@ -56,14 +59,17 @@ export async function processWebhook(ctx: AppContext, body: any, job?: Job): Pro
   if (retry) throw new Error('Estados de mensajes aún no registrados; se reintentará');
 }
 
-async function channelByPhoneNumberId(ctx: AppContext, phoneNumberId: string | undefined): Promise<ChannelRow | null> {
+async function channelByPhoneNumberId(ctx: AppContext, phoneNumberId: string | undefined, allowed: string[] | null): Promise<ChannelRow | null> {
   if (!phoneNumberId) return null;
-  const { rows } = await ctx.db.query<ChannelRow>(`SELECT * FROM channels WHERE phone_number_id = $1`, [phoneNumberId]);
+  const { rows } = await ctx.db.query<ChannelRow>(
+    `SELECT * FROM channels WHERE phone_number_id = $1 AND ($2::uuid[] IS NULL OR id = ANY($2::uuid[]))`,
+    [phoneNumberId, allowed],
+  );
   return rows[0] ?? null;
 }
 
-async function processMessagesChange(ctx: AppContext, value: any, job?: Job) {
-  const channel = await channelByPhoneNumberId(ctx, value.metadata?.phone_number_id);
+async function processMessagesChange(ctx: AppContext, value: any, job: Job | undefined, allowed: string[] | null) {
+  const channel = await channelByPhoneNumberId(ctx, value.metadata?.phone_number_id, allowed);
   if (!channel) {
     ctx.log.warn({ phoneNumberId: value.metadata?.phone_number_id }, 'webhook for unknown phone number id');
     return;
@@ -168,7 +174,7 @@ export async function processInboundMessage(ctx: AppContext, channel: ChannelRow
       `INSERT INTO messages (workspace_id, contact_id, channel_id, direction, type, body, media, payload, wamid,
          reply_to_wamid, status, sent_by, created_at)
        VALUES ($1, $2, $3, 'in', $4, $5, $6, $7, $8, $9, 'received', 'contact', $10)
-       ON CONFLICT (wamid) DO NOTHING RETURNING *`,
+       ON CONFLICT (workspace_id, wamid) DO NOTHING RETURNING *`,
       [
         channel.workspace_id,
         contact.id,
@@ -281,8 +287,8 @@ export async function processStatus(ctx: AppContext, channel: ChannelRow, st: an
 }
 
 /** Coexistence: messages the business sent from the WhatsApp Business app on the phone. */
-async function processEchoes(ctx: AppContext, value: any) {
-  const channel = await channelByPhoneNumberId(ctx, value.metadata?.phone_number_id);
+async function processEchoes(ctx: AppContext, value: any, allowed: string[] | null) {
+  const channel = await channelByPhoneNumberId(ctx, value.metadata?.phone_number_id, allowed);
   if (!channel) return;
   for (const echo of value.message_echoes ?? []) {
     const ws = await ctx.db.query<{ default_country_code: string }>(`SELECT default_country_code FROM workspaces WHERE id = $1`, [
@@ -295,7 +301,7 @@ async function processEchoes(ctx: AppContext, value: any) {
     const { rows } = await ctx.db.query<MessageRow>(
       `INSERT INTO messages (workspace_id, contact_id, channel_id, direction, type, body, media, payload, wamid, status, sent_by, created_at)
        VALUES ($1, $2, $3, 'out', $4, $5, $6, $7, $8, 'sent', 'phone', $9)
-       ON CONFLICT (wamid) DO NOTHING RETURNING *`,
+       ON CONFLICT (workspace_id, wamid) DO NOTHING RETURNING *`,
       [
         channel.workspace_id,
         contact.id,
@@ -319,12 +325,13 @@ async function processEchoes(ctx: AppContext, value: any) {
   }
 }
 
-async function processTemplateStatus(ctx: AppContext, wabaId: string, value: any) {
+async function processTemplateStatus(ctx: AppContext, wabaId: string, value: any, allowed: string[] | null) {
   const { rows } = await ctx.db.query<{ workspace_id: string; id: string }>(
     `UPDATE templates t SET status = $1, rejected_reason = NULLIF($2, 'NONE'), updated_at = now()
      FROM channels ch
      WHERE ch.id = t.channel_id AND ch.waba_id = $3
        AND (t.meta_id = $4 OR (t.name = $5 AND t.language = $6))
+       AND ($7::uuid[] IS NULL OR ch.id = ANY($7::uuid[]))
      RETURNING t.workspace_id, t.id`,
     [
       String(value.event ?? '').toUpperCase(),
@@ -333,17 +340,19 @@ async function processTemplateStatus(ctx: AppContext, wabaId: string, value: any
       String(value.message_template_id ?? ''),
       value.message_template_name ?? '',
       value.message_template_language ?? '',
+      allowed,
     ],
   );
   for (const r of rows) ctx.realtime.emit(r.workspace_id, 'template:update', { id: r.id });
 }
 
-async function processTemplateCategory(ctx: AppContext, wabaId: string, value: any) {
+async function processTemplateCategory(ctx: AppContext, wabaId: string, value: any, allowed: string[] | null) {
   const category = String(value.new_category ?? '').toLowerCase();
   if (!category) return;
   await ctx.db.query(
     `UPDATE templates t SET category = $1, updated_at = now() FROM channels ch
-     WHERE ch.id = t.channel_id AND ch.waba_id = $2 AND (t.meta_id = $3 OR t.name = $4)`,
-    [category, wabaId, String(value.message_template_id ?? ''), value.message_template_name ?? ''],
+     WHERE ch.id = t.channel_id AND ch.waba_id = $2 AND (t.meta_id = $3 OR t.name = $4)
+       AND ($5::uuid[] IS NULL OR ch.id = ANY($5::uuid[]))`,
+    [category, wabaId, String(value.message_template_id ?? ''), value.message_template_name ?? '', allowed],
   );
 }

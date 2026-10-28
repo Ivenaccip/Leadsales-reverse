@@ -94,18 +94,32 @@ http://localhost:3000`) y pon esa URL en `PUBLIC_URL` antes de arrancar.
 ```bash
 npm ci
 npm run dev        # API en :3000 (tsx watch) + interfaz en :5173 (Vite con proxy)
-npm test           # 71 pruebas de integración (base embebida)
+npm test           # 89 pruebas de integración (base embebida)
 TEST_DATABASE_URL=postgres://usuario@localhost:5432/postgres npm test   # contra PostgreSQL real
 npm run typecheck
 ```
 
 ## Seguridad
 
-- Webhook de Meta verificado con HMAC-SHA256 (App Secret por canal).
+- Webhook de Meta verificado con HMAC-SHA256 (App Secret por canal). Cada payload solo
+  puede afectar a los canales cuya clave lo firmó: un negocio no puede inyectar eventos en
+  el número de otro.
+- Al conectar un número, LeadLibre comprueba con Meta que el token controla ese número y
+  que el número pertenece a la WABA indicada (nadie puede "apartar" el número de otro).
+- En espacios con créditos prepagados, solo el administrador de la instancia conecta o
+  edita números oficiales.
 - Tokens de Meta y llaves de IA cifrados en reposo (AES-256-GCM).
 - Contraseñas con bcrypt; límite de intentos de inicio de sesión.
 - Cookies `httpOnly`, `SameSite=Lax`, `Secure` cuando `PUBLIC_URL` es HTTPS.
-- Webhooks salientes bloquean destinos en redes privadas (protección SSRF).
+- Webhooks salientes: solo destinos públicos, verificados al conectar (contra DNS
+  rebinding), sin seguir redirecciones (protección SSRF).
+- Archivos recibidos por WhatsApp: solo imágenes, audio y video conocidos se muestran en el
+  navegador; el resto (SVG, HTML…) se descarga, con CSP `sandbox`.
+- Exportación CSV protegida contra inyección de fórmulas.
+- Límite de intentos de inicio de sesión por IP y por cuenta; `TRUST_PROXY` controla qué
+  proxies pueden indicar la IP del cliente.
+- Las difusiones reclaman destinatarios de forma atómica: nunca se envía (ni se cobra) dos
+  veces al mismo contacto aunque se pause/reanude o haya varias réplicas.
 - Aislamiento por espacio de trabajo en todas las consultas y en el tiempo real; con
   "los agentes solo ven sus conversaciones", cada agente recibe solo los eventos de sus
   chats y de los no asignados.

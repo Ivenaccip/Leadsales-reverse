@@ -105,6 +105,12 @@ export class CloudApiProvider implements WhatsAppProvider {
     );
   }
 
+  /** Phone number ids registered in the WABA (proves the number belongs to that account). */
+  async listPhoneNumberIds(): Promise<string[]> {
+    const r = await this.call<{ data: { id: string }[] }>('GET', `${this.requireWaba()}/phone_numbers?fields=id&limit=100`);
+    return (r.data ?? []).map((p) => String(p.id));
+  }
+
   async subscribeApp() {
     await this.call('POST', `${this.requireWaba()}/subscribed_apps`);
   }

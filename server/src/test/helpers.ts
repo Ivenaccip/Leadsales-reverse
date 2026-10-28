@@ -53,7 +53,13 @@ export function fakeFetch(routes: Route[] = []) {
 export interface TestEnv {
   built: BuiltApp;
   config: Config;
-  api: (method: string, url: string, body?: unknown, opts?: { cookie?: string; ws?: string | null; headers?: Record<string, string> }) => Promise<{ status: number; body: any; headers: any; raw: string }>;
+  /** opts.workspaceId is accepted as an alias of opts.ws so register() results can be passed directly. */
+  api: (
+    method: string,
+    url: string,
+    body?: unknown,
+    opts?: { cookie?: string; ws?: string | null; workspaceId?: string; headers?: Record<string, string> },
+  ) => Promise<{ status: number; body: any; headers: any; raw: string }>;
   register: (email?: string, workspaceName?: string) => Promise<{ cookie: string; userId: string; workspaceId: string }>;
   drain: () => Promise<void>;
   close: () => Promise<void>;
@@ -97,7 +103,7 @@ export async function setup(opts: { fetch?: typeof fetch; config?: Partial<Confi
     const headers: Record<string, string> = { ...(o.headers ?? {}) };
     const cookie = o.cookie ?? defaultCookie;
     if (cookie) headers.cookie = cookie;
-    const ws = o.ws === undefined ? defaultWs : o.ws;
+    const ws = o.ws === undefined ? (o.workspaceId ?? defaultWs) : o.ws;
     if (ws) headers['x-workspace-id'] = ws;
     const res = await built.app.inject({ method: method as any, url, headers, ...(body !== undefined ? { payload: body as any } : {}) });
     let parsed: any = res.body;

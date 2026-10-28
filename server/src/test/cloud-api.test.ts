@@ -10,6 +10,7 @@ const TOKEN = 'EAAG-fake-permanent-token-xxxxxxxxxxxx';
 const meta = fakeFetch([
   (c) => (c.url.includes(`/${PHONE_ID}?fields=`) ? { json: { id: PHONE_ID, display_phone_number: '+52 55 1234 0000', verified_name: 'Tacos' } } : undefined),
   (c) => (c.url.endsWith(`/${WABA_ID}/subscribed_apps`) ? { json: { success: true } } : undefined),
+  (c) => (c.url.includes(`/${WABA_ID}/phone_numbers`) ? { json: { data: [{ id: PHONE_ID }] } } : undefined),
   (c) =>
     c.url.includes(`/${WABA_ID}/message_templates?limit`)
       ? {

@@ -78,6 +78,8 @@ const registerSchema = z.object({
 
 export async function authRoutes(app: FastifyInstance, ctx: AppContext) {
   const loginLimiter = new RateLimiter(10, 15 * 60 * 1000);
+  // Per account regardless of IP, so rotating addresses does not allow unlimited guesses.
+  const accountLimiter = new RateLimiter(30, 15 * 60 * 1000);
   const cookieOpts = {
     path: '/',
     httpOnly: true,
@@ -124,6 +126,7 @@ export async function authRoutes(app: FastifyInstance, ctx: AppContext) {
   app.post('/api/auth/login', async (req, reply) => {
     const body = parse(z.object({ email: z.string().trim().toLowerCase(), password: z.string() }), req.body);
     loginLimiter.check(`login:${req.ip}:${body.email}`);
+    accountLimiter.check(`account:${body.email}`);
     const { rows } = await ctx.db.query<{ id: string; password_hash: string }>(`SELECT id, password_hash FROM users WHERE email = $1`, [
       body.email,
     ]);

@@ -2,10 +2,25 @@ import fs from 'node:fs';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
-import { badRequest } from '../lib/errors.js';
+import { badRequest, forbidden } from '../lib/errors.js';
 import { getMedia, mediaAbsPath, saveMedia } from '../services/media.js';
 import { overviewReport } from '../services/reports.js';
-import { parse, requireWs, uuid } from './helpers.js';
+import { ADMIN_ROLES, agentRestricted, parse, requireWs, uuid } from './helpers.js';
+
+const INLINE_SAFE = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+  'video/mp4',
+  'video/3gpp',
+  'audio/ogg',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/aac',
+  'audio/amr',
+  'audio/opus',
+]);
 
 const ALLOWED_MIME = /^(image\/(jpeg|png|webp)|video\/(mp4|3gpp)|audio\/(ogg|mpeg|mp4|aac|amr|opus)|application\/(pdf|msword|vnd\.[\w.-]+|zip)|text\/(plain|csv))$/;
 
@@ -33,7 +48,7 @@ export async function miscRoutes(app: FastifyInstance, ctx: AppContext) {
   });
 
   app.get('/api/credits/ledger', async (req) => {
-    const a = await requireWs(ctx, req);
+    const a = await requireWs(ctx, req, ADMIN_ROLES);
     const q = parse(z.object({ page: z.coerce.number().int().min(1).default(1) }), req.query);
     const { rows } = await ctx.db.query(
       `SELECT l.*, u.name AS created_by_name, c.name AS contact_name, c.phone AS contact_phone, b.name AS broadcast_name
@@ -86,13 +101,28 @@ export async function miscRoutes(app: FastifyInstance, ctx: AppContext) {
     });
     const { id } = parse(z.object({ id: uuid }), req.params);
     const file = await getMedia(ctx, a.workspaceId, id);
+    if (await agentRestricted(ctx, a)) {
+      // Files of conversations assigned to someone else stay hidden too.
+      const { rows } = await ctx.db.query(
+        `SELECT 1 FROM messages m JOIN contacts c ON c.id = m.contact_id
+         WHERE m.media_file_id = $1 AND c.assigned_user_id IS NOT NULL AND c.assigned_user_id <> $2
+           AND NOT EXISTS (SELECT 1 FROM messages m2 JOIN contacts c2 ON c2.id = m2.contact_id
+                           WHERE m2.media_file_id = $1 AND (c2.assigned_user_id IS NULL OR c2.assigned_user_id = $2))
+         LIMIT 1`,
+        [id, a.user.id],
+      );
+      if (rows[0]) throw forbidden('Este archivo pertenece a una conversación asignada a otra persona');
+    }
     const abs = mediaAbsPath(ctx, file);
     if (!fs.existsSync(abs)) throw badRequest('El archivo ya no existe en el servidor');
-    reply.header('Content-Type', file.mime);
+    // Files may come from anyone on WhatsApp: only well-known media types are rendered
+    // by the browser; everything else (SVG, HTML…) is downloaded, never executed.
+    const inline = INLINE_SAFE.has(file.mime);
+    reply.header('Content-Type', inline ? file.mime : 'application/octet-stream');
     reply.header('Cache-Control', 'private, max-age=86400');
     reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Content-Security-Policy', "default-src 'none'; img-src 'self'; media-src 'self'; sandbox");
     const safeName = (file.filename ?? 'archivo').replace(/[^\w.\- ]+/g, '_');
-    const inline = /^(image|video|audio)\//.test(file.mime) || file.mime === 'application/pdf';
     reply.header('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename="${safeName}"`);
     return reply.send(fs.createReadStream(abs));
   });

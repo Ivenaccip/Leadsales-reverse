@@ -69,6 +69,13 @@ export async function requireWs(ctx: AppContext, req: FastifyRequest, roles?: Ro
 
 export const ADMIN_ROLES: Role[] = ['owner', 'admin'];
 
+/** True when this member is an agent limited to their own and unassigned conversations. */
+export async function agentRestricted(ctx: AppContext, a: WsAuth): Promise<boolean> {
+  if (a.role !== 'agent') return false;
+  const { rows } = await ctx.db.query<{ v: string | null }>(`SELECT settings->>'agent_visibility' AS v FROM workspaces WHERE id = $1`, [a.workspaceId]);
+  return rows[0]?.v === 'assigned';
+}
+
 export async function requireSuperadmin(ctx: AppContext, req: FastifyRequest): Promise<AuthUser> {
   const user = await requireUser(ctx, req);
   if (!user.is_superadmin) throw forbidden('Solo el administrador de la instancia puede hacer esto');
@@ -85,6 +92,8 @@ export async function requireApiKey(ctx: AppContext, req: FastifyRequest): Promi
     [sha256Hex(key)],
   );
   if (!rows[0]) throw new AppError(401, 'UNAUTHORIZED', 'Llave de API inválida');
+  const ws = await ctx.db.query<{ is_active: boolean }>(`SELECT is_active FROM workspaces WHERE id = $1`, [rows[0].workspace_id]);
+  if (!ws.rows[0]?.is_active) throw forbidden('Este espacio de trabajo está suspendido');
   return { workspaceId: rows[0].workspace_id, keyId: rows[0].id };
 }
 

@@ -29,6 +29,8 @@ export interface Config {
   sandboxStatusDelayMs: number;
   /** Let outgoing webhooks target private/LAN addresses (off by default: SSRF protection). */
   allowPrivateWebhooks: boolean;
+  /** Which proxies may set X-Forwarded-For (Fastify trustProxy). Clients cannot spoof their IP. */
+  trustProxy: string | number | boolean;
 }
 
 /**
@@ -47,6 +49,14 @@ function loadOrCreateSecrets(dataDir: string): { jwtSecret: string; encryptionKe
   };
   fs.writeFileSync(file, JSON.stringify(secrets, null, 2), { mode: 0o600 });
   return secrets;
+}
+
+function parseTrustProxy(v: string | undefined): string | number | boolean {
+  // Default: only proxies on loopback/private networks (Caddy/Nginx/Docker) are trusted.
+  if (!v) return 'loopback,linklocal,uniquelocal';
+  if (/^\d+$/.test(v)) return Number(v);
+  if (v === 'true' || v === 'false') return v === 'true';
+  return v;
 }
 
 function bool(v: string | undefined, def: boolean): boolean {
@@ -100,6 +110,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, overrides: Part
     maxUploadMb: Number(env.MAX_UPLOAD_MB || 16),
     sandboxStatusDelayMs: Number(env.SANDBOX_STATUS_DELAY_MS ?? 800),
     allowPrivateWebhooks: bool(env.ALLOW_PRIVATE_WEBHOOKS, false),
+    trustProxy: parseTrustProxy(env.TRUST_PROXY),
     ...overrides,
   };
 }

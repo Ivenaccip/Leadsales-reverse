@@ -56,7 +56,8 @@ nadie puede inyectar mensajes falsos.
 **Ajustes → Canales de WhatsApp → Conectar WhatsApp API oficial**, pega los 4 datos
 y pulsa **Verificar y conectar**. LeadLibre:
 
-- valida el número con Meta (`GET /{phone-number-id}`),
+- valida el número con Meta (`GET /{phone-number-id}`) y comprueba que pertenece a tu
+  cuenta (`GET /{waba-id}/phone_numbers`),
 - suscribe tu app a la cuenta (`POST /{waba-id}/subscribed_apps`),
 - descarga tus plantillas (`GET /{waba-id}/message_templates`),
 - guarda el token y la clave **cifrados** (AES-256-GCM) en tu servidor.

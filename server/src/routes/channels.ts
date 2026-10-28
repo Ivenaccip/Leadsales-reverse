@@ -3,14 +3,14 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { encryptJson, hmacSha256Hex, randomToken, safeEqual } from '../lib/crypto.js';
-import { badRequest, conflict, notFound } from '../lib/errors.js';
+import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { syncTemplates } from '../services/templates.js';
 import type { ChannelRow } from '../types.js';
 import { processInboundMessage } from '../whatsapp/inbound.js';
 import { channelCredentials, providerFor } from '../whatsapp/provider.js';
 import { CloudApiProvider } from '../whatsapp/cloud-api.js';
 import { explainMetaError, MetaApiError } from '../whatsapp/types.js';
-import { ADMIN_ROLES, noContent, parse, requireWs, uuid } from './helpers.js';
+import { ADMIN_ROLES, noContent, parse, requireWs, uuid, type WsAuth } from './helpers.js';
 
 function publicChannel(ctx: AppContext, ch: ChannelRow) {
   const creds = channelCredentials(ctx, ch);
@@ -36,6 +36,39 @@ function metaError(err: unknown): never {
   throw err;
 }
 
+/**
+ * Proves the token controls this phone number AND that the number belongs to the WABA,
+ * so nobody can register (squat) someone else's number id or WABA id.
+ */
+async function verifyOwnership(ctx: AppContext, accessToken: string, phoneNumberId: string, wabaId: string) {
+  const provider = new CloudApiProvider({
+    baseUrl: ctx.config.graphBaseUrl,
+    version: ctx.config.graphVersion,
+    accessToken,
+    phoneNumberId,
+    wabaId,
+    fetch: ctx.fetch,
+  });
+  const info = await provider.getPhoneInfo().catch(metaError);
+  const ids = await provider.listPhoneNumberIds().catch(metaError);
+  if (!ids.includes(phoneNumberId)) {
+    throw badRequest('Ese Phone Number ID no pertenece a la cuenta de WhatsApp (WABA) indicada', 'PHONE_NOT_IN_WABA');
+  }
+  return info;
+}
+
+/**
+ * In prepaid workspaces the instance operator pays Meta, so only the operator may
+ * connect or change the official numbers (whoever holds the app secret can sign webhooks).
+ */
+async function assertCanManageCloudChannels(ctx: AppContext, a: WsAuth) {
+  if (a.user.is_superadmin) return;
+  const { rows } = await ctx.db.query<{ billing_mode: string }>(`SELECT billing_mode FROM workspaces WHERE id = $1`, [a.workspaceId]);
+  if (rows[0]?.billing_mode === 'prepaid') {
+    throw forbidden('En modo de créditos prepagados, el administrador de la instancia conecta y edita los números oficiales');
+  }
+}
+
 const cloudSchema = z.object({
   provider: z.literal('cloud_api'),
   name: z.string().trim().min(1).default('WhatsApp'),
@@ -44,7 +77,6 @@ const cloudSchema = z.object({
   access_token: z.string().trim().min(20, 'Pega el token de acceso permanente'),
   app_secret: z.string().trim().min(16, 'Pega la clave secreta de la app (App Secret)'),
   verify_token: z.string().trim().min(8).optional(),
-  skip_test: z.boolean().optional(),
 });
 const sandboxSchema = z.object({ provider: z.literal('sandbox'), name: z.string().trim().min(1).default('Sandbox de pruebas') });
 
@@ -71,29 +103,18 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
       return { channel: publicChannel(ctx, rows[0]) };
     }
 
+    await assertCanManageCloudChannels(ctx, a);
     const taken = await ctx.db.query(`SELECT 1 FROM channels WHERE phone_number_id = $1`, [body.phone_number_id]);
     if (taken.rows[0]) throw conflict('Ese número ya está conectado en esta instancia');
 
-    let displayPhone: string | null = null;
-    if (!body.skip_test) {
-      const provider = new CloudApiProvider({
-        baseUrl: ctx.config.graphBaseUrl,
-        version: ctx.config.graphVersion,
-        accessToken: body.access_token,
-        phoneNumberId: body.phone_number_id,
-        wabaId: body.waba_id,
-        fetch: ctx.fetch,
-      });
-      const info = await provider.getPhoneInfo().catch(metaError);
-      displayPhone = info.display_phone_number ?? null;
-    }
+    const info = await verifyOwnership(ctx, body.access_token, body.phone_number_id, body.waba_id);
     const { rows } = await ctx.db.query<ChannelRow>(
       `INSERT INTO channels (workspace_id, provider, name, display_phone, phone_number_id, waba_id, credentials, verify_token, is_default)
        VALUES ($1, 'cloud_api', $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
       [
         a.workspaceId,
         body.name,
-        displayPhone,
+        info.display_phone_number ?? null,
         body.phone_number_id,
         body.waba_id,
         encryptJson(ctx.config.encryptionKey, { accessToken: body.access_token, appSecret: body.app_secret }),
@@ -103,17 +124,15 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
     );
     const channel = rows[0];
     const warnings: string[] = [];
-    if (!body.skip_test) {
-      try {
-        await providerFor(ctx, channel).subscribeApp();
-      } catch (err) {
-        warnings.push(`No se pudo suscribir la app a la WABA: ${(err as Error).message}`);
-      }
-      try {
-        await syncTemplates(ctx, channel);
-      } catch (err) {
-        warnings.push(`No se pudieron sincronizar las plantillas: ${(err as Error).message}`);
-      }
+    try {
+      await providerFor(ctx, channel).subscribeApp();
+    } catch (err) {
+      warnings.push(`No se pudo suscribir la app a la WABA: ${(err as Error).message}`);
+    }
+    try {
+      await syncTemplates(ctx, channel);
+    } catch (err) {
+      warnings.push(`No se pudieron sincronizar las plantillas: ${(err as Error).message}`);
     }
     return { channel: publicChannel(ctx, channel), warnings };
   });
@@ -135,10 +154,17 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
     );
     const ch = await getOwnChannel(ctx, a.workspaceId, id);
     let credentials = ch.credentials;
-    if (body.access_token || body.app_secret) {
+    if (ch.provider === 'cloud_api' && (body.access_token || body.app_secret || body.waba_id || body.status)) {
+      await assertCanManageCloudChannels(ctx, a);
+    }
+    if (body.access_token || body.app_secret || body.waba_id) {
       const creds = channelCredentials(ctx, ch);
+      const accessToken = body.access_token ?? creds.accessToken;
+      if (ch.provider === 'cloud_api' && (body.access_token || body.waba_id)) {
+        await verifyOwnership(ctx, accessToken ?? '', ch.phone_number_id, body.waba_id ?? ch.waba_id ?? '');
+      }
       credentials = encryptJson(ctx.config.encryptionKey, {
-        accessToken: body.access_token ?? creds.accessToken,
+        accessToken,
         appSecret: body.app_secret ?? creds.appSecret,
       });
     }
@@ -155,7 +181,8 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
   app.delete('/api/channels/:id', async (req, reply) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
-    await getOwnChannel(ctx, a.workspaceId, id);
+    const ch = await getOwnChannel(ctx, a.workspaceId, id);
+    if (ch.provider === 'cloud_api') await assertCanManageCloudChannels(ctx, a);
     await ctx.db.query(`DELETE FROM channels WHERE id = $1`, [id]);
     return noContent(reply);
   });
@@ -243,21 +270,29 @@ export async function metaWebhookRoutes(app: FastifyInstance, ctx: AppContext) {
       `SELECT * FROM channels WHERE provider = 'cloud_api' AND (phone_number_id = ANY($1::text[]) OR waba_id = ANY($2::text[]))`,
       [[...phoneIds], [...wabaIds]],
     );
-    const secrets = new Set<string>();
-    for (const ch of rows) {
-      const s = channelCredentials(ctx, ch).appSecret;
-      if (s) secrets.add(s);
-    }
-    if (ctx.config.metaAppSecret) secrets.add(ctx.config.metaAppSecret);
     if (!rows.length && !ctx.config.metaAppSecret) return reply.code(200).send('IGNORED');
 
+    // Which secret signed the payload decides which channels it may touch: a tenant that
+    // knows its own app secret must never be able to inject events into another tenant.
     const header = String(req.headers['x-hub-signature-256'] ?? '');
-    const valid = [...secrets].some((s) => safeEqual(header, `sha256=${hmacSha256Hex(s, raw)}`));
-    if (!valid) {
-      ctx.log.warn({ phoneIds: [...phoneIds] }, 'invalid webhook signature');
-      return reply.code(401).send('Firma inválida');
+    const signedWith = (secret: string) => safeEqual(header, `sha256=${hmacSha256Hex(secret, raw)}`);
+    let allowed: string[];
+    if (ctx.config.metaAppSecret && signedWith(ctx.config.metaAppSecret)) {
+      allowed = rows.map((ch) => ch.id);
+    } else {
+      const bySecret = new Map<string, string[]>();
+      for (const ch of rows) {
+        const secret = channelCredentials(ctx, ch).appSecret;
+        if (secret) bySecret.set(secret, [...(bySecret.get(secret) ?? []), ch.id]);
+      }
+      const match = [...bySecret.entries()].find(([secret]) => signedWith(secret));
+      if (!match) {
+        ctx.log.warn({ phoneIds: [...phoneIds] }, 'invalid webhook signature');
+        return reply.code(401).send('Firma inválida');
+      }
+      allowed = match[1];
     }
-    await ctx.queue.enqueue('wa.webhook', { body }, { maxAttempts: 6 });
+    await ctx.queue.enqueue('wa.webhook', { body, channelIds: allowed }, { maxAttempts: 6 });
     return reply.code(200).send('EVENT_RECEIVED');
   });
 }

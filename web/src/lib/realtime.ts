@@ -12,6 +12,11 @@ function ensureSocket(): Socket {
       joined = null;
       joinCurrent();
     });
+    // The server re-checks permissions (member removed, role or visibility changed).
+    socket.on('session:refresh', () => {
+      joined = null;
+      joinCurrent();
+    });
   }
   return socket;
 }
