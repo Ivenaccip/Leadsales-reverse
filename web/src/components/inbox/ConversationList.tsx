@@ -70,6 +70,8 @@ export function ConversationList({ selectedId, onSelect, className }: { selected
   });
 
   const items = list.data?.pages.flatMap((p) => p.items) ?? [];
+  // Deleting the only number keeps its conversations: they stay listed, with a nudge to connect one.
+  const noChannel = !!channels.data && channels.data.length === 0;
   const activeFilters = Number(unread) + Number(!!tagId) + Number(!!stageId);
   const tabs: { id: InboxTab; label: string; count?: number }[] = [
     { id: 'all', label: 'Todas', count: counts.data?.all },
@@ -160,11 +162,20 @@ export function ConversationList({ selectedId, onSelect, className }: { selected
       </div>
 
       <div className="scroll-thin min-h-0 flex-1 overflow-y-auto">
+        {noChannel && items.length > 0 && (
+          <div className="m-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            No hay ningún número de WhatsApp conectado: puedes revisar tus conversaciones, pero para responder{' '}
+            <Link to="/ajustes/canales" className="font-medium underline">
+              conecta un número
+            </Link>
+            .
+          </div>
+        )}
         {list.isLoading ? (
           <div className="flex justify-center py-10">
             <Spinner />
           </div>
-        ) : channels.data && channels.data.length === 0 ? (
+        ) : noChannel && items.length === 0 ? (
           <EmptyState
             icon={<Smartphone className="h-6 w-6" />}
             title="Conecta tu número de WhatsApp"

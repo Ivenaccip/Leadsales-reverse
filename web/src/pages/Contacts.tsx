@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Archive, Ban, ChevronLeft, ChevronRight, Download, Plus, Search, Tag as TagIcon, Trash2, Upload, UserPlus, Users, MoveRight, X } from 'lucide-react';
 import { api, errorMessage, getWorkspaceId, qs } from '../lib/api';
-import { decodeCsv } from '../lib/csv';
+import { decodeCsvFile } from '../lib/csv';
 import { stageMap, useFunnels, useMembers, useTags } from '../lib/queries';
 import { useRealtime } from '../lib/realtime';
 import { useSession } from '../lib/session';
@@ -35,7 +35,7 @@ import {
 
 const LIMIT = 50;
 
-type BulkAction = 'add_tags' | 'remove_tags' | 'move_stage' | 'assign' | 'archive' | 'unarchive' | 'opt_out' | 'delete';
+export type BulkAction = 'add_tags' | 'remove_tags' | 'move_stage' | 'assign' | 'archive' | 'unarchive' | 'opt_out' | 'delete';
 
 interface Filters {
   search: string;
@@ -427,6 +427,24 @@ const BULK_TITLE: Record<BulkAction, string> = {
   delete: 'Eliminar contactos',
 };
 
+/**
+ * What to tell after a bulk action. A delete archives instead the contacts with a prepaid charge
+ * Meta can still settle (refund or adjustment), so the team learns why they are still there.
+ */
+export function bulkOutcome(action: BulkAction, r: { updated: number; archived?: number }): { toast: string | null; notice: string | null } {
+  const n = r.updated;
+  const s = n === 1 ? '' : 's';
+  if (action !== 'delete') return { toast: `${n} contacto${s} actualizado${s}`, notice: null };
+  const archived = r.archived ?? 0;
+  const notice =
+    archived === 0
+      ? null
+      : archived === 1
+        ? '1 contacto se archivó en lugar de borrarse: tiene mensajes cobrados que Meta todavía no confirma. Podrás borrarlo cuando se confirmen.'
+        : `${archived} contactos se archivaron en lugar de borrarse: tienen mensajes cobrados que Meta todavía no confirma. Podrás borrarlos cuando se confirmen.`;
+  return { toast: n > 0 || !archived ? `${n} contacto${s} eliminado${s}` : null, notice };
+}
+
 function BulkModal({ action, ids, onClose, onDone }: { action: BulkAction; ids: string[]; onClose: () => void; onDone: () => void }) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -437,10 +455,11 @@ function BulkModal({ action, ids, onClose, onDone }: { action: BulkAction; ids: 
   const [tagIds, setTagIds] = useState<string[]>([]);
   const [stageId, setStageId] = useState<string | null>(funnels[0]?.stages[0]?.id ?? null);
   const [userId, setUserId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const run = useMutation({
     mutationFn: () =>
-      api.post<{ updated: number }>('/api/contacts/bulk', {
+      api.post<{ updated: number; archived?: number }>('/api/contacts/bulk', {
         ids,
         action,
         ...(action === 'add_tags' || action === 'remove_tags' ? { tag_ids: tagIds } : {}),
@@ -448,8 +467,11 @@ function BulkModal({ action, ids, onClose, onDone }: { action: BulkAction; ids: 
         ...(action === 'assign' ? { user_id: userId } : {}),
       }),
     onSuccess: (r) => {
-      toast.success(`${r.updated} contacto${r.updated === 1 ? '' : 's'} actualizado${r.updated === 1 ? '' : 's'}`);
-      onDone();
+      const out = bulkOutcome(action, r);
+      if (out.toast) toast.success(out.toast);
+      // Stays open until read: a toast would vanish before the reason is understood.
+      if (out.notice) setNotice(out.notice);
+      else onDone();
     },
     onError: (err) => toast.error(errorMessage(err)),
   });
@@ -467,6 +489,14 @@ function BulkModal({ action, ids, onClose, onDone }: { action: BulkAction; ids: 
   }
 
   const invalid = ((action === 'add_tags' || action === 'remove_tags') && !tagIds.length) || (action === 'move_stage' && !stageId);
+
+  if (notice) {
+    return (
+      <Modal open onClose={onDone} title={BULK_TITLE[action]} size="sm" footer={<Button onClick={onDone}>Listo</Button>}>
+        <Alert tone="warning">{notice}</Alert>
+      </Modal>
+    );
+  }
 
   return (
     <Modal
@@ -593,6 +623,15 @@ function CreateContactModal({ onClose, onCreated }: { onClose: () => void; onCre
   );
 }
 
+/**
+ * Body of POST /api/contacts/import. `lossy` says whether the file's bytes had to be replaced by
+ * U+FFFD while decoding: the server then refuses any U+FFFD, and otherwise keeps it as data (so a
+ * name exported with one imports back unchanged).
+ */
+export function importRequestBody(csv: string, lossy: boolean, stageId: string | null, tagIds: string[]) {
+  return { csv, lossy, stage_id: stageId ?? undefined, tag_ids: tagIds.length ? tagIds : undefined };
+}
+
 interface ImportResult {
   total: number;
   created: number;
@@ -607,13 +646,14 @@ function ImportModal({ onClose, onDone }: { onClose: () => void; onDone: () => v
   const tags = useTags().data ?? [];
   const createTag = useCreateTag();
   const [csv, setCsv] = useState('');
+  const [lossy, setLossy] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
   const [stageId, setStageId] = useState<string | null>(null);
   const [tagIds, setTagIds] = useState<string[]>([]);
   const [result, setResult] = useState<ImportResult | null>(null);
 
   const run = useMutation({
-    mutationFn: () => api.post<ImportResult>('/api/contacts/import', { csv, stage_id: stageId ?? undefined, tag_ids: tagIds.length ? tagIds : undefined }),
+    mutationFn: () => api.post<ImportResult>('/api/contacts/import', importRequestBody(csv, lossy, stageId, tagIds)),
     onSuccess: (r) => {
       setResult(r);
       onDone();
@@ -627,7 +667,9 @@ function ImportModal({ onClose, onDone }: { onClose: () => void; onDone: () => v
     e.target.value = '';
     if (!file) return;
     try {
-      setCsv(decodeCsv(await file.arrayBuffer()));
+      const decoded = decodeCsvFile(await file.arrayBuffer());
+      setCsv(decoded.text);
+      setLossy(decoded.lossy);
       setFileName(file.name);
     } catch {
       toast.error('No se pudo leer el archivo');
@@ -703,6 +745,8 @@ function ImportModal({ onClose, onDone }: { onClose: () => void; onDone: () => v
               value={csv}
               onChange={(e) => {
                 setCsv(e.target.value);
+                // Typed or pasted text lost nothing, but U+FFFD left over from a lossy file still marks it.
+                setLossy((l) => l && e.target.value.includes('\ufffd'));
                 setFileName(null);
               }}
               placeholder={'nombre,teléfono,correo,etiquetas\nAna López,+52 55 1234 5678,ana@correo.com,VIP;Expo'}

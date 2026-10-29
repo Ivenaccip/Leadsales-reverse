@@ -11,7 +11,7 @@
  ──webhook firmado──┼─► /webhooks/whatsapp ─┤ cola de trabajos (tabla jobs, FOR UPDATE SKIP LOCKED)   │
  ◄──Graph API───────┼── proveedor cloud_api │   wa.webhook · media.download · automation.inbound      │
                     │   proveedor sandbox   │   ai.reply · broadcast.process · scheduled.send ·        │
- Claude API ◄───────┼── agente IA           │   webhook.deliver                                        │
+ Claude API ◄───────┼── agente IA           │   webhook.deliver · template.refresh                     │
  Make/Zapier/n8n ◄──┼── webhooks salientes  │                                                         │
                     └──────────────┬───────────────────────────────────────────────────────────────────┘
                                    ▼
@@ -35,8 +35,9 @@
   (PostgreSQL compilado a WebAssembly) guardado en `DATA_DIR/pgdata`. Mismo SQL, mismas
   migraciones. Las pruebas corren en ambos.
 - **Webhook rápido y durable.** El endpoint verifica la firma HMAC con la *App Secret*
-  del canal, encola el payload y responde 200 de inmediato. El procesamiento es
-  idempotente (`wamid` único) y reintenta si un estado llega antes que el mensaje.
+  del canal, encola un trabajo por espacio de trabajo con sus eventos y responde 200 de
+  inmediato. El procesamiento es idempotente (`wamid` único) y reintenta si un estado
+  llega antes que el mensaje.
 - **Proveedores intercambiables.** `WhatsAppProvider` abstrae Cloud API y Sandbox
   (simulador con estados y precios falsos). Agregar otro proveedor es implementar esa
   interfaz.
@@ -49,12 +50,16 @@
   verifica correos, así que un espacio nunca agrega una cuenta existente por su correo ni
   le pone contraseña a otra persona: crea una invitación con un enlace de un solo uso
   (`/invitacion/<token>`, se guarda solo su SHA-256, vence en 7 días). Entra solo quien
-  abre el enlace con la sesión de ese correo, o quien crea esa cuenta desde el enlace.
+  abre el enlace con la sesión de ese correo, o quien crea esa cuenta desde el enlace. Sin
+  correos verificados, quien tiene el enlace (también quien invitó) puede crear esa
+  cuenta: el operador la recupera desde **Administración → Usuarios** (contraseña
+  temporal, o borrarla si no es miembro de ningún espacio). Ver `04-despliegue.md`.
 - **Secretos cifrados.** Tokens de Meta y llaves de IA se guardan con AES-256-GCM
   (`ENCRYPTION_KEY`).
 - **Sesiones revocables.** La cookie (`httpOnly`, `SameSite=Lax`) lleva un JWT
   `{ uid, sid }` y cada petición y cada conexión de Socket.IO exigen que la fila `sid`
-  de `sessions` exista y no esté revocada. Cerrar sesión revoca esa sesión; cambiar la
+  de `sessions` exista, no esté revocada y se haya abierto con la versión actual de la
+  contraseña (`users.password_version`). Cerrar sesión revoca esa sesión; cambiar la
   contraseña revoca las demás; quitar o desactivar a alguien de su único espacio revoca
   todas. Sus pestañas abiertas reciben `session:revoked` y se desconectan.
 - **Números oficiales del operador.** En espacios prepagados el operador paga a Meta, así
@@ -93,14 +98,18 @@
 
 ## Flujo de un mensaje entrante
 
-1. Meta → `POST /webhooks/whatsapp` (firma verificada) → job `wa.webhook`.
+1. Meta → `POST /webhooks/whatsapp` (firma verificada, máx. 3 MB y 1000 eventos) → un
+   job `wa.webhook` por espacio de trabajo, con solo los eventos de sus números, en el
+   carril de entrada con turnos por espacio.
 2. Se crea/actualiza el contacto (teléfono normalizado: `521…` de México se guarda como
    `52…` para no duplicar), se coloca en la primera etapa del embudo predeterminado y,
    si el embudo tiene round-robin, se asigna.
 3. Se guarda el mensaje (idempotente), se actualizan no leídos y ventana de 24 h, se
    encola la descarga de multimedia y se emite por Socket.IO.
 4. Job `automation.inbound`: horario/ausencia, bienvenida, bot de menú o agente IA
-   (con *debounce* de 4 s para juntar mensajes seguidos).
+   (con *debounce* de 4 s para juntar mensajes seguidos). Un mensaje de baja (`BAJA`,
+   `STOP`…) marca al contacto fuera de las difusiones y no recibe respuesta automática;
+   lo que el contacto escriba después sí la recibe.
 
 ## Flujo de un envío
 
@@ -111,12 +120,19 @@
    El mensaje guarda quién pagó (`charged_prepaid`): sus reembolsos y ajustes van a esa
    misma cartera aunque después cambie el modo del espacio.
 3. Se llama a Graph API (`POST /{phone-number-id}/messages`).
-4. Si Meta responde error (o la conexión falla antes de enviar): mensaje `failed` con
-   explicación en español y reembolso.
+4. Si Meta responde error: mensaje `failed` con explicación en español y reembolso. Si la
+   conexión falla antes de llegar a Meta (DNS, conexión rechazada, certificado), nada
+   salió: mensaje `failed` con `error.network: true` y reembolso. Las difusiones y los
+   programados reintentan solos esos envíos, y los que Meta frenó por velocidad, sobre el
+   mismo mensaje (con `error.auto_retry: true` mientras tanto); sin conexión esperan cada
+   vez más (de 30 s a 8 min) y una difusión se pausa tras unos 15 minutos. Los envíos de
+   la bandeja, la API, el bot y la IA no se reintentan solos.
 5. Si la respuesta de Meta se pierde (falla de red, tiempo agotado o 5xx): mensaje
    `unknown` ("Sin confirmar"). Meta pudo haberlo entregado, así que conserva el cargo y
-   nunca se reenvía solo; las plantillas llevan el id del mensaje en
-   `biz_opaque_callback_data` para que sus webhooks de estado lo encuentren.
+   nunca se reenvía solo. Todo envío (no solo las plantillas) lleva el id del mensaje en
+   `biz_opaque_callback_data` para que sus webhooks de estado lo encuentren. Si a los 7
+   días sigue `unknown` (o `pending`, porque el proceso murió a medio envío) sin ningún
+   estado de Meta, nunca llegó: pasa a `failed` y se reembolsa.
 6. Los webhooks de estado actualizan ✓, ✓✓, leído o fallido y concilian el costo real.
 
 ## Cola de trabajos
@@ -126,16 +142,24 @@ multimedia, bot e IA, difusiones, programados y webhooks salientes) es una fila 
 `jobs`. El worker corre en el mismo proceso y toma trabajos con `FOR UPDATE SKIP LOCKED`
 en cuanto se libera un lugar, así que un trabajo lento no detiene a los demás.
 
-- **Carriles.** Cada carril tiene sus propios lugares: `default` (10 a la vez) para casi
-  todo y `webhooks` (8 a la vez) para los webhooks salientes, así un receptor lento o
-  caído nunca frena los mensajes entrantes, el bot ni las difusiones. En `webhooks` un
-  espacio ocupa como máximo 3 lugares y los libres se reparten entre espacios: primero
-  el que menos tiempo de carril usó últimamente, así que un negocio con endpoints que no
-  responden no acapara el carril.
+- **Carriles.** Cada carril tiene sus propios lugares: `inbound` para lo que manda Meta
+  (un trabajo `wa.webhook` por espacio y payload), `default` para el bot, la IA y casi todo
+  lo demás (como `template.refresh`, que vuelve a leer de Meta una plantilla que cambió),
+  `bulk` para programados y difusiones, `media` para descargas de archivos y `webhooks`
+  para los webhooks salientes. Así un receptor lento o caído, una ráfaga de programados o
+  un negocio que inunda su propio número nunca frenan los mensajes entrantes ni el bot de
+  los demás. En cada carril un espacio ocupa como máximo una parte de los lugares (por
+  ejemplo, 4 de los 8 de `inbound`). Los lugares libres se reparten entre **cuentas** (la
+  dueña de cada espacio) y, dentro de cada cuenta, entre sus espacios: primero la cuenta,
+  y luego el espacio, que menos tiempo de carril usó últimamente. Abrir más espacios no da
+  más lugares, y un negocio cuyos trabajos se cuelgan gasta su turno en segundos, no en
+  trabajos. Los trabajos sin espacio usan los lugares que sobran.
 - **Un contacto a la vez.** `automation.inbound` y `ai.reply` de un mismo contacto
   comparten `serial_key` (`contact:<id>`) y nunca corren al mismo tiempo: leen el estado
-  del bot o la conversación y luego actúan sobre ella. Los de otros contactos siguen en
-  paralelo.
+  del bot o la conversación y luego actúan sobre ella. Solo el primer trabajo pendiente de
+  cada `serial_key` se puede tomar; los demás esperan marcados `held` y se liberan, uno por
+  uno, cuando termina el anterior. Así una fila larga de un mismo contacto no hace más
+  lento tomar trabajos, y los de otros contactos siguen en paralelo.
 - **Reintentos.** Por omisión, 5 intentos con espera creciente (5 s, 10 s, 20 s, 40 s).
   Los webhooks salientes hacen hasta 12 intentos en unas 34 h (ver `06-api.md`) y la
   descarga de multimedia hasta 10 en unas 28 h. Un error definitivo no se reintenta.
@@ -145,6 +169,14 @@ en cuanto se libera un lugar, así que un trabajo lento no detiene a los demás.
   proceso, vuelven de inmediato al arrancar. Un trabajo que pasa de 10 min libera su
   lugar y se reintenta. Al recibir `SIGTERM`, LeadLibre deja de tomar trabajos, espera
   hasta 7 s a los que corren y devuelve los demás a la cola.
+- **Mantenimiento.** Con cada latido el worker también recupera trabajos y libera los
+  `held` que se quedaron sin nadie delante. Cada 10 minutos (con PostgreSQL y con PGlite)
+  borra los trabajos terminados de más de 7 días y las descargas a medias que dejó un
+  proceso caído, y cierra lo que ningún trabajo va a terminar: los envíos que Meta nunca
+  confirmó en 7 días pasan a `failed` y se reembolsan (`settleStaleSends`), y los
+  programados cuyo trabajo murió con el proceso (`recoverOrphanedScheduled`) terminan como
+  terminó su mensaje, o como fallidos si no se llegó a guardar ninguno (nunca se reenvían
+  solos).
 - **Una sola réplica.** La cola aguantaría varias instancias, pero el tiempo real y los
   límites de inicio de sesión viven en memoria (ver "Una sola réplica" arriba). Con
   PostgreSQL, si al arrancar detecta otra instancia activa en la misma base, LeadLibre lo

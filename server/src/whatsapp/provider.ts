@@ -67,6 +67,10 @@ export function webhookEnvelope(channel: Pick<ChannelRow, 'waba_id' | 'phone_num
 async function simulateStatuses(ctx: AppContext, channel: ChannelRow, wamid: string, to: string, message: WaMessage) {
   const base = ctx.config.sandboxStatusDelayMs;
   const ts = () => String(Math.floor(Date.now() / 1000));
+  // Meta echoes biz_opaque_callback_data in every status of a message that set it, failed included.
+  const callback = typeof message.biz_opaque_callback_data === 'string' ? { biz_opaque_callback_data: message.biz_opaque_callback_data } : {};
+  // The jobs belong to the workspace, as real webhooks do: unowned ones only get the slots of the
+  // fair 'inbound' lane that owned jobs leave free.
   if (to.endsWith('0000')) {
     const status = {
       id: wamid,
@@ -74,8 +78,9 @@ async function simulateStatuses(ctx: AppContext, channel: ChannelRow, wamid: str
       timestamp: ts(),
       recipient_id: to,
       errors: [{ code: 131026, title: 'Message undeliverable', message: 'Message undeliverable' }],
+      ...callback,
     };
-    await ctx.queue.enqueue('wa.webhook', { body: webhookEnvelope(channel, { statuses: [status] }) }, { delayMs: base });
+    await ctx.queue.enqueue('wa.webhook', { body: webhookEnvelope(channel, { statuses: [status] }) }, { delayMs: base, workspaceId: channel.workspace_id });
     return;
   }
   let pricing: Record<string, unknown> = { billable: false, pricing_model: 'PMP', category: 'service', type: 'free_customer_service' };
@@ -92,10 +97,8 @@ async function simulateStatuses(ctx: AppContext, channel: ChannelRow, wamid: str
     ['delivered', 2],
     ['read', 5],
   ];
-  // Meta echoes biz_opaque_callback_data in sent/delivered/read statuses.
-  const callback = typeof message.biz_opaque_callback_data === 'string' ? { biz_opaque_callback_data: message.biz_opaque_callback_data } : {};
   for (const [status, mult] of steps) {
     const st = { id: wamid, status, timestamp: ts(), recipient_id: to, pricing, ...callback };
-    await ctx.queue.enqueue('wa.webhook', { body: webhookEnvelope(channel, { statuses: [st] }) }, { delayMs: base * mult });
+    await ctx.queue.enqueue('wa.webhook', { body: webhookEnvelope(channel, { statuses: [st] }) }, { delayMs: base * mult, workspaceId: channel.workspace_id });
   }
 }

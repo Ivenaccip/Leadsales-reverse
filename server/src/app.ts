@@ -8,7 +8,7 @@ import { Server as IOServer } from 'socket.io';
 import type { Config } from './config.js';
 import type { AppContext } from './context.js';
 import { createDb, type Db } from './db/index.js';
-import { jobHandlers } from './jobs/handlers.js';
+import { jobGiveUpHandlers, jobHandlers } from './jobs/handlers.js';
 import { Queue } from './jobs/queue.js';
 import { Worker } from './jobs/worker.js';
 import { readCookie, verifyToken } from './lib/auth.js';
@@ -41,7 +41,13 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
     bodyLimit: 12 * 1024 * 1024,
     trustProxy: config.trustProxy as any,
   });
-  const db = opts.db ?? (await createDb({ databaseUrl: config.databaseUrl, dataDir: config.dataDir }));
+  const db =
+    opts.db ??
+    (await createDb({
+      databaseUrl: config.databaseUrl,
+      dataDir: config.dataDir,
+      onIdleError: (err) => app.log.warn({ err: err.message }, 'idle database connection lost'),
+    }));
   const queue = new Queue(db);
   const realtime = new Realtime();
   const ctx: AppContext = {
@@ -53,7 +59,7 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
     fetch: opts.fetch ?? fetch,
     webhookFetch: opts.fetch ?? createWebhookFetch(config.allowPrivateWebhooks),
   };
-  const worker = new Worker(ctx, jobHandlers);
+  const worker = new Worker(ctx, jobHandlers, { onGiveUp: jobGiveUpHandlers });
 
   // JSON parser that keeps the raw body for Meta's signature check and accepts empty bodies.
   app.removeContentTypeParser('application/json');
@@ -121,7 +127,11 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
       const token = readCookie(socket.handshake.headers.cookie, COOKIE);
       const payload = token ? verifyToken(config.jwtSecret, token) : null;
       if (!payload) return next(new Error('unauthorized'));
-      const { rows } = await db.query(`SELECT 1 FROM sessions WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`, [payload.sid, payload.uid]);
+      const { rows } = await db.query(
+        `SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id AND u.password_version = s.password_version
+         WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL`,
+        [payload.sid, payload.uid],
+      );
       if (!rows[0]) return next(new Error('unauthorized'));
       socket.data.userId = payload.uid;
       socket.data.sid = payload.sid;
@@ -138,15 +148,33 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
       const ack = typeof rawAck === 'function' ? (rawAck as (r: { ok: boolean }) => void) : undefined;
       try {
         if (typeof workspaceId !== 'string' || !/^[0-9a-f-]{36}$/i.test(workspaceId)) return ack?.({ ok: false });
-        const { rows } = await db.query<{ role: string | null; visibility: string | null; is_superadmin: boolean; ws_active: boolean }>(
-          `SELECT m.role, w.settings->>'agent_visibility' AS visibility, u.is_superadmin, w.is_active AS ws_active
-           FROM users u JOIN sessions s ON s.id = $3 AND s.user_id = u.id AND s.revoked_at IS NULL
-           JOIN workspaces w ON w.id = $1
-           LEFT JOIN memberships m ON m.workspace_id = w.id AND m.user_id = u.id AND m.is_active
-           WHERE u.id = $2`,
-          [workspaceId, socket.data.userId, socket.data.sid],
-        );
-        const r = rows[0];
+        // Rights are read, then rooms joined. Revocations commit first and evict after: if one that
+        // concerns this join evicted while we were reading, what we read may predate it, so read again.
+        const { userId, sid } = socket.data;
+        const evictions = realtime.watchEvictions([`ws:${workspaceId}`, `ws:${workspaceId}:u:${userId}`, `user:${userId}`, `sid:${sid}`]);
+        let r: { role: string | null; visibility: string | null; is_superadmin: boolean; ws_active: boolean } | undefined;
+        try {
+          for (let attempt = 0; ; attempt++) {
+            const epoch = evictions.count();
+            const { rows } = await db.query<{ role: string | null; visibility: string | null; is_superadmin: boolean; ws_active: boolean }>(
+              `SELECT m.role, w.settings->>'agent_visibility' AS visibility, u.is_superadmin, w.is_active AS ws_active
+               FROM users u JOIN sessions s ON s.id = $3 AND s.user_id = u.id AND s.revoked_at IS NULL AND s.password_version = u.password_version
+               JOIN workspaces w ON w.id = $1
+               LEFT JOIN memberships m ON m.workspace_id = w.id AND m.user_id = u.id AND m.is_active
+               WHERE u.id = $2`,
+              [workspaceId, userId, sid],
+            );
+            if (evictions.count() === epoch) {
+              r = rows[0];
+              break;
+            }
+            if (attempt >= 4) break; // rights keep changing: refuse, the client may retry
+          }
+        } finally {
+          evictions.release();
+        }
+        // Nothing awaited since the check above: an eviction from now on finds this socket in its rooms.
+        if (!socket.connected) return;
         if (!r || (!r.is_superadmin && (!r.role || !r.ws_active))) {
           // A refused switch must not leave the socket listening to the previous workspace either.
           for (const room of socket.rooms) if (room.startsWith('ws:')) socket.leave(room);

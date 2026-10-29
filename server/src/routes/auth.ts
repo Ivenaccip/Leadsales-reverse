@@ -3,10 +3,10 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import type { Queryable } from '../db/index.js';
-import { dummyPasswordHash, hashPassword, signToken, verifyPassword } from '../lib/auth.js';
+import { dummyPasswordHash, hashPassword, knownDevice, rememberDevice, signToken, verifyPassword } from '../lib/auth.js';
 import { badRequest, conflict, forbidden, unauthorized } from '../lib/errors.js';
 import { topup } from '../services/credits.js';
-import { COOKIE, parse, RateLimiter, requireSession, requireUser, tooManyAttempts } from './helpers.js';
+import { COOKIE, DEVICE_COOKIE, parse, RateLimiter, requireSession, requireUser, tooManyAttempts } from './helpers.js';
 
 export const DEFAULT_STAGES = [
   { name: 'Nuevo', color: '#3b82f6', kind: 'open' },
@@ -78,13 +78,16 @@ async function hasUsers(q: Queryable): Promise<boolean> {
   return rows[0].x;
 }
 
-/** Opens a revocable session (one row per login) and sets its cookie. */
-export async function startSession(ctx: AppContext, req: FastifyRequest, reply: FastifyReply, userId: string) {
-  const { rows } = await ctx.db.query<{ id: string }>(`INSERT INTO sessions (user_id, user_agent, ip) VALUES ($1, $2, $3) RETURNING id`, [
-    userId,
-    String(req.headers['user-agent'] ?? '').slice(0, 300) || null,
-    req.ip,
-  ]);
+/**
+ * Opens a revocable session (one row per login) and sets its cookie. `passwordVersion` is the
+ * version read together with the password that was just verified (or set): if the password
+ * changed meanwhile, the session is born stale and never works.
+ */
+export async function startSession(ctx: AppContext, req: FastifyRequest, reply: FastifyReply, userId: string, passwordVersion: number) {
+  const { rows } = await ctx.db.query<{ id: string }>(
+    `INSERT INTO sessions (user_id, user_agent, ip, password_version) VALUES ($1, $2, $3, $4) RETURNING id`,
+    [userId, String(req.headers['user-agent'] ?? '').slice(0, 300) || null, req.ip, passwordVersion],
+  );
   // Old rows only serve to recognize addresses that signed in before (see the login limiter).
   await ctx.db.query(`DELETE FROM sessions WHERE user_id = $1 AND created_at < now() - interval '90 days'`, [userId]);
   reply.setCookie(COOKIE, signToken(ctx.config.jwtSecret, { uid: userId, sid: rows[0].id }), {
@@ -93,6 +96,25 @@ export async function startSession(ctx: AppContext, req: FastifyRequest, reply: 
     sameSite: 'lax',
     secure: ctx.config.publicUrl.startsWith('https://'),
     maxAge: 30 * 24 * 3600,
+  });
+  rememberThisDevice(ctx, req, reply, userId, passwordVersion);
+}
+
+const DEVICE_COOKIE_PATH = '/api/auth';
+
+/** This browser now counts as one the account signed in from (see the login limiter). */
+function rememberThisDevice(ctx: AppContext, req: FastifyRequest, reply: FastifyReply, userId: string, passwordVersion: number) {
+  // The browser sends the cookie only under its path. Elsewhere (e.g. registering through an
+  // invitation) the entries of the other accounts in this browser are unknown here, and rewriting
+  // the cookie would drop them: this account gets its entry at its next login instead.
+  if (!req.url.startsWith(`${DEVICE_COOKIE_PATH}/`)) return;
+  const current = (req.cookies as Record<string, string | undefined> | undefined)?.[DEVICE_COOKIE];
+  reply.setCookie(DEVICE_COOKIE, rememberDevice(ctx.config.jwtSecret, current, userId, passwordVersion), {
+    path: DEVICE_COOKIE_PATH,
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: ctx.config.publicUrl.startsWith('https://'),
+    maxAge: 365 * 24 * 3600,
   });
 }
 
@@ -134,6 +156,8 @@ const loginSchema = z.object({
 });
 
 const WINDOW = 15 * 60 * 1000;
+/** Stands in for an unknown account, so its checks cost the same as a real one's. */
+const NO_USER = '00000000-0000-0000-0000-000000000000';
 
 /** Whether the account signed in (sessions are kept 90 days) from this client network before. */
 async function signedInFrom(ctx: AppContext, userId: string, client: string): Promise<boolean> {
@@ -165,10 +189,16 @@ export async function authRoutes(app: FastifyInstance, ctx: AppContext) {
   // - per client network + account: the one limit that always applies
   const pairLimiter = new RateLimiter(10, WINDOW);
   // - per account regardless of IP, so rotating addresses does not allow unlimited guesses.
-  // A network that already signed in to the account is exempt from the two shared buckets, so
-  // neither someone behind the same NAT nor someone elsewhere can lock the owner out.
+  // A browser that signed in to the account before (device cookie), or a network that did, is
+  // exempt from the two shared buckets, so neither someone behind the same NAT nor someone
+  // elsewhere can lock the owner out, even when her address changes.
   const accountLimiter = new RateLimiter(30, WINDOW);
+  // - per device cookie: a stolen one is no unlimited pass around the shared buckets
+  const deviceLimiter = new RateLimiter(10, WINDOW);
   const registerLimiter = new RateLimiter(10, WINDOW);
+  // - current-password checks, per session: a stolen session is no unlimited password oracle, and
+  // its guesses cannot use up the owner's budget (changing the password is how she ends it)
+  const passwordLimiter = new RateLimiter(10, WINDOW);
   void dummyPasswordHash();
 
   app.get('/api/instance', async () => {
@@ -190,45 +220,65 @@ export async function authRoutes(app: FastifyInstance, ctx: AppContext) {
     const closed = () => forbidden('El registro está cerrado en esta instancia. Pide una invitación.');
     // Cheap early answer; the decision that counts is taken again under the lock below.
     if (!ctx.config.allowSignup && (await hasUsers(ctx.db))) throw closed();
+    const taken = () => conflict('Ya existe una cuenta con ese correo', 'EMAIL_TAKEN');
+    // Answered before paying for bcrypt (the answer is the same either way).
+    if ((await ctx.db.query(`SELECT 1 FROM users WHERE email = $1`, [body.email])).rows[0]) throw taken();
     const hash = await hashPassword(body.password);
-    const userId = await ctx.db.tx(async (q) => {
+    const created = await ctx.db.tx(async (q) => {
       await lockSignups(q);
       const first = !(await hasUsers(q));
       if (!first && !ctx.config.allowSignup) throw closed();
       const exists = await q.query(`SELECT 1 FROM users WHERE email = $1`, [body.email]);
-      if (exists.rows[0]) throw conflict('Ya existe una cuenta con ese correo', 'EMAIL_TAKEN');
-      const u = await q.query<{ id: string }>(
-        `INSERT INTO users (email, password_hash, name, is_superadmin) VALUES ($1, $2, $3, $4) RETURNING id`,
+      if (exists.rows[0]) throw taken();
+      const u = await q.query<{ id: string; password_version: number }>(
+        `INSERT INTO users (email, password_hash, name, is_superadmin) VALUES ($1, $2, $3, $4) RETURNING id, password_version`,
         [body.email, hash, body.name, first],
       );
       await createWorkspace(ctx, q, u.rows[0].id, body.workspaceName, { timezone: body.timezone, countryCode: body.countryCode });
-      return u.rows[0].id;
+      return u.rows[0];
     });
-    await startSession(ctx, req, reply, userId);
-    return sessionResponse(ctx, userId);
+    await startSession(ctx, req, reply, created.id, created.password_version);
+    return sessionResponse(ctx, created.id);
   });
 
   app.post('/api/auth/login', async (req, reply) => {
     const body = parse(loginSchema, req.body);
     const client = clientNet(req.ip);
-    const { rows } = await ctx.db.query<{ id: string; password_hash: string }>(`SELECT id, password_hash FROM users WHERE email = $1`, [
-      body.email,
-    ]);
+    const { rows } = await ctx.db.query<{ id: string; password_hash: string; password_version: number }>(
+      `SELECT id, password_hash, password_version FROM users WHERE email = $1`,
+      [body.email],
+    );
     const user = rows[0];
+    // A browser that signed in to this account with its current password, wherever it connects from.
+    const device = knownDevice(ctx.config.jwtSecret, (req.cookies as Record<string, string | undefined>)?.[DEVICE_COOKIE], user ?? null);
+    const deviceOk = device !== null && !deviceLimiter.blocked(device);
     let known: Promise<boolean> | undefined;
-    const knownNet = () => (known ??= user ? signedInFrom(ctx, user.id, client) : Promise.resolve(false));
+    // Same query for an unknown email, so not even a 429 tells whether the account exists.
+    const knownNet = () => (known ??= signedInFrom(ctx, user?.id ?? NO_USER, client).then((k) => k && !!user));
+    const exempt = async () => deviceOk || (await knownNet());
     // The network bucket goes first so a blocked network cannot create new per-account keys.
-    const netCounted = await take(netLimiter, client, knownNet);
+    const netCounted = await take(netLimiter, client, exempt);
     const pair = `${client}\n${body.email}`;
     pairLimiter.hit(pair);
-    const accountCounted = await take(accountLimiter, body.email, knownNet);
-    // Always pay for one bcrypt comparison so the response time does not reveal whether the account exists.
-    const ok = await verifyPassword(body.password, user?.password_hash ?? (await dummyPasswordHash()));
+    const accountCounted = await take(accountLimiter, body.email, exempt);
+    if (deviceOk) deviceLimiter.hit(device);
+    const giveBack = () => {
+      if (netCounted) netLimiter.undo(client);
+      pairLimiter.undo(pair);
+      if (accountCounted) accountLimiter.undo(body.email);
+      if (deviceOk) deviceLimiter.undo(device);
+    };
+    let ok: boolean;
+    try {
+      // Always pay for one bcrypt comparison so the response time does not reveal whether the account exists.
+      ok = await verifyPassword(body.password, user?.password_hash ?? (await dummyPasswordHash()));
+    } catch (err) {
+      giveBack(); // nothing was checked (e.g. the server is busy): the attempt does not count
+      throw err;
+    }
     if (!user || !ok) throw unauthorized('Correo o contraseña incorrectos');
-    if (netCounted) netLimiter.undo(client);
-    pairLimiter.undo(pair);
-    if (accountCounted) accountLimiter.undo(body.email);
-    await startSession(ctx, req, reply, user.id);
+    giveBack();
+    await startSession(ctx, req, reply, user.id, user.password_version);
     return sessionResponse(ctx, user.id);
   });
 
@@ -247,7 +297,7 @@ export async function authRoutes(app: FastifyInstance, ctx: AppContext) {
     return { user, workspaces: await workspacesOf(ctx, user.id) };
   });
 
-  app.patch('/api/auth/me', async (req) => {
+  app.patch('/api/auth/me', async (req, reply) => {
     const { user, sid } = await requireSession(ctx, req);
     const body = parse(
       z.object({
@@ -258,14 +308,37 @@ export async function authRoutes(app: FastifyInstance, ctx: AppContext) {
       req.body,
     );
     if (body.password) {
-      const { rows } = await ctx.db.query<{ password_hash: string }>(`SELECT password_hash FROM users WHERE id = $1`, [user.id]);
-      if (!body.currentPassword || !(await verifyPassword(body.currentPassword, rows[0].password_hash))) {
-        throw badRequest('La contraseña actual no es correcta');
+      if (passwordLimiter.blocked(sid)) throw tooManyAttempts();
+      const { rows } = await ctx.db.query<{ password_hash: string; password_version: number }>(
+        `SELECT password_hash, password_version FROM users WHERE id = $1`,
+        [user.id],
+      );
+      passwordLimiter.hit(sid);
+      let ok = false;
+      try {
+        ok = !!body.currentPassword && (await verifyPassword(body.currentPassword, rows[0].password_hash));
+      } catch (err) {
+        passwordLimiter.undo(sid);
+        throw err;
       }
-      await ctx.db.query(`UPDATE users SET password_hash = $2 WHERE id = $1`, [user.id, await hashPassword(body.password)]);
-      // A new password ends every other session (a stolen cookie stops working); this one stays.
-      await ctx.db.query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL`, [user.id, sid]);
+      if (!ok) throw badRequest('La contraseña actual no es correcta');
+      passwordLimiter.undo(sid);
+      const hash = await hashPassword(body.password);
+      const version = await ctx.db.tx(async (q) => {
+        // Only over the version whose password was just verified: of two concurrent changes, one wins.
+        const r = await q.query<{ password_version: number }>(
+          `UPDATE users SET password_hash = $2, password_version = password_version + 1 WHERE id = $1 AND password_version = $3 RETURNING password_version`,
+          [user.id, hash, rows[0].password_version],
+        );
+        if (!r.rows[0]) return null;
+        // A new password ends every other session (a stolen cookie stops working); this one stays.
+        await q.query(`UPDATE sessions SET password_version = $2 WHERE id = $1`, [sid, r.rows[0].password_version]);
+        await q.query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL`, [user.id, sid]);
+        return r.rows[0].password_version;
+      });
+      if (version === null) throw conflict('La contraseña acaba de cambiar desde otra sesión. Vuelve a intentarlo.', 'PASSWORD_CHANGED');
       await ctx.realtime.endSessions({ userId: user.id, exceptSid: sid });
+      rememberThisDevice(ctx, req, reply, user.id, version);
     }
     if (body.name) await ctx.db.query(`UPDATE users SET name = $2 WHERE id = $1`, [user.id, body.name]);
     const { rows } = await ctx.db.query(`SELECT id, email, name, is_superadmin FROM users WHERE id = $1`, [user.id]);

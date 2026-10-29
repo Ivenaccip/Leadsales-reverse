@@ -427,7 +427,8 @@ describe('opt-out', () => {
   });
 
   it('a template quick-reply button or an interactive reply opts out too (#46, #62)', async () => {
-    const button = { from: '5215544444646', id: newWamid(), timestamp: nowTs(), type: 'button', button: { text: 'Baja', payload: 'Baja' } };
+    // Meta's marketing opt-out button; without a payload set at send time Meta repeats the text
+    const button = { from: '5215544444646', id: newWamid(), timestamp: nowTs(), type: 'button', button: { text: 'Detener promociones', payload: 'Detener promociones' } };
     const listReply = {
       from: '5215544446262',
       id: newWamid(),
@@ -435,7 +436,7 @@ describe('opt-out', () => {
       type: 'interactive',
       interactive: { type: 'button_reply', button_reply: { id: 'stop', title: 'STOP' } },
     };
-    const byPayload = { from: '5215544446263', id: newWamid(), timestamp: nowTs(), type: 'button', button: { text: 'No me interesa', payload: 'BAJA' } };
+    const byPayload = { from: '5215544446263', id: newWamid(), timestamp: nowTs(), type: 'button', button: { text: 'No me interesa', payload: 'STOP' } };
     await deliver([button, listReply, byPayload]);
     for (const m of [button, listReply, byPayload]) {
       const stored = await messageByWamid(m.id);

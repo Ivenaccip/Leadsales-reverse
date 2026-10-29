@@ -161,7 +161,15 @@ export interface Message {
   reply_to_wamid: string | null;
   /** 'unknown': sent, but Meta's answer was lost (error explains it); a status webhook may still settle it. */
   status: 'pending' | 'unknown' | 'sent' | 'delivered' | 'read' | 'failed' | 'received' | 'note';
-  error: { code?: number | null; title?: string; message?: string } | null;
+  error: {
+    code?: number | null;
+    title?: string;
+    message?: string;
+    /** The send never reached Meta (network failure): nothing went out and its charge was refunded. */
+    network?: boolean;
+    /** A broadcast or scheduled send retries it by itself, as this same message: do not resend it by hand. */
+    auto_retry?: boolean;
+  } | null;
   sent_by: string | null;
   user_id: string | null;
   user_name?: string | null;

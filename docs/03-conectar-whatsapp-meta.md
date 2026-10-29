@@ -76,6 +76,9 @@ Pulsa **Verificar y guardar** y luego, en **Campos del webhook**, suscríbete a:
 
 - `messages` (mensajes y estados de entrega, incluye el precio de cada mensaje)
 - `message_template_status_update` (aprobación/rechazo de plantillas)
+- `message_template_components_update` (cambios en el contenido de una plantilla, por
+  ejemplo al editarla en WhatsApp Manager: LeadLibre vuelve a leerla de Meta para enviar
+  siempre la versión vigente)
 - opcional: `template_category_update`, `smb_message_echoes` (coexistencia)
 
 Escríbele a tu número desde otro WhatsApp: el mensaje debe aparecer en la **Bandeja**.

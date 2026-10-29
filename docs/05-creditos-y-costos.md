@@ -31,15 +31,38 @@ Mensaje fallido ─────────────────────�
 - **Fallos**: si Meta rechaza o no entrega el mensaje, se reembolsa. Meta solo cobra lo
   entregado: un mensaje que ya se había conciliado como cobrable al pasar a "enviado" y
   después falla sin entregarse también recupera su cargo.
+- **Sin conexión con Meta**: si la conexión falla antes de llegar a Meta (DNS, conexión
+  rechazada, certificado), nada salió: el mensaje queda fallido (`error.network`) y se
+  reembolsa. Las difusiones y los programados lo reintentan solos, sobre el mismo mensaje
+  y con espera creciente (de 30 s a 8 min); también reintentan los envíos que Meta frena
+  por velocidad. Una difusión se pausa si la conexión no vuelve en unos 15 minutos, sin
+  dar por fallido a nadie (la reanudas cuando todo funcione), y un programado se da por
+  fallido tras 5 reintentos. Un mensaje que espera su reintento lo dice en la bandeja
+  (`error.auto_retry`): no lo reenvíes a mano o llegaría duplicado. Los envíos de la
+  bandeja, la API, el bot y la IA no se reintentan solos.
 - **Sin confirmar**: si la respuesta de Meta a un envío se pierde (falla de red, tiempo
   agotado o error 5xx de Meta), el mensaje queda "Sin confirmar" (`unknown`). Meta pudo
   haberlo entregado y cobrado, así que el cargo se conserva y LeadLibre no lo reenvía
-  solo. Cuando llegan los webhooks de estado de Meta (las plantillas llevan el id del
-  mensaje para reconocerlo), se concilia o se reembolsa como cualquier otro.
+  solo. Todo envío, no solo las plantillas, lleva el id del mensaje en
+  `biz_opaque_callback_data`: cuando llegan los webhooks de estado de Meta, se concilia o
+  se reembolsa como cualquier otro. Meta reintenta sus webhooks hasta 7 días: un mensaje
+  que a los 7 días sigue sin confirmar (o `pending`, porque el servidor se cayó a medio
+  envío) sin ningún estado de Meta nunca llegó, así que pasa a fallido y se reembolsa.
+- **Borrar contactos**: un contacto con un mensaje cobrado del saldo prepagado que Meta
+  todavía puede reembolsar o ajustar (hasta 30 días después del envío) no se borra: el
+  ajuste necesita el mensaje. Borrarlo responde `409 CONTACT_BILLING_PENDING`, y el borrado
+  masivo lo archiva en su lugar (responde cuántos se archivaron); podrás borrarlo cuando
+  Meta confirme sus mensajes.
 - **Cada cargo recuerda su modo**: los reembolsos y ajustes de un mensaje van a donde fue
   su cargo (el saldo prepagado o el gasto medido de `meta_direct`), según el modo del
   espacio al enviarlo. Cambiar de modo con mensajes en camino no crea ni pierde créditos.
-- Todo queda en **Créditos → Movimientos** (libro contable por espacio).
+  Los reembolsos y ajustes de un mensaje cobrado del saldo prepagado solo los aceptan
+  estados firmados con una clave que el negocio no conoce (la `META_APP_SECRET` global o
+  la *App Secret* de un número que verificó el operador): si el espacio vuelve a
+  `meta_direct` y el negocio pone su propia clave en el número, sus estados actualizan las
+  palomitas pero ya no mueven el saldo prepagado.
+- Todo queda en **Créditos → Movimientos** (libro contable por espacio). El gasto "de
+  este mes" es el mes calendario en la zona horaria del espacio.
 
 ## Dos modos (por espacio de trabajo)
 
@@ -69,7 +92,10 @@ y Tobago, Barbados…), la de resto del mundo.
 ## Estimar una campaña
 
 En **Difusiones → Nueva**, el paso de audiencia muestra destinatarios, desglose por país
-y costo total antes de enviar. Los contactos que respondieron **BAJA/STOP** se excluyen.
+y costo total antes de enviar. Los contactos que respondieron **BAJA/STOP** (o que tu
+equipo marcó como baja) se excluyen. La baja solo los saca de las difusiones: si después
+te escriben, el bot y la IA les responden como a cualquiera; el mensaje de baja en sí no
+recibe respuesta automática.
 
 ## Comparación con Leadsales
 
@@ -86,3 +112,9 @@ El agente IA usa **tu propia llave de Claude (Anthropic)**: también pagas solo 
 créditos de uso en console.anthropic.com. Por defecto usa `claude-opus-5-5` con esfuerzo
 bajo (respuestas rápidas y económicas) y caché del prompt; puedes elegir Sonnet o Haiku
 para reducir costo.
+
+Para acotar el gasto y el tiempo, cada respuesta del agente tiene un tope de unos 1024
+tokens (si se corta, termina en la última oración completa) y sale en mensajes de hasta
+4096 caracteres, el máximo de WhatsApp. Cada petición a Claude se corta a los 60 s y
+cada respuesta completa (con reintentos y herramientas) a los 4 minutos. El agente
+responde a contactos que se dieron de baja de las difusiones, pero no al mensaje de baja.

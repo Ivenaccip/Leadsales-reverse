@@ -1,6 +1,8 @@
 # Caddy obtiene y renueva el certificado HTTPS automáticamente (Let's Encrypt).
 # Meta exige HTTPS válido para el webhook de WhatsApp.
+# Caddy corre en la red del host y llega a la app por el puerto que Docker publica en 127.0.0.1.
+# Fija X-Forwarded-For con la IP real del cliente (descarta la que traiga el cliente).
 {$DOMAIN} {
 	encode gzip
-	reverse_proxy app:3000
+	reverse_proxy 127.0.0.1:{$APP_PORT:3000}
 }

@@ -11,22 +11,34 @@ function decodeWindows1252(bytes: Uint8Array): string {
   return new TextDecoder('windows-1252').decode(bytes).replace(/[\u0080-\u009f]/g, (c) => CP1252_C1[c.charCodeAt(0) - 0x80]);
 }
 
+function decodeStrict(label: string, bytes: Uint8Array): { text: string; lossy: boolean } {
+  try {
+    return { text: new TextDecoder(label, { fatal: true }).decode(bytes), lossy: false };
+  } catch {
+    return { text: new TextDecoder(label).decode(bytes), lossy: true };
+  }
+}
+
 /**
  * Text of an uploaded CSV. Excel's plain "CSV (delimitado por comas)" is ANSI (windows-1252) in
  * Spanish locales and its "Texto Unicode" is UTF-16, so those are decoded here instead of being
- * refused by the server. Anything else is passed on as lossy UTF-8: the server then answers
- * CSV_NOT_UTF8 with the hint to save the file as "CSV UTF-8".
+ * refused by the server. Anything else is passed on as lossy UTF-8 (`lossy`: its bad bytes became
+ * U+FFFD): the server then answers CSV_NOT_UTF8 with the hint to save the file as "CSV UTF-8".
  */
-export function decodeCsv(data: ArrayBuffer | Uint8Array): string {
+export function decodeCsvFile(data: ArrayBuffer | Uint8Array): { text: string; lossy: boolean } {
   const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-  if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le').decode(bytes);
-  if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes);
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return decodeStrict('utf-16le', bytes);
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return decodeStrict('utf-16be', bytes);
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return { text: new TextDecoder('utf-8', { fatal: true }).decode(bytes), lossy: false };
   } catch {
     // Every byte is valid windows-1252, so only fall back for what looks like text.
     const latin = decodeWindows1252(bytes);
-    if (!BINARY_BYTE.test(latin)) return latin;
-    return new TextDecoder('utf-8').decode(bytes);
+    if (!BINARY_BYTE.test(latin)) return { text: latin, lossy: false };
+    return { text: new TextDecoder('utf-8').decode(bytes), lossy: true };
   }
+}
+
+export function decodeCsv(data: ArrayBuffer | Uint8Array): string {
+  return decodeCsvFile(data).text;
 }

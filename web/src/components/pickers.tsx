@@ -1,7 +1,18 @@
 import { useMemo, useState } from 'react';
 import { Check, Plus, Search } from 'lucide-react';
+import { errorMessage } from '../lib/api';
 import type { Funnel, Member, Tag } from '../lib/types';
 import { cx, Select, TagChip } from './ui';
+
+export const TAG_NAME_HINT = 'Máximo 40 caracteres, sin ; , ni | (separan etiquetas al importar un CSV).';
+
+/** Same rule as the server: ; , and | split a CSV tags cell, so a name with one would not import back whole. */
+export function tagNameProblem(name: string): string | null {
+  const n = name.trim();
+  if (/[;,|]/.test(n)) return 'El nombre de una etiqueta no puede llevar ; , ni |';
+  if (n.length > 40) return 'El nombre de una etiqueta admite máximo 40 caracteres';
+  return null;
+}
 
 /** Multi-select of tags with search; optionally lets the user create a tag. */
 export function TagMultiSelect({
@@ -19,6 +30,7 @@ export function TagMultiSelect({
 }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
+  const [createError, setCreateError] = useState<string | null>(null);
   const selected = tags.filter((t) => value.includes(t.id));
   const filtered = tags.filter((t) => t.name.toLowerCase().includes(q.toLowerCase()));
   const exact = tags.some((t) => t.name.toLowerCase() === q.trim().toLowerCase());
@@ -40,7 +52,16 @@ export function TagMultiSelect({
           <div className="absolute left-0 right-0 z-40 mt-1 rounded-lg border border-slate-200 bg-white p-1 shadow-lg">
             <div className="flex items-center gap-2 border-b border-slate-100 px-2 pb-1">
               <Search className="h-4 w-4 text-slate-400" />
-              <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar…" className="h-8 flex-1 text-sm outline-none" />
+              <input
+                autoFocus
+                value={q}
+                onChange={(e) => {
+                  setQ(e.target.value);
+                  setCreateError(null);
+                }}
+                placeholder="Buscar…"
+                className="h-8 flex-1 text-sm outline-none"
+              />
             </div>
             <div className="scroll-thin max-h-56 overflow-y-auto py-1">
               {filtered.map((t) => (
@@ -50,19 +71,25 @@ export function TagMultiSelect({
                   {value.includes(t.id) && <Check className="h-4 w-4 text-brand-600" />}
                 </button>
               ))}
-              {onCreate && q.trim() && !exact && (
+              {onCreate && q.trim() && !exact && tagNameProblem(q) && <p className="px-2 py-1.5 text-xs text-amber-700">{tagNameProblem(q)}</p>}
+              {onCreate && q.trim() && !exact && !tagNameProblem(q) && (
                 <button
                   type="button"
                   onClick={async () => {
-                    const t = await onCreate(q.trim());
-                    onChange([...value, t.id]);
-                    setQ('');
+                    try {
+                      const t = await onCreate(q.trim());
+                      onChange([...value, t.id]);
+                      setQ('');
+                    } catch (err) {
+                      setCreateError(errorMessage(err));
+                    }
                   }}
                   className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-brand-700 hover:bg-brand-50"
                 >
                   <Plus className="h-4 w-4" /> Crear “{q.trim()}”
                 </button>
               )}
+              {createError && <p className="px-2 py-1.5 text-xs text-red-600">{createError}</p>}
               {!filtered.length && !q && <p className="px-2 py-2 text-xs text-slate-400">No hay etiquetas</p>}
             </div>
           </div>

@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { badRequest, forbidden } from '../lib/errors.js';
 import { assertWhatsAppMedia, getMedia, mediaAbsPath, saveMedia } from '../services/media.js';
-import { overviewReport } from '../services/reports.js';
+import { dayStart, localDay, overviewReport, workspaceTimezone } from '../services/reports.js';
 import { ADMIN_ROLES, agentRestricted, parse, requireWs, uuid } from './helpers.js';
 
 const INLINE_SAFE = new Set([
@@ -31,25 +31,36 @@ const MIME_ALIASES: Record<string, string> = {
   'audio/x-aac': 'audio/aac',
 };
 
+const calendarDay = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Usa fechas AAAA-MM-DD')
+  .refine((d) => {
+    const t = Date.parse(`${d}T00:00:00Z`);
+    return !Number.isNaN(t) && new Date(t).toISOString().startsWith(d);
+  }, 'Fecha inválida');
+
 /** Créditos, reportes y archivos. */
 export async function miscRoutes(app: FastifyInstance, ctx: AppContext) {
   // ---- Credits ----
   app.get('/api/credits', async (req) => {
     const a = await requireWs(ctx, req);
+    // "This month" is the calendar month of the workspace's time zone.
+    const tz = await workspaceTimezone(ctx, a.workspaceId);
+    const month = dayStart(`${localDay(tz).slice(0, 8)}01`, tz);
     const { rows } = await ctx.db.query<Record<string, unknown>>(
       `SELECT w.billing_mode, w.credit_balance::float AS balance,
          COALESCE((SELECT -sum(amount) FROM credit_ledger l WHERE l.workspace_id = w.id AND l.kind IN ('charge', 'refund')
-           AND l.created_at >= date_trunc('month', now())), 0)::float AS spent_this_month,
+           AND l.created_at >= $2), 0)::float AS spent_this_month,
          COALESCE((SELECT -sum(amount) FROM credit_ledger l WHERE l.workspace_id = w.id AND l.kind IN ('charge', 'refund')), 0)::float AS spent_total,
-         COALESCE((SELECT count(*) FROM messages m WHERE m.workspace_id = w.id AND m.cost > 0 AND m.created_at >= date_trunc('month', now())), 0)::int AS billable_messages_this_month
+         COALESCE((SELECT count(*) FROM messages m WHERE m.workspace_id = w.id AND m.cost > 0 AND m.created_at >= $2), 0)::int AS billable_messages_this_month
        FROM workspaces w WHERE w.id = $1`,
-      [a.workspaceId],
+      [a.workspaceId, month],
     );
     const byCategory = await ctx.db.query(
       `SELECT billing_category AS category, count(*)::int AS messages, COALESCE(sum(cost), 0)::float AS cost
-       FROM messages WHERE workspace_id = $1 AND cost > 0 AND created_at >= date_trunc('month', now())
+       FROM messages WHERE workspace_id = $1 AND cost > 0 AND created_at >= $2
        GROUP BY billing_category ORDER BY cost DESC`,
-      [a.workspaceId],
+      [a.workspaceId, month],
     );
     return { ...rows[0], by_category: byCategory.rows };
   });
@@ -77,12 +88,16 @@ export async function miscRoutes(app: FastifyInstance, ctx: AppContext) {
   // ---- Reports ----
   app.get('/api/reports/overview', async (req) => {
     const a = await requireWs(ctx, req);
-    const q = parse(z.object({ from: z.string().optional(), to: z.string().optional() }), req.query);
-    const to = q.to ? new Date(new Date(q.to).getTime() + 24 * 3600 * 1000) : new Date();
-    const from = q.from ? new Date(q.from) : new Date(to.getTime() - 30 * 24 * 3600 * 1000);
-    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from >= to) throw badRequest('Rango de fechas inválido');
-    if (to.getTime() - from.getTime() > 400 * 24 * 3600 * 1000) throw badRequest('El rango máximo es de 400 días');
-    return overviewReport(ctx, a.workspaceId, from, to);
+    // Calendar days (both included) of the workspace's time zone.
+    const q = parse(z.object({ from: calendarDay.optional(), to: calendarDay.optional() }), req.query);
+    const tz = await workspaceTimezone(ctx, a.workspaceId);
+    const to = q.to ?? localDay(tz);
+    const dayMs = 24 * 3600 * 1000;
+    const from = q.from ?? new Date(Date.parse(`${to}T00:00:00Z`) - 29 * dayMs).toISOString().slice(0, 10);
+    const span = (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / dayMs + 1;
+    if (span < 1) throw badRequest('Rango de fechas inválido');
+    if (span > 400) throw badRequest('El rango máximo es de 400 días');
+    return overviewReport(ctx, a.workspaceId, from, to, tz);
   });
 
   // ---- Media ----

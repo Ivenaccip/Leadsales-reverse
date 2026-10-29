@@ -10,9 +10,19 @@ import {
   launchBroadcast,
   type BroadcastRow,
 } from '../services/broadcasts.js';
+import { abandonAutoRetry } from '../services/messages.js';
 import { findTemplate } from '../services/templates.js';
 import { getChannel } from '../whatsapp/provider.js';
 import { ADMIN_ROLES, noContent, parse, requireWs, uuid } from './helpers.js';
+
+// "Creados desde/hasta": calendar days of the workspace's time zone (see audienceWhere).
+const calendarDay = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Usa fechas AAAA-MM-DD')
+  .refine((d) => {
+    const t = Date.parse(`${d}T00:00:00Z`);
+    return !Number.isNaN(t) && new Date(t).toISOString().startsWith(d);
+  }, 'Fecha inválida');
 
 const audienceSchema = z.object({
   funnel_id: uuid.nullable().optional(),
@@ -20,8 +30,8 @@ const audienceSchema = z.object({
   tag_ids: z.array(uuid).optional(),
   exclude_tag_ids: z.array(uuid).optional(),
   assigned_user_id: uuid.nullable().optional(),
-  created_from: z.string().nullable().optional(),
-  created_to: z.string().nullable().optional(),
+  created_from: calendarDay.nullable().optional(),
+  created_to: calendarDay.nullable().optional(),
   contact_ids: z.array(uuid).max(50_000).optional(),
 });
 
@@ -40,9 +50,13 @@ const paramsSchema = z.object({
     ])
     .optional(),
   body: z.array(z.string().min(1).max(1024)).max(30).optional(),
-  bodyNamed: z.record(z.string(), z.string().min(1).max(1024)).optional(),
+  bodyNamed: z
+    .record(z.string().min(1).max(100), z.string().min(1).max(1024))
+    .refine((r) => Object.keys(r).length <= 30, 'Una plantilla admite como máximo 30 variables')
+    .optional(),
   buttons: z
     .array(z.object({ index: z.number().int().min(0).max(9), value: z.string().min(1).max(200), sub_type: z.enum(['url', 'copy_code']).optional() }))
+    .max(10)
     .optional(),
 });
 
@@ -127,7 +141,12 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
     const { id } = parse(z.object({ id: uuid }), req.params);
     const body = parse(patchSchema, req.body);
     const b = await getBroadcast(ctx.db, a.workspaceId, id);
-    if (b.status !== 'draft') throw badRequest('Solo puedes editar difusiones en borrador');
+    // A paused broadcast can be fixed and resumed (e.g. a template sync added a variable and it paused
+    // with TEMPLATE_PARAMS_MISSING). Its recipients were chosen at launch, so its audience is fixed.
+    if (b.status !== 'draft' && b.status !== 'paused') throw badRequest('Solo puedes editar difusiones en borrador o en pausa');
+    if (b.status !== 'draft' && body.audience) {
+      throw badRequest('La audiencia de una difusión ya lanzada no se puede cambiar', 'AUDIENCE_LOCKED');
+    }
     // Resolve the channel inside this workspace (a foreign or unknown id is a 400, never stored)
     // and check the template exists there, like POST does.
     const channel = await getChannel(ctx.db, a.workspaceId, body.channel_id ?? b.channel_id);
@@ -135,12 +154,13 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
     if (!tpl) throw badRequest('Esa plantilla no existe en el canal elegido');
     // The stored params must fit a newly chosen template (or channel) too; a rename alone checks nothing.
     if (body.template_name || body.template_language || body.channel_id || body.params) checkBroadcastParams(tpl.components, body.params ?? b.params);
-    const est = await estimateAudience(ctx, a.workspaceId, body.audience ?? b.audience, tpl.category);
+    // Only a draft's audience is still an estimate; a launched broadcast keeps its recipients and totals.
+    const est = b.status === 'draft' ? await estimateAudience(ctx, a.workspaceId, body.audience ?? b.audience, tpl.category) : null;
     const { rows } = await ctx.db.query<BroadcastRow>(
       `UPDATE broadcasts SET name = COALESCE($2, name), template_name = COALESCE($3, template_name), template_language = COALESCE($4, template_language),
          params = COALESCE($5, params), audience = COALESCE($6, audience), scheduled_at = CASE WHEN $7 THEN $8::timestamptz ELSE scheduled_at END,
-         channel_id = $9, template_category = $10, total_recipients = $11, estimated_cost = $12
-       WHERE id = $1 AND status = 'draft' RETURNING *`,
+         channel_id = $9, template_category = $10, total_recipients = COALESCE($11, total_recipients), estimated_cost = COALESCE($12, estimated_cost)
+       WHERE id = $1 AND status = $13 RETURNING *`,
       [
         id,
         body.name ?? null,
@@ -152,11 +172,12 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
         body.scheduled_at ?? null,
         channel.id,
         tpl.category,
-        est.recipients,
-        est.cost,
+        est?.recipients ?? null,
+        est?.cost ?? null,
+        b.status,
       ],
     );
-    if (!rows[0]) throw badRequest('Solo puedes editar difusiones en borrador');
+    if (!rows[0]) throw badRequest('La difusión cambió de estado mientras la editabas. Recarga la página.', 'BROADCAST_CHANGED');
     return { broadcast: await withStats(ctx, rows[0]) };
   });
 
@@ -188,6 +209,8 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
       );
       if (r.rows[0]) await q.query(`UPDATE broadcast_recipients SET status = 'skipped' WHERE broadcast_id = $1 AND status = 'queued'`, [id]);
     });
+    // Messages that were waiting for an automatic retry (throttle, network) will not get it now.
+    await abandonAutoRetry(ctx, { broadcastId: id });
     return { broadcast: await withStats(ctx, await getBroadcast(ctx.db, a.workspaceId, id)) };
   });
 
@@ -211,6 +234,8 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
     const { id } = parse(z.object({ id: uuid }), req.params);
     const b = await getBroadcast(ctx.db, a.workspaceId, id);
     if (['running', 'scheduled'].includes(b.status)) throw badRequest('Pausa o cancela la difusión antes de eliminarla');
+    // Its messages stay in the chats: those waiting for an automatic retry will not get it now.
+    await abandonAutoRetry(ctx, { broadcastId: id });
     await ctx.db.query(`DELETE FROM broadcasts WHERE id = $1`, [id]);
     return noContent(reply);
   });

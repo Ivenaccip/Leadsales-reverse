@@ -3,7 +3,7 @@ import { parse as parseCsv } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
-import { badRequest, conflict } from '../lib/errors.js';
+import { AppError, badRequest, conflict } from '../lib/errors.js';
 import { renderPlaceholders, renderTemplateParams } from '../services/broadcasts.js';
 import { CONTACT_COLUMNS, createContact, getContact, updateContact } from '../services/contacts.js';
 import { waTypeForMime } from '../services/media.js';
@@ -13,6 +13,7 @@ import { checkTemplateParams, findTemplate } from '../services/templates.js';
 import type { MessageRow } from '../types.js';
 import { getChannel, providerFor } from '../whatsapp/provider.js';
 import type { TemplateParams } from '../whatsapp/types.js';
+import { TAG_NAME_MAX, TAG_SEPARATORS } from './crm.js';
 import { ADMIN_ROLES, agentRestricted, noContent, parse, requireWs, uuid, type WsAuth } from './helpers.js';
 
 const boolish = z
@@ -89,9 +90,14 @@ const templateParamsSchema = z.object({
     ])
     .optional(),
   body: z.array(z.string().max(1024)).max(30).optional(),
-  bodyNamed: z.record(z.string(), z.string().max(1024)).optional(),
+  // Every value is rendered for the contact: the number of keys is bounded like body's.
+  bodyNamed: z
+    .record(z.string().max(100), z.string().max(1024))
+    .refine((o) => Object.keys(o).length <= 30, 'Máximo 30 variables')
+    .optional(),
   buttons: z
     .array(z.object({ index: z.number().int().min(0).max(9), text: z.string().min(1).max(200), sub_type: z.enum(['url', 'copy_code']).optional() }))
+    .max(10)
     .optional(),
 });
 
@@ -124,9 +130,97 @@ const normHeader = (h: string) => h.toLowerCase().normalize('NFD').replace(/[̀-
  */
 export function csvCell(v: unknown): string {
   const t = v == null ? '' : String(v);
-  const safe = t.replace(/(^|[;,\t\r\n])([\s"]*)(?=[=+\-@])/g, "$1$2'");
+  // The spaces before a formula exclude the separators themselves: each match then stops at the
+  // next separator (linear), and a separator in that run starts its own match anyway.
+  const safe = t.replace(/(^|[;,\t\r\n])((?:[^\S\t\r\n]|")*)(?=[=+\-@])/g, "$1$2'");
   return /^[\t\r]/.test(safe) ? `'${safe}` : safe;
 }
+
+/** Undoes csvCell, every ' it added (not only the first), so an exported file imports back as it was. */
+export function uncsvCell(v: string): string {
+  return v.replace(/^'(?=[\t\r])/, '').replace(/(^|[;,\t\r\n])((?:[^\S\t\r\n]|")*)'(?=[=+\-@])/g, '$1$2');
+}
+
+interface LegacyTagNode {
+  /** Lowercase separator + segment → the node for names that go on after it. */
+  next: Map<string, LegacyTagNode>;
+  /** Lowercase separator + last segment → the tag's name. */
+  ends: Map<string, string>;
+}
+
+/** Tags created before ; , and | were barred from names, by their lowercase first segment. */
+export type LegacyTags = Map<string, LegacyTagNode>;
+
+/**
+ * Indexes the tags whose names contain ; , or | once per import, segment by segment, so splitting
+ * a cell costs about its own length however many tags the workspace has.
+ */
+export function legacyTagIndex(names: Iterable<string>): LegacyTags {
+  const index: LegacyTags = new Map();
+  const node = (m: Map<string, LegacyTagNode>, key: string) => {
+    let n = m.get(key);
+    if (!n) m.set(key, (n = { next: new Map(), ends: new Map() }));
+    return n;
+  };
+  for (const name of names) {
+    if (name.length > 200 || !TAG_SEPARATORS.test(name)) continue;
+    // [segment, separator, segment, …, separator, segment]
+    const parts = name.trim().toLowerCase().split(/([;,|])/);
+    let at = node(index, parts[0]);
+    for (let k = 1; k < parts.length - 2; k += 2) at = node(at.next, parts[k] + parts[k + 1]);
+    const last = parts[parts.length - 2] + parts[parts.length - 1];
+    if (!at.ends.has(last)) at.ends.set(last, name);
+  }
+  return index;
+}
+
+/**
+ * Tag names of an imported cell, split on ; , or |. Tags created before names were barred from
+ * containing those characters still match whole (the longest one at each position), so their
+ * export imports back.
+ */
+export function splitTagCell(cell: string, legacy: LegacyTags = new Map()): string[] {
+  const parts = cell.split(/([;,|])/);
+  const out: string[] = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    let at = legacy.size ? legacy.get(parts[i].trimStart().toLowerCase()) : undefined;
+    let match: string | undefined;
+    let end = i;
+    // A legacy name has at most 200 characters, so a longer segment ends the walk.
+    for (let j = i + 2; at && j < parts.length && parts[j].length <= 200; j += 2) {
+      const seg = parts[j].toLowerCase();
+      const name = at.ends.get(parts[j - 1] + seg.trimEnd());
+      if (name) [match, end] = [name, j];
+      at = at.next.get(parts[j - 1] + seg);
+    }
+    if (match) {
+      out.push(match);
+      i = end;
+    } else if (parts[i].trim()) {
+      out.push(parts[i].trim());
+    }
+  }
+  return out;
+}
+
+/** A letter lost by reading a non-UTF-8 file as UTF-8 leaves U+FFFD next to the rest of its word. */
+const LOST_LETTER = /\p{L}\uFFFD|\uFFFD\p{L}/u;
+
+function notUtf8(detail = '') {
+  return badRequest(
+    `${detail}El archivo no está guardado en UTF-8 y se perderían los acentos (por ejemplo, en "Teléfono" o en los nombres). En Excel, usa Guardar como → "CSV UTF-8 (delimitado por comas)" e impórtalo de nuevo.`,
+    'CSV_NOT_UTF8',
+  );
+}
+
+/**
+ * A prepaid charge Meta can still settle: the refund of a message that fails after a billable
+ * "sent", or the pricing adjustment of its first priced status. Settling needs the message row,
+ * which deleting the contact removes (ON DELETE CASCADE). Meta gives up on a message in 30 days.
+ */
+const UNSETTLED_CHARGE = `EXISTS (SELECT 1 FROM messages m WHERE m.contact_id = c.id AND m.direction = 'out' AND m.charged_prepaid
+  AND m.cost > 0 AND m.created_at > now() - interval '30 days'
+  AND (NOT m.pricing_reconciled OR m.status NOT IN ('delivered', 'read', 'failed')))`;
 
 /** Delimiter of a CSV from its header line: Excel saves ';' (or tab) in locales with a decimal comma. */
 export function detectCsvDelimiter(text: string): string {
@@ -280,19 +374,25 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
   app.post('/api/contacts/import', async (req) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const body = parse(
-      z.object({ csv: z.string().min(1).max(10_000_000), funnel_id: uuid.optional(), stage_id: uuid.optional(), tag_ids: z.array(uuid).optional() }),
+      z.object({
+        csv: z.string().min(1).max(10_000_000),
+        funnel_id: uuid.optional(),
+        stage_id: uuid.optional(),
+        tag_ids: z.array(uuid).optional(),
+        // How the caller turned the file into text: true when it had to replace bytes that were not
+        // UTF-8 (each became U+FFFD), false when nothing was lost. Unknown when absent.
+        lossy: z.boolean().optional(),
+      }),
       req.body,
     );
     const text = body.csv.replace(/^﻿/, '');
-    // U+FFFD means the file was decoded as UTF-8 but is not (Excel's plain "CSV" is ANSI/cp1252 in
-    // Spanish locales): the accents are already lost, so headers like "Teléfono" would not match and
-    // names would be stored garbled. Refuse with a way out instead.
-    if (text.includes('\ufffd')) {
-      throw badRequest(
-        'El archivo no está guardado en UTF-8 y se perderían los acentos (por ejemplo, en "Teléfono" o en los nombres). En Excel, usa Guardar como → "CSV UTF-8 (delimitado por comas)" e impórtalo de nuevo.',
-        'CSV_NOT_UTF8',
-      );
-    }
+    // U+FFFD where bytes were not UTF-8 (Excel's plain "CSV" is ANSI/cp1252 in Spanish locales):
+    // the accents are already lost, so headers like "Teléfono" would not match and names would be
+    // stored garbled. It can also be real data (a customer's WhatsApp name, kept by our own export),
+    // so when the caller does not say how it decoded the file, only a U+FFFD in the header line or
+    // standing for a letter (checked below) is refused.
+    const headerLine = text.slice(0, text.search(/[\r\n]|$/));
+    if (body.lossy === true ? text.includes('\ufffd') : body.lossy === undefined && headerLine.includes('\ufffd')) throw notUtf8();
     let records: Record<string, string>[];
     try {
       records = parseCsv(text, {
@@ -307,8 +407,18 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
       throw badRequest(`No se pudo leer el CSV: ${(err as Error).message}`);
     }
     if (records.length > 20_000) throw badRequest('Máximo 20,000 filas por importación');
+    if (body.lossy === undefined) {
+      for (const [i, rec] of records.entries()) {
+        const bad = Object.values(rec).find((v) => typeof v === 'string' && LOST_LETTER.test(v));
+        if (bad) {
+          const at = bad.indexOf('\ufffd');
+          throw notUtf8(`La fila ${i + 2} tiene letras que no se pudieron leer ("${bad.slice(Math.max(0, at - 20), at + 20)}"). `);
+        }
+      }
+    }
     const tagsRes = await ctx.db.query<{ id: string; name: string }>(`SELECT id, name FROM tags WHERE workspace_id = $1`, [a.workspaceId]);
     const tagByName = new Map(tagsRes.rows.map((t) => [t.name.toLowerCase(), t.id]));
+    const legacyTags = legacyTagIndex(tagsRes.rows.map((t) => t.name));
     let created = 0;
     let existing = 0;
     const errors: { row: number; error: string }[] = [];
@@ -316,8 +426,7 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
       const mapped: Record<string, string> = {};
       const custom: Record<string, string> = {};
       for (const [k, raw] of Object.entries(rec)) {
-        // Undo the export's formula guard (a leading ') so an exported file imports back as it was.
-        const v = typeof raw === 'string' ? raw.replace(/^'(?=[=+\-@\t\r])/, '') : raw;
+        const v = typeof raw === 'string' ? uncsvCell(raw) : raw;
         const target = HEADER_ALIASES[normHeader(k)];
         if (target) mapped[target] = v;
         else if (v) custom[k.trim()] = v;
@@ -326,8 +435,21 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
         errors.push({ row: i + 2, error: 'Falta el teléfono' });
         continue;
       }
+      // Same limits as creating a contact or a tag by hand.
+      const tooLong =
+        (mapped.name?.trim().length ?? 0) > 120
+          ? 'El nombre admite máximo 120 caracteres'
+          : (mapped.company?.trim().length ?? 0) > 120
+            ? 'La empresa admite máximo 120 caracteres'
+            : null;
+      const names = splitTagCell(mapped.tags ?? '', legacyTags);
+      const longTag = names.find((n) => n.length > TAG_NAME_MAX && !tagByName.has(n.toLowerCase()));
+      if (tooLong || longTag) {
+        errors.push({ row: i + 2, error: tooLong ?? `La etiqueta "${longTag!.slice(0, 40)}…" supera ${TAG_NAME_MAX} caracteres` });
+        continue;
+      }
       const tagIds = [...(body.tag_ids ?? [])];
-      for (const name of (mapped.tags ?? '').split(/[;,|]/).map((s) => s.trim()).filter(Boolean)) {
+      for (const name of names) {
         let id = tagByName.get(name.toLowerCase());
         if (!id) {
           const t = await ctx.db.query<{ id: string }>(
@@ -346,7 +468,7 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
           {
             phone: mapped.phone,
             name: mapped.name,
-            email: mapped.email && mapped.email.includes('@') ? mapped.email : null,
+            email: mapped.email && mapped.email.includes('@') && mapped.email.length <= 254 ? mapped.email : null,
             company: mapped.company,
             dealValue: mapped.deal_value ? parseAmount(mapped.deal_value) : 0,
             customFields: custom,
@@ -390,9 +512,23 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
       body.ids = visible.rows.map((r) => r.id);
     }
     if (body.action === 'delete') {
-      const r = await ctx.db.query(`DELETE FROM contacts WHERE workspace_id = $1 AND id = ANY($2::uuid[])`, [a.workspaceId, body.ids]);
-      ctx.realtime.emit(a.workspaceId, 'contacts:bulk', { action: 'delete', ids: body.ids });
-      return { updated: r.rowCount };
+      // Contacts with a charge Meta can still settle are archived instead (see UNSETTLED_CHARGE).
+      const r = await ctx.db.tx(async (q) => {
+        // Locked first: a send in progress (it locks its contact) commits before the check reads.
+        await q.query(`SELECT id FROM contacts WHERE workspace_id = $1 AND id = ANY($2::uuid[]) ORDER BY id FOR UPDATE`, [a.workspaceId, body.ids]);
+        const kept = await q.query<{ id: string }>(
+          `UPDATE contacts c SET is_archived = true, updated_at = now() WHERE c.workspace_id = $1 AND c.id = ANY($2::uuid[]) AND ${UNSETTLED_CHARGE} RETURNING c.id`,
+          [a.workspaceId, body.ids],
+        );
+        const deleted = await q.query<{ id: string }>(
+          `DELETE FROM contacts c WHERE c.workspace_id = $1 AND c.id = ANY($2::uuid[]) AND NOT ${UNSETTLED_CHARGE} RETURNING c.id`,
+          [a.workspaceId, body.ids],
+        );
+        return { kept: kept.rows.map((x) => x.id), deleted: deleted.rows.map((x) => x.id) };
+      });
+      if (r.deleted.length) ctx.realtime.emit(a.workspaceId, 'contacts:bulk', { action: 'delete', ids: r.deleted });
+      if (r.kept.length) ctx.realtime.emit(a.workspaceId, 'contacts:bulk', { action: 'archive', ids: r.kept });
+      return { updated: r.deleted.length, archived: r.kept.length };
     }
     let updated = 0;
     for (const id of body.ids) {
@@ -490,7 +626,18 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
   app.delete('/api/contacts/:id', async (req, reply) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
-    await ctx.db.query(`DELETE FROM contacts WHERE id = $1 AND workspace_id = $2`, [id, a.workspaceId]);
+    await ctx.db.tx(async (q) => {
+      await q.query(`SELECT id FROM contacts WHERE id = $1 AND workspace_id = $2 FOR UPDATE`, [id, a.workspaceId]);
+      const pending = await q.query(`SELECT 1 FROM contacts c WHERE c.id = $1 AND c.workspace_id = $2 AND ${UNSETTLED_CHARGE}`, [id, a.workspaceId]);
+      if (pending.rows[0]) {
+        throw new AppError(
+          409,
+          'CONTACT_BILLING_PENDING',
+          'Este contacto tiene mensajes cobrados que Meta todavía no confirma como entregados. Si lo borras ahora, ya no se podría reembolsar uno que no se entregue: archívalo y bórralo cuando se confirmen (a más tardar en 30 días).',
+        );
+      }
+      await q.query(`DELETE FROM contacts WHERE id = $1 AND workspace_id = $2`, [id, a.workspaceId]);
+    });
     ctx.realtime.emit(a.workspaceId, 'contacts:bulk', { action: 'delete', ids: [id] });
     return noContent(reply);
   });
@@ -499,14 +646,28 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
   app.get('/api/contacts/:id/messages', async (req) => {
     const a = await requireWs(ctx, req);
     const { id } = parse(z.object({ id: uuid }), req.params);
-    const q = parse(z.object({ before: z.string().datetime().optional(), limit: z.coerce.number().int().min(1).max(200).default(60) }), req.query);
+    const q = parse(
+      z.object({
+        // The oldest message already shown: a keyset at full precision. Messages of one webhook are
+        // microseconds apart (and late ones can tie), which a JSON timestamp (`before`) cannot tell apart.
+        before_id: uuid.optional(),
+        before: z.string().datetime().optional(),
+        limit: z.coerce.number().int().min(1).max(200).default(60),
+      }),
+      req.query,
+    );
     await ensureVisible(a, id);
+    const cursor = q.before_id
+      ? 'AND (m.created_at, m.id) < (SELECT b.created_at, b.id FROM messages b WHERE b.id = $3 AND b.contact_id = $1 AND b.workspace_id = $2)'
+      : q.before
+        ? 'AND m.created_at < $3'
+        : '';
     const { rows } = await ctx.db.query<MessageRow>(
       `SELECT m.*, mf.mime AS file_mime, mf.filename AS file_name, mf.size AS file_size, u.name AS user_name
        FROM messages m LEFT JOIN media_files mf ON mf.id = m.media_file_id LEFT JOIN users u ON u.id = m.user_id
-       WHERE m.contact_id = $1 AND m.workspace_id = $2 ${q.before ? 'AND m.created_at < $3' : ''}
-       ORDER BY m.created_at DESC LIMIT ${q.limit}`,
-      q.before ? [id, a.workspaceId, q.before] : [id, a.workspaceId],
+       WHERE m.contact_id = $1 AND m.workspace_id = $2 ${cursor}
+       ORDER BY m.created_at DESC, m.id DESC LIMIT ${q.limit}`,
+      cursor ? [id, a.workspaceId, q.before_id ?? q.before] : [id, a.workspaceId],
     );
     return { messages: rows.reverse(), has_more: rows.length === q.limit };
   });

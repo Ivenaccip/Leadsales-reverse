@@ -7,7 +7,7 @@ import { stageMap, useFunnels, useMembers } from '../../lib/queries';
 import type { Contact, Message } from '../../lib/types';
 import { Avatar, Button, IconButton, Spinner } from '../ui';
 import { Composer } from './Composer';
-import { LIVE_QUERY, patchConversations, upsertMessage } from './helpers';
+import { LIVE_QUERY, messagesPath, olderMessagesCursor, patchConversations, upsertMessage, whenVisible, type MessagesPage } from './helpers';
 import { MessageBubble } from './MessageBubble';
 import { ScheduleModal, SendTemplateModal } from './TemplateModals';
 
@@ -48,31 +48,38 @@ export function ChatView({
   const messages = useInfiniteQuery({
     queryKey: ['messages', contact.id],
     initialPageParam: undefined as string | undefined,
-    queryFn: ({ pageParam }) =>
-      api.get<{ messages: Message[]; has_more: boolean }>(
-        `/api/contacts/${contact.id}/messages?limit=${PAGE}${pageParam ? `&before=${encodeURIComponent(pageParam)}` : ''}`,
-      ),
-    getNextPageParam: (last) => (last.has_more && last.messages.length ? last.messages[0].created_at : undefined),
+    queryFn: ({ pageParam }) => api.get<MessagesPage>(messagesPath(contact.id, PAGE, pageParam)),
+    getNextPageParam: olderMessagesCursor,
     ...LIVE_QUERY,
   });
 
   // Pages arrive newest-first; each page is in chronological order.
   const list = useMemo(() => [...(messages.data?.pages ?? [])].reverse().flatMap((p) => p.messages), [messages.data]);
 
-  // Mark as read when the open chat has unread messages (also when new ones arrive while it is open).
+  // Mark as read when the open chat has unread messages (also when new ones arrive while it is open),
+  // once the agent can see it: messages that arrived in a background tab are read on coming back.
   const unread = contact.unread_count;
+  const latest = useRef(contact);
+  latest.current = contact;
   useEffect(() => {
-    if (unread <= 0 || document.visibilityState === 'hidden') return;
-    const t = setTimeout(() => {
-      void api
-        .post(`/api/contacts/${contact.id}/read`)
-        .then(() => {
-          qc.invalidateQueries({ queryKey: ['contact-counts'] });
-        })
-        .catch(() => {});
-      patchConversations(qc, { ...contact, unread_count: 0 }, myId);
-    }, 400);
-    return () => clearTimeout(t);
+    if (unread <= 0) return;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const cancel = whenVisible(document, () => {
+      t = setTimeout(() => {
+        void api
+          .post(`/api/contacts/${contact.id}/read`)
+          .then(() => {
+            qc.invalidateQueries({ queryKey: ['contact-counts'] });
+          })
+          .catch(() => {});
+        // The contact may have changed while the tab was hidden: patch its latest version.
+        patchConversations(qc, { ...latest.current, unread_count: 0 }, myId);
+      }, 400);
+    });
+    return () => {
+      cancel();
+      clearTimeout(t);
+    };
   }, [contact.id, unread]);
 
   // ---- Scrolling ----

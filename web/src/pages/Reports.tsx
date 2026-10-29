@@ -1,10 +1,11 @@
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Coins, MessageCircle, Trophy, UserPlus } from 'lucide-react';
-import { api, qs } from '../lib/api';
+import { api, errorMessage, qs } from '../lib/api';
+import { useWorkspace } from '../lib/queries';
 import { credits, duration, money, number, SOURCE_LABEL } from '../lib/format';
 import { BarList, ColumnChart, LineChart, SERIES } from '../components/charts';
-import { Avatar, Card, EmptyState, Input, Page, PageHeader, PageLoader, Select, Stat, Tabs, cx } from '../components/ui';
+import { Alert, Avatar, Card, EmptyState, Input, Page, PageHeader, PageLoader, Select, Stat, Tabs, cx } from '../components/ui';
 
 interface Report {
   totals: { new_leads: number; messages_in: number; messages_out: number; active_conversations: number; won: number; won_value: number; spend: number };
@@ -21,23 +22,78 @@ const RANGES = [
   { id: 'custom', label: 'Personalizado' },
 ] as const;
 
-function isoDay(d: Date) {
-  return d.toISOString().slice(0, 10);
+/** Same limit as the server (GET /api/reports/overview). */
+export const MAX_RANGE_DAYS = 400;
+const DAY_MS = 24 * 3600 * 1000;
+const pad = (n: number) => String(n).padStart(2, '0');
+
+/**
+ * Today's calendar day (YYYY-MM-DD) in the workspace's time zone, which the server uses for the
+ * report's days. toISOString() would give the UTC day: tomorrow, every evening in the Americas.
+ */
+export function todayIn(tz: string | undefined, now = new Date()): string {
+  if (tz) {
+    try {
+      return new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+    } catch {
+      /* unknown zone: the browser's own day */
+    }
+  }
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+/** Calendar arithmetic on YYYY-MM-DD (no time zone involved). */
+export function addDays(day: string, n: number): string {
+  return new Date(Date.parse(`${day}T00:00:00Z`) + n * DAY_MS).toISOString().slice(0, 10);
+}
+
+/** The last `days` calendar days, today included. */
+export function lastDays(days: number, today: string): { from: string; to: string } {
+  return { from: addDays(today, -(days - 1)), to: today };
+}
+
+/** Why the server would refuse this range (shown instead of asking), or null. */
+export function rangeProblem({ from, to }: { from: string; to: string }): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) return 'Elige la fecha inicial y la final.';
+  const span = (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / DAY_MS + 1;
+  if (!(span >= 1)) return 'La fecha inicial debe ser anterior o igual a la final.';
+  if (span > MAX_RANGE_DAYS) return `El rango máximo es de ${MAX_RANGE_DAYS} días.`;
+  return null;
+}
+
+/** Shown instead of the report: why it cannot be asked for, why the server refused it, or a loader. */
+export function ReportUnavailable({ problem, error }: { problem: string | null; error: unknown }) {
+  if (problem) return <Alert tone="warning">{problem}</Alert>;
+  if (error) {
+    return (
+      <Alert tone="error" title="No se pudo cargar el reporte">
+        {errorMessage(error)}
+      </Alert>
+    );
+  }
+  return <PageLoader />;
 }
 
 export default function ReportsPage() {
   const [range, setRange] = useState<(typeof RANGES)[number]['id']>('30');
-  const [custom, setCustom] = useState({ from: isoDay(new Date(Date.now() - 30 * 86400000)), to: isoDay(new Date()) });
+  const [customRange, setCustom] = useState<{ from: string; to: string } | null>(null);
   const [funnelId, setFunnelId] = useState<string>('');
   const [view, setView] = useState<'chart' | 'table'>('chart');
+  const ws = useWorkspace();
+  const tz = ws.data?.workspace.timezone;
+  // Days are the workspace's: wait for its time zone (or give up on it if it cannot be read).
+  const tzKnown = !!tz || ws.isError;
+  const today = todayIn(tz);
+  const custom = customRange ?? lastDays(30, today);
 
-  const params = useMemo(() => {
-    if (range === 'custom') return custom;
-    const days = Number(range);
-    return { from: isoDay(new Date(Date.now() - (days - 1) * 86400000)), to: isoDay(new Date()) };
-  }, [range, custom]);
+  const params = useMemo(() => (range === 'custom' ? custom : lastDays(Number(range), today)), [range, custom.from, custom.to, today]);
+  const problem = range === 'custom' ? rangeProblem(params) : null;
 
-  const report = useQuery({ queryKey: ['report', params], queryFn: () => api.get<Report>(`/api/reports/overview${qs(params)}`) });
+  const report = useQuery({
+    queryKey: ['report', params],
+    queryFn: () => api.get<Report>(`/api/reports/overview${qs(params)}`),
+    enabled: tzKnown && !problem,
+  });
   const r = report.data;
 
   const funnels = useMemo(() => {
@@ -68,15 +124,29 @@ export default function ReportsPage() {
         </div>
         {range === 'custom' && (
           <>
-            <Input type="date" className="w-40" value={custom.from} max={custom.to} onChange={(e) => setCustom({ ...custom, from: e.target.value })} />
+            <Input
+              type="date"
+              className="w-40"
+              value={custom.from}
+              min={rangeProblem(custom) ? undefined : addDays(custom.to, -(MAX_RANGE_DAYS - 1))}
+              max={custom.to}
+              onChange={(e) => setCustom({ ...custom, from: e.target.value })}
+            />
             <span className="text-slate-400">a</span>
-            <Input type="date" className="w-40" value={custom.to} min={custom.from} onChange={(e) => setCustom({ ...custom, to: e.target.value })} />
+            <Input
+              type="date"
+              className="w-40"
+              value={custom.to}
+              min={custom.from}
+              max={rangeProblem(custom) ? undefined : addDays(custom.from, MAX_RANGE_DAYS - 1)}
+              onChange={(e) => setCustom({ ...custom, to: e.target.value })}
+            />
           </>
         )}
       </div>
 
-      {report.isLoading || !r ? (
-        <PageLoader />
+      {problem || !r ? (
+        <ReportUnavailable problem={problem} error={report.isError ? report.error : null} />
       ) : (
         <div className="space-y-6">
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">

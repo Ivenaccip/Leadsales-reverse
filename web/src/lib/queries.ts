@@ -27,6 +27,25 @@ export function useChannels() {
   return useQuery({ queryKey: ['channels'], queryFn: async () => (await api.get<{ channels: Channel[] }>('/api/channels')).channels });
 }
 
+/**
+ * The number used when none is chosen: the default one, or the first, among those that can send.
+ * Same rule as the server (getChannel skips disabled numbers), so estimates, template lists and
+ * sends all use the number that will really send.
+ */
+export function defaultChannel(channels: Channel[] | undefined): Channel | undefined {
+  const usable = (channels ?? []).filter((c) => c.status !== 'disabled');
+  return usable.find((c) => c.is_default) ?? usable[0];
+}
+
+/**
+ * The number whose data a page shows when none is chosen: the sending default, else any number.
+ * Only sends skip disabled numbers; a disabled number (e.g. right after the switch to prepaid)
+ * still has its templates, and hiding them would look like no number is connected.
+ */
+export function viewedChannel(channels: Channel[] | undefined): Channel | undefined {
+  return defaultChannel(channels) ?? channels?.find((c) => c.is_default) ?? channels?.[0];
+}
+
 export function useTemplates(channelId?: string) {
   return useQuery({
     queryKey: ['templates', channelId ?? 'all'],

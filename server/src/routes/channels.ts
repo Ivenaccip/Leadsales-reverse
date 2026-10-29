@@ -92,9 +92,15 @@ async function assertSecretUnknownToBusiness(ctx: AppContext, workspaceId: strin
   }
 }
 
-/** One WABA belongs to one workspace: templates live per WABA at Meta, so sharing it leaks them. */
+/**
+ * One WABA belongs to one workspace: templates live per WABA at Meta, so sharing it leaks them.
+ * Only official numbers count: their WABA was proven with Meta (a sandbox has none).
+ */
 async function assertWabaFree(ctx: AppContext, workspaceId: string, wabaId: string) {
-  const { rows } = await ctx.db.query(`SELECT 1 FROM channels WHERE waba_id = $1 AND workspace_id <> $2 LIMIT 1`, [wabaId, workspaceId]);
+  const { rows } = await ctx.db.query(`SELECT 1 FROM channels WHERE waba_id = $1 AND workspace_id <> $2 AND provider = 'cloud_api' LIMIT 1`, [
+    wabaId,
+    workspaceId,
+  ]);
   if (rows[0]) throw conflict('Esa cuenta de WhatsApp (WABA) ya está conectada en otro espacio de trabajo', 'WABA_TAKEN');
 }
 
@@ -110,6 +116,19 @@ export async function disableUnverifiedCloudChannels(ctx: AppContext, workspaceI
   await ctx.db.query(
     `UPDATE channels SET status = 'disabled', last_error = $2
      WHERE workspace_id = $1 AND provider = 'cloud_api' AND NOT operator_verified AND status <> 'disabled'`,
+    [workspaceId, PREPAID_UNVERIFIED],
+  );
+}
+
+/**
+ * Switching a workspace back to paying Meta directly: the numbers disabled only because of prepaid
+ * billing work again (the business may use its own app's secret there).
+ */
+export async function enableAfterPrepaid(ctx: AppContext, workspaceId: string) {
+  await ctx.db.query(
+    `UPDATE channels ch SET status = 'active', last_error = NULL FROM workspaces w
+     WHERE w.id = ch.workspace_id AND ch.workspace_id = $1 AND w.billing_mode <> 'prepaid'
+       AND ch.provider = 'cloud_api' AND ch.status = 'disabled' AND ch.last_error = $2`,
     [workspaceId, PREPAID_UNVERIFIED],
   );
 }
@@ -221,6 +240,10 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
       req.body,
     );
     const ch = await getOwnChannel(ctx, a.workspaceId, id);
+    // A sandbox has no Meta account: a WABA id stored on it would be unproven (and could squat it).
+    if (ch.provider !== 'cloud_api' && (body.waba_id || body.access_token || body.app_secret)) {
+      throw badRequest('Los canales sandbox no tienen cuenta de Meta: no admiten WABA, token ni App Secret', 'SANDBOX_NO_CREDENTIALS');
+    }
     const prepaid = ch.provider === 'cloud_api' && (await billingModeOf(ctx, a.workspaceId)) === 'prepaid';
     let credentials = ch.credentials;
     let verified = !!ch.operator_verified;
@@ -309,7 +332,8 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
       return { ok: true, info };
     } catch (err) {
       const msg = err instanceof MetaApiError ? explainMetaError(err.code, err.message) : (err as Error).message;
-      await ctx.db.query(`UPDATE channels SET last_error = $2 WHERE id = $1`, [id, msg]);
+      // A disabled number keeps the reason it was disabled (it decides how it is re-enabled).
+      await ctx.db.query(`UPDATE channels SET last_error = CASE WHEN status = 'disabled' THEN last_error ELSE $2 END WHERE id = $1`, [id, msg]);
       return { ok: false, error: msg };
     }
   });
@@ -369,10 +393,14 @@ export async function metaWebhookRoutes(app: FastifyInstance, ctx: AppContext) {
     return reply.type('text/plain').send(challenge);
   });
 
-  app.post('/webhooks/whatsapp', { config: { rawBody: true } }, async (req, reply) => {
+  // Meta's payloads are small batches (at most a few MB): anything bigger is not from Meta.
+  app.post('/webhooks/whatsapp', { config: { rawBody: true }, bodyLimit: WEBHOOK_BODY_LIMIT }, async (req, reply) => {
     const raw = (req as any).rawBody as Buffer | undefined;
     const body = req.body as any;
     if (!raw || body?.object !== 'whatsapp_business_account') return reply.code(200).send('IGNORED');
+    if (webhookItems(body) > MAX_WEBHOOK_ITEMS) {
+      return reply.code(413).send({ error: { code: 'TOO_MANY_EVENTS', message: 'Demasiados eventos en un solo webhook' } });
+    }
 
     // Find which channels the payload is about to know which app secret(s) can sign it.
     const phoneIds = new Set<string>();
@@ -394,8 +422,11 @@ export async function metaWebhookRoutes(app: FastifyInstance, ctx: AppContext) {
     const header = String(req.headers['x-hub-signature-256'] ?? '');
     const signedWith = (secret: string) => safeEqual(header, `sha256=${hmacSha256Hex(secret, raw)}`);
     let allowed: string[];
+    // Signed with a secret the business cannot know: only these payloads may move prepaid money.
+    let trusted: string[];
     if (ctx.config.metaAppSecret && signedWith(ctx.config.metaAppSecret)) {
       allowed = rows.map((ch) => ch.id);
+      trusted = allowed;
     } else {
       const bySecret = new Map<string, string[]>();
       // In prepaid workspaces a secret the tenant typed cannot vouch for billing events.
@@ -424,8 +455,73 @@ export async function metaWebhookRoutes(app: FastifyInstance, ctx: AppContext) {
         return reply.code(401).send('Firma inválida');
       }
       allowed = match[1];
+      trusted = rows.filter((c) => allowed.includes(c.id) && c.operator_verified).map((c) => c.id);
     }
-    await ctx.queue.enqueue('wa.webhook', { body, channelIds: allowed }, { maxAttempts: 6 });
+    // One job per workspace with only its own events: each tenant's inbound work queues on its
+    // own (fair lane), so a tenant flooding its own number never delays another tenant's messages.
+    const parts = splitByWorkspace(body, rows.filter((c) => allowed.includes(c.id)));
+    if (parts.length) {
+      await ctx.db.tx(async (q) => {
+        for (const p of parts) {
+          await ctx.queue.enqueue(
+            'wa.webhook',
+            { body: p.body, channelIds: p.channelIds, trustedChannelIds: p.channelIds.filter((id) => trusted.includes(id)) },
+            { maxAttempts: 6, workspaceId: p.workspaceId },
+            q,
+          );
+        }
+      });
+      ctx.queue.notify();
+    }
     return reply.code(200).send('EVENT_RECEIVED');
   });
+}
+
+const WEBHOOK_BODY_LIMIT = 3 * 1024 * 1024;
+/** Changes plus the messages and statuses in them; Meta's batches are far smaller. */
+const MAX_WEBHOOK_ITEMS = 1000;
+
+function webhookItems(body: any): number {
+  let n = 0;
+  for (const e of Array.isArray(body?.entry) ? body.entry : []) {
+    for (const ch of Array.isArray(e?.changes) ? e.changes : []) {
+      const v = ch?.value ?? {};
+      n += 1 + (Array.isArray(v.messages) ? v.messages.length : 0) + (Array.isArray(v.statuses) ? v.statuses.length : 0);
+    }
+    n += 1;
+  }
+  return n;
+}
+
+/**
+ * Splits a payload into one per workspace. A change about a number goes to the workspace of that
+ * number (if the signature allows it); one without a number (templates) goes to the workspaces
+ * whose allowed numbers belong to the entry's WABA.
+ */
+function splitByWorkspace(body: any, channels: ChannelRow[]): { workspaceId: string; channelIds: string[]; body: any }[] {
+  const byWs = new Map<string, { channelIds: string[]; entries: Map<any, any[]> }>();
+  for (const c of channels) {
+    const w = byWs.get(c.workspace_id) ?? { channelIds: [] as string[], entries: new Map<any, any[]>() };
+    w.channelIds.push(c.id);
+    byWs.set(c.workspace_id, w);
+  }
+  for (const e of Array.isArray(body.entry) ? body.entry : []) {
+    for (const change of Array.isArray(e?.changes) ? e.changes : []) {
+      const phoneId = change?.value?.metadata?.phone_number_id;
+      const owners = phoneId
+        ? channels.filter((c) => c.phone_number_id === String(phoneId))
+        : channels.filter((c) => e?.id && c.waba_id === String(e.id));
+      for (const wsId of new Set(owners.map((c) => c.workspace_id))) {
+        const entries = byWs.get(wsId)!.entries;
+        entries.set(e, [...(entries.get(e) ?? []), change]);
+      }
+    }
+  }
+  return [...byWs.entries()]
+    .filter(([, w]) => w.entries.size)
+    .map(([workspaceId, w]) => ({
+      workspaceId,
+      channelIds: w.channelIds,
+      body: { ...body, entry: [...w.entries.entries()].map(([e, changes]) => ({ ...e, changes })) },
+    }));
 }

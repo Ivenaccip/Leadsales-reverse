@@ -34,9 +34,29 @@ function fileSize(n: number | null | undefined) {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
+/**
+ * Why a WhatsApp attachment will never show (the server gave up downloading it), or null while
+ * it may still arrive. The customer is the only one who can send the file again.
+ */
+export function mediaDownloadError(m: Pick<Message, 'direction' | 'media'>): string | null {
+  const raw = m.media?.download_error;
+  const reason = typeof raw === 'string' ? raw.trim().replace(/[.\s]+$/, '') : '';
+  if (!reason) return null;
+  return m.direction === 'in' ? `No se pudo descargar el archivo: ${reason}. Pide al cliente que lo reenvíe.` : `No se pudo descargar el archivo: ${reason}.`;
+}
+
 function MediaContent({ m }: { m: Message }) {
   const inbound = m.direction === 'in';
   if (!m.media_file_id) {
+    const failed = mediaDownloadError(m);
+    if (failed) {
+      return (
+        <div className="flex items-start gap-2 rounded-md bg-red-50 px-3 py-3 text-xs text-red-700">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{failed}</span>
+        </div>
+      );
+    }
     const Icon = inbound ? Loader2 : ImageOff;
     return (
       <div className="flex items-center gap-2 rounded-md bg-black/5 px-3 py-4 text-xs text-slate-500">

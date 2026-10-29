@@ -2,11 +2,11 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Link, Route, Routes, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, CalendarClock, ChevronLeft, ChevronRight, Megaphone, Pause, Play, Plus, Send, Trash2, XCircle } from 'lucide-react';
-import { api, errorMessage, qs } from '../lib/api';
-import { useChannels, useFunnels, useMembers, useTags, useTemplates } from '../lib/queries';
+import { api, ApiError, errorMessage, qs } from '../lib/api';
+import { defaultChannel, useChannels, useFunnels, useMembers, useTags, useTemplates } from '../lib/queries';
 import { useRealtime } from '../lib/realtime';
 import { CATEGORY_LABEL, MARKET_LABEL, credits, dateTime, formatPhone, number } from '../lib/format';
-import type { Audience, Broadcast, Estimate, Template } from '../lib/types';
+import type { Audience, Broadcast, BroadcastParams, Estimate, Template } from '../lib/types';
 import { useDebounced } from '../components/crm/hooks';
 import { MemberSelect, StagePills, TagMultiSelect } from '../components/pickers';
 import {
@@ -218,6 +218,43 @@ function StepTitle({ n, title, active, done, onClick }: { n: number; title: stri
   );
 }
 
+/** Drafts are edited whole; a paused broadcast only its message (it is resumed afterwards). */
+export function editableBroadcast(status: Broadcast['status']): boolean {
+  return status === 'draft' || status === 'paused';
+}
+
+/**
+ * Body of the save request. A paused broadcast already chose its recipients at launch: the server
+ * refuses any audience for it (AUDIENCE_LOCKED), and its number and schedule stay as they were.
+ */
+export function broadcastSaveBody(
+  status: Broadcast['status'] | undefined,
+  f: { name: string; channelId: string; template: Pick<Template, 'name' | 'language'>; params: BroadcastParams; audience: Audience; scheduledAt: string | null },
+) {
+  const message = { name: f.name, template_name: f.template.name, template_language: f.template.language, params: f.params };
+  if (status === 'paused') return message;
+  return { ...message, channel_id: f.channelId || undefined, audience: f.audience, scheduled_at: f.scheduledAt };
+}
+
+/** The broadcast changed state while it was being edited: the editor reloads it. */
+export function broadcastChangedMeanwhile(err: unknown): boolean {
+  return err instanceof ApiError && (err.code === 'BROADCAST_CHANGED' || err.code === 'AUDIENCE_LOCKED');
+}
+
+/**
+ * The template of a draft being edited, once the template list shown is that of the draft's own
+ * number (templates belong to a number: another number's list may not have it, and restoring
+ * from it would silently drop the saved variables).
+ */
+export function draftTemplate(
+  b: Pick<Broadcast, 'channel_id' | 'template_name' | 'template_language'>,
+  listedChannel: string,
+  templates: Template[] | undefined,
+): { ready: false } | { ready: true; template: Template | undefined } {
+  if (!templates || (b.channel_id && listedChannel !== b.channel_id)) return { ready: false };
+  return { ready: true, template: templates.find((t) => t.name === b.template_name && t.language === b.template_language) };
+}
+
 function BroadcastWizard() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -243,9 +280,9 @@ function BroadcastWizard() {
   const [when, setWhen] = useState<'now' | 'later'>('now');
   const [scheduledAt, setScheduledAt] = useState('');
   const [loaded, setLoaded] = useState(!id);
+  const paused = existingQ.data?.status === 'paused';
 
-  const defaultChannel = channels.find((c) => c.is_default) ?? channels[0];
-  const effectiveChannel = channelId || defaultChannel?.id || '';
+  const effectiveChannel = channelId || defaultChannel(channels)?.id || '';
   const templatesQ = useTemplates(effectiveChannel || undefined);
   const approved = (templatesQ.data ?? []).filter((t) => t.status === 'APPROVED');
   const template: Template | undefined = approved.find((t) => `${t.name}|${t.language}` === templateKey);
@@ -253,24 +290,28 @@ function BroadcastWizard() {
   // Load a draft being edited.
   useEffect(() => {
     const b = existingQ.data;
-    if (!b || loaded || !templatesQ.data) return;
+    if (!b || loaded) return;
+    // Switch to the draft's number first: its template may exist only in that number's list.
+    if (b.channel_id && channelId !== b.channel_id) return setChannelId(b.channel_id);
+    // A list that failed to load must not keep the editor on its loader forever.
+    const draft = draftTemplate(b, effectiveChannel, templatesQ.isError ? [] : templatesQ.data);
+    if (!draft.ready) return;
     setName(b.name);
-    if (b.channel_id) setChannelId(b.channel_id);
     setTemplateKey(`${b.template_name}|${b.template_language}`);
-    const t = templatesQ.data.find((x) => x.name === b.template_name && x.language === b.template_language);
-    if (t) setValue(fromBroadcastParams(t, b.params ?? {}));
+    if (draft.template) setValue(fromBroadcastParams(draft.template, b.params ?? {}));
     setAudience(b.audience ?? {});
     if (b.scheduled_at) {
       setWhen('later');
       setScheduledAt(toLocalInput(b.scheduled_at));
     }
     setLoaded(true);
-  }, [existingQ.data, templatesQ.data, loaded]);
+  }, [existingQ.data, templatesQ.data, templatesQ.isError, loaded, channelId, effectiveChannel]);
 
   const audienceClean = cleanAudience(audience);
   // Debounce a string (not an object) so identical inputs don't retrigger the timer on every render.
+  // A paused broadcast's recipients are fixed: there is nothing to estimate.
   const estimateInput = useDebounced(
-    template
+    template && !paused
       ? JSON.stringify({ channel_id: effectiveChannel, template_name: template.name, template_language: template.language, audience: audienceClean })
       : '',
     500,
@@ -289,15 +330,14 @@ function BroadcastWizard() {
   const save = useMutation({
     mutationFn: async (launch: boolean) => {
       if (!template) throw new Error('Elige una plantilla');
-      const body = {
+      const body = broadcastSaveBody(existingQ.data?.status, {
         name: name.trim(),
-        channel_id: effectiveChannel || undefined,
-        template_name: template.name,
-        template_language: template.language,
+        channelId: effectiveChannel,
+        template,
         params: toBroadcastParams(template, value),
         audience: audienceClean,
-        scheduled_at: when === 'later' && scheduledAt ? new Date(scheduledAt).toISOString() : null,
-      };
+        scheduledAt: when === 'later' && scheduledAt ? new Date(scheduledAt).toISOString() : null,
+      });
       const saved = id
         ? (await api.patch<{ broadcast: Broadcast }>(`/api/broadcasts/${id}`, body)).broadcast
         : (await api.post<{ broadcast: Broadcast }>('/api/broadcasts', body)).broadcast;
@@ -308,20 +348,30 @@ function BroadcastWizard() {
       void qc.invalidateQueries({ queryKey: ['broadcasts'] });
       void qc.invalidateQueries({ queryKey: ['broadcast', saved.id] });
       void qc.invalidateQueries({ queryKey: ['credits'] });
-      toast.success(launch ? (when === 'later' ? 'Difusión programada' : 'Difusión en camino 🚀') : 'Borrador guardado');
+      toast.success(
+        launch
+          ? when === 'later'
+            ? 'Difusión programada'
+            : 'Difusión en camino 🚀'
+          : saved.status === 'paused'
+            ? 'Cambios guardados. Reanuda la difusión para seguir enviando.'
+            : 'Borrador guardado',
+      );
       navigate(`/difusiones/${saved.id}`);
     },
     onError: (err) => {
       toast.error(errorMessage(err));
       void qc.invalidateQueries({ queryKey: ['broadcasts'] });
+      // Launched, paused or resumed elsewhere: show what it is now (or that it can no longer be edited).
+      if (id && broadcastChangedMeanwhile(err)) void existingQ.refetch().then(() => setLoaded(false));
     },
   });
 
   if (id && (existingQ.isLoading || !loaded)) return <PageLoader />;
-  if (existingQ.data && existingQ.data.status !== 'draft') {
+  if (existingQ.data && !editableBroadcast(existingQ.data.status)) {
     return (
       <Page>
-        <Alert tone="warning" title="Solo puedes editar borradores">
+        <Alert tone="warning" title="Solo puedes editar borradores o difusiones en pausa">
           <Link to={`/difusiones/${id}`} className="underline">
             Volver a la difusión
           </Link>
@@ -337,12 +387,12 @@ function BroadcastWizard() {
       <Link to="/difusiones" className="mb-4 inline-flex items-center gap-1 text-sm text-slate-500 hover:text-slate-800">
         <ArrowLeft className="h-4 w-4" /> Difusiones
       </Link>
-      <PageHeader title={id ? 'Editar difusión' : 'Nueva difusión'} />
+      <PageHeader title={paused ? 'Editar difusión en pausa' : id ? 'Editar difusión' : 'Nueva difusión'} />
 
-      {channels.length === 0 && (
+      {!defaultChannel(channels) && (
         <div className="mb-4">
-          <Alert tone="warning" title="Conecta un número primero">
-            Necesitas un canal de WhatsApp para enviar difusiones.{' '}
+          <Alert tone="warning" title={channels.length ? 'Tus números están deshabilitados' : 'Conecta un número primero'}>
+            Necesitas un canal de WhatsApp activo para enviar difusiones.{' '}
             <Link to="/ajustes/canales" className="underline">
               Ir a canales
             </Link>
@@ -350,13 +400,22 @@ function BroadcastWizard() {
         </div>
       )}
 
-      <div className="mb-6 flex flex-wrap items-center gap-4">
-        <StepTitle n={1} title="Mensaje" active={step === 1} done={step1Valid} onClick={() => setStep(1)} />
-        <span className="h-px w-8 bg-slate-300" />
-        <StepTitle n={2} title="Audiencia" active={step === 2} done={!!estimate?.recipients} onClick={() => step1Valid && setStep(2)} />
-        <span className="h-px w-8 bg-slate-300" />
-        <StepTitle n={3} title="Envío" active={step === 3} done={false} onClick={() => step1Valid && setStep(3)} />
-      </div>
+      {paused ? (
+        <div className="mb-4">
+          <Alert tone="info" title="Difusión en pausa">
+            Puedes cambiar el nombre, la plantilla y sus variables. La audiencia quedó fija al lanzarla: al reanudar, solo la recibirán los destinatarios que
+            faltan.
+          </Alert>
+        </div>
+      ) : (
+        <div className="mb-6 flex flex-wrap items-center gap-4">
+          <StepTitle n={1} title="Mensaje" active={step === 1} done={step1Valid} onClick={() => setStep(1)} />
+          <span className="h-px w-8 bg-slate-300" />
+          <StepTitle n={2} title="Audiencia" active={step === 2} done={!!estimate?.recipients} onClick={() => step1Valid && setStep(2)} />
+          <span className="h-px w-8 bg-slate-300" />
+          <StepTitle n={3} title="Envío" active={step === 3} done={false} onClick={() => step1Valid && setStep(3)} />
+        </div>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
         <div className="space-y-6">
@@ -370,14 +429,16 @@ function BroadcastWizard() {
                   <Field label="Número que envía">
                     <Select
                       value={effectiveChannel}
+                      disabled={paused}
                       onChange={(e) => {
                         setChannelId(e.target.value);
                         setTemplateKey('');
                       }}
                     >
                       {channels.map((c) => (
-                        <option key={c.id} value={c.id}>
+                        <option key={c.id} value={c.id} disabled={c.status === 'disabled' && c.id !== effectiveChannel}>
                           {c.name} {c.display_phone ? `(${c.display_phone})` : ''}
+                          {c.status === 'disabled' ? ' · deshabilitado' : ''}
                         </option>
                       ))}
                     </Select>
@@ -419,9 +480,15 @@ function BroadcastWizard() {
                   </div>
                 )}
                 <div className="flex justify-end">
-                  <Button onClick={() => setStep(2)} disabled={!step1Valid}>
-                    Continuar
-                  </Button>
+                  {paused ? (
+                    <Button onClick={() => save.mutate(false)} loading={save.isPending} disabled={!step1Valid}>
+                      Guardar cambios
+                    </Button>
+                  ) : (
+                    <Button onClick={() => setStep(2)} disabled={!step1Valid}>
+                      Continuar
+                    </Button>
+                  )}
                 </div>
               </div>
             </Card>
@@ -549,17 +616,20 @@ function BroadcastWizard() {
               <p className="text-sm text-slate-500">Elige una plantilla para ver la vista previa y el costo estimado.</p>
             </Card>
           )}
-          {template && <EstimateCard estimate={estimate} loading={estimateQ.isFetching} />}
+          {template && !paused && <EstimateCard estimate={estimate} loading={estimateQ.isFetching} error={estimateQ.error} />}
         </aside>
       </div>
     </Page>
   );
 }
 
-function EstimateCard({ estimate, loading }: { estimate: Estimate | undefined; loading: boolean }) {
+export function EstimateCard({ estimate, loading, error }: { estimate: Estimate | undefined; loading: boolean; error?: unknown }) {
   return (
     <Card title="Costo estimado" actions={loading ? <Spinner className="h-4 w-4" /> : undefined}>
-      {!estimate ? (
+      {/* A refused estimate (no usable number, bad audience) is not retried: say why instead of waiting. */}
+      {error && !loading ? (
+        <Alert tone="error">{errorMessage(error)}</Alert>
+      ) : !estimate ? (
         <p className="text-sm text-slate-500">Calculando…</p>
       ) : (
         <div className="space-y-3 text-sm">
@@ -737,6 +807,9 @@ function BroadcastDetail() {
   }
   if (b.status === 'paused') {
     actions.push(
+      <Button key="edit" variant="outline" onClick={() => navigate(`/difusiones/${b.id}/editar`)}>
+        Editar
+      </Button>,
       <Button key="resume" icon={<Play className="h-4 w-4" />} onClick={() => run('launch')} loading={action.isPending && action.variables === 'launch'}>
         Reanudar
       </Button>,

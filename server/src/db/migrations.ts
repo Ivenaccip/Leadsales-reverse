@@ -388,9 +388,11 @@ ALTER TABLE broadcasts ALTER COLUMN estimated_cost TYPE numeric(16,6);
 ALTER TABLE rate_card ALTER COLUMN price TYPE numeric(12,6);
 
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS operator_verified boolean NOT NULL DEFAULT false;
--- Since 850282e only the operator could connect numbers in prepaid workspaces: keep them working.
-UPDATE channels SET operator_verified = true
-  WHERE provider = 'cloud_api' AND NOT operator_verified
+-- A business may know the App Secret of numbers connected before its workspace became prepaid
+-- (it could connect its own app while paying Meta directly): the operator re-verifies them.
+UPDATE channels SET status = 'disabled',
+  last_error = 'Desactivado en modo de créditos prepagados: el negocio puede conocer la clave secreta (App Secret) de este número. Para activarlo, el administrador de la instancia debe capturar el token y la App Secret de su propia app de Meta.'
+  WHERE provider = 'cloud_api' AND NOT operator_verified AND status <> 'disabled'
     AND workspace_id IN (SELECT id FROM workspaces WHERE billing_mode = 'prepaid');
 
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS locked_by text;
@@ -409,9 +411,52 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
 );
 `;
 
+// Third review: sessions tied to the password they were opened with, Meta's own timestamp on
+// inbound messages, and template statuses older versions stored from notification events.
+const reviewThree = `
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_version int NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS password_version int NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS wa_ts bigint;
+UPDATE templates SET status = 'APPROVED' WHERE status IN ('REINSTATED', 'FLAGGED', 'LOCKED', 'UNLOCKED');
+-- Periodic settlement of sends Meta never confirmed, and of scheduled rows whose job died.
+CREATE INDEX IF NOT EXISTS messages_unsettled ON messages (created_at) WHERE direction = 'out' AND status IN ('pending', 'unknown') AND wamid IS NULL;
+CREATE INDEX IF NOT EXISTS scheduled_messages_stuck ON scheduled_messages (send_at) WHERE status IN ('pending', 'sending');
+CREATE INDEX IF NOT EXISTS jobs_scheduled_live ON jobs ((payload->>'id')) WHERE type = 'scheduled.send' AND status IN ('queued', 'running');
+-- Jobs: only the first queued job of each serial key can be claimed (held marks the ones behind
+-- it), claims read partial indexes of claimable jobs, and queued jobs move to this version's lanes.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS held boolean NOT NULL DEFAULT false;
+DROP INDEX IF EXISTS jobs_lane_ready;
+DROP INDEX IF EXISTS jobs_lane_ws_queued;
+CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs (lane, run_at, id) WHERE status = 'queued' AND NOT held;
+CREATE INDEX IF NOT EXISTS jobs_claimable_ws ON jobs (lane, workspace_id, run_at, id) WHERE status = 'queued' AND NOT held;
+CREATE INDEX IF NOT EXISTS jobs_serial_queued ON jobs (serial_key, run_at, id) WHERE status = 'queued' AND serial_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS jobs_serial_unheld ON jobs (serial_key, run_at) WHERE status = 'queued' AND NOT held AND serial_key IS NOT NULL;
+UPDATE jobs j SET held = true
+WHERE j.status = 'queued' AND j.serial_key IS NOT NULL
+  AND EXISTS (SELECT 1 FROM jobs p WHERE p.serial_key = j.serial_key AND p.id <> j.id
+              AND (p.status = 'running' OR (p.status = 'queued' AND (p.run_at, p.id) < (j.run_at, j.id))));
+UPDATE jobs SET lane = 'inbound' WHERE type = 'wa.webhook' AND status = 'queued';
+UPDATE jobs SET lane = 'media',
+  workspace_id = COALESCE(workspace_id, (SELECT m.workspace_id FROM messages m
+    WHERE m.id = CASE WHEN jobs.payload->>'messageId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN (jobs.payload->>'messageId')::uuid END))
+WHERE type = 'media.download' AND status = 'queued';
+UPDATE jobs SET lane = 'bulk',
+  workspace_id = COALESCE(workspace_id, (SELECT s.workspace_id FROM scheduled_messages s
+    WHERE s.id = CASE WHEN jobs.payload->>'id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN (jobs.payload->>'id')::uuid END))
+WHERE type = 'scheduled.send' AND status = 'queued';
+UPDATE jobs SET lane = 'bulk',
+  workspace_id = COALESCE(workspace_id, (SELECT b.workspace_id FROM broadcasts b
+    WHERE b.id = CASE WHEN jobs.payload->>'broadcastId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN (jobs.payload->>'broadcastId')::uuid END))
+WHERE type = 'broadcast.process' AND status = 'queued';
+-- Claims are planned from the statistics of jobs: refresh them after every 1000 changes, not after
+-- 10% of a table that keeps a week of finished jobs (a burst would be planned as an empty queue).
+ALTER TABLE jobs SET (autovacuum_analyze_scale_factor = 0, autovacuum_analyze_threshold = 1000);
+`;
+
 export const migrations: { name: string; sql: string }[] = [
   { name: '001_init', sql: init },
   { name: '002_rate_card_seed', sql: seedRates },
   { name: '003_wamid_per_workspace', sql: wamidPerWorkspace },
   { name: '004_hardening', sql: hardening },
+  { name: '005_review_three', sql: reviewThree },
 ];

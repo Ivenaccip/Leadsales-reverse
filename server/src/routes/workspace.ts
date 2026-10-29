@@ -10,7 +10,7 @@ import { getWorkspace } from '../services/messages.js';
 import type { BotMenu, WorkspaceRow, WorkspaceSettings } from '../types.js';
 import { emailSchema, lockSignups, newPasswordSchema } from './auth.js';
 import { ADMIN_ROLES, noContent, parse, requireWs, uuid, type WsAuth } from './helpers.js';
-import { createInvitation } from './invitations.js';
+import { createInvitation, revokePendingInvitations } from './invitations.js';
 
 const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Usa formato HH:MM');
 
@@ -191,6 +191,8 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
           body.name ?? body.email.split('@')[0],
         ]);
         await q.query(`INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, $3)`, [a.workspaceId, u.rows[0].id, body.role]);
+        // An earlier link for this email would later override what the admins decide for this member.
+        await revokePendingInvitations(q, a.workspaceId, { email: body.email });
         return u.rows[0].id;
       });
       if (userId) return { id: userId, existing_user: false };
@@ -221,6 +223,8 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
        WHERE workspace_id = $1 AND user_id = $2`,
       [a.workspaceId, id, body.role ?? null, body.is_active ?? null, body.receives_leads ?? null],
     );
+    // A pending link from before must not give back a role or access that was just taken away.
+    if (body.role || body.is_active === false) await revokePendingInvitations(ctx.db, a.workspaceId, { userId: id });
     if (body.role || body.is_active !== undefined) await ctx.realtime.evict(a.workspaceId, id);
     if (body.is_active === false) await endSessionsWithoutWorkspace(ctx, id);
     return { ok: true };
@@ -239,6 +243,7 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
     }
     await ctx.db.query(`UPDATE contacts SET assigned_user_id = NULL WHERE workspace_id = $1 AND assigned_user_id = $2`, [a.workspaceId, id]);
     await ctx.db.query(`DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2`, [a.workspaceId, id]);
+    await revokePendingInvitations(ctx.db, a.workspaceId, { userId: id });
     await ctx.realtime.evict(a.workspaceId, id);
     await endSessionsWithoutWorkspace(ctx, id);
     return noContent(reply);

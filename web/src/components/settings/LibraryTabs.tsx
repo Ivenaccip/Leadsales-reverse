@@ -6,18 +6,29 @@ import { useQuickReplies, useTags } from '../../lib/queries';
 import { useSession } from '../../lib/session';
 import type { QuickReply, Tag } from '../../lib/types';
 import { PLACEHOLDERS } from '../TemplateForm';
+import { TAG_NAME_HINT, tagNameProblem } from '../pickers';
 import { WA_MEDIA_ACCEPT } from '../inbox/helpers';
 import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageLoader, TagChip, Textarea, useConfirm, useToast } from '../ui';
 
 const COLORS = ['#ef4444', '#f97316', '#f59e0b', '#22c55e', '#10b981', '#0ea5e9', '#3b82f6', '#8b5cf6', '#ec4899', '#64748b'];
+
+/**
+ * What saving the tag sends, and why it would be refused. A tag named before ; , and | were refused
+ * keeps that name until it is renamed: a color change alone leaves the name out, which the server accepts.
+ */
+export function tagSaveBody(tag: Partial<Tag> | null, name: string, color: string): { body: { name?: string; color: string }; problem: string | null } {
+  const renamed = !tag?.id || name !== tag.name;
+  return { body: renamed ? { name, color } : { color }, problem: renamed ? tagNameProblem(name) : null };
+}
 
 function TagModal({ tag, onClose }: { tag: Partial<Tag> | null; onClose: () => void }) {
   const toast = useToast();
   const qc = useQueryClient();
   const [name, setName] = useState(tag?.name ?? '');
   const [color, setColor] = useState(tag?.color ?? COLORS[5]);
+  const draft = tagSaveBody(tag, name, color);
   const save = useMutation({
-    mutationFn: () => (tag?.id ? api.patch(`/api/tags/${tag.id}`, { name, color }) : api.post('/api/tags', { name, color })),
+    mutationFn: () => (tag?.id ? api.patch(`/api/tags/${tag.id}`, draft.body) : api.post('/api/tags', draft.body)),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['tags'] });
       onClose();
@@ -31,13 +42,13 @@ function TagModal({ tag, onClose }: { tag: Partial<Tag> | null; onClose: () => v
       title={tag?.id ? 'Editar etiqueta' : 'Nueva etiqueta'}
       size="sm"
       footer={
-        <Button onClick={() => save.mutate()} loading={save.isPending} disabled={!name.trim()}>
+        <Button onClick={() => save.mutate()} loading={save.isPending} disabled={!name.trim() || !!draft.problem}>
           Guardar
         </Button>
       }
     >
       <div className="space-y-4">
-        <Field label="Nombre">
+        <Field label="Nombre" hint={TAG_NAME_HINT} error={draft.problem}>
           <Input value={name} onChange={(e) => setName(e.target.value)} autoFocus maxLength={40} />
         </Field>
         <Field label="Color">

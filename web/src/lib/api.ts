@@ -12,28 +12,36 @@ export class ApiError extends Error {
   }
 }
 
-export function getWorkspaceId(): string | null {
+function readStored(key: string): string | null {
   try {
-    return localStorage.getItem(WS_KEY);
+    return localStorage.getItem(key);
   } catch {
     return null;
   }
+}
+
+// The workspace this tab works in. localStorage is shared by every tab of the origin, so it only
+// seeds a new tab (or a reload) with the last choice: a switch in another tab must not redirect
+// this tab's requests, media links or socket room to a workspace it is not showing.
+let tabWorkspace = readStored(WS_KEY);
+let tabOpener = readStored(OPENER_KEY);
+
+export function getWorkspaceId(): string | null {
+  return tabWorkspace;
 }
 
 /**
- * The user id of the instance operator who opened the stored workspace without a membership
+ * The user id of the instance operator who opened this tab's workspace without a membership
  * (Administración → Abrir). Only that operator may land in it again after a reload.
  */
 export function getWorkspaceOpener(): string | null {
-  try {
-    return localStorage.getItem(OPENER_KEY);
-  } catch {
-    return null;
-  }
+  return tabOpener;
 }
 
-/** Stores the current workspace; `opener` only when an operator opens a workspace they are not a member of. */
+/** Sets this tab's workspace; `opener` only when an operator opens a workspace they are not a member of. */
 export function setWorkspaceId(id: string | null, opener: string | null = null) {
+  tabWorkspace = id;
+  tabOpener = id && opener ? opener : null;
   try {
     if (id) localStorage.setItem(WS_KEY, id);
     else localStorage.removeItem(WS_KEY);

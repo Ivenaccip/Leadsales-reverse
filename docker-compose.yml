@@ -4,6 +4,11 @@
 #   docker compose up -d                      # app + PostgreSQL
 #   docker compose --profile https up -d      # + Caddy con HTTPS automático (requiere DOMAIN)
 #
+# La app se publica solo en 127.0.0.1: la usan Caddy o el proxy que tengas en este servidor.
+# Un cliente que llegara directo al puerto por IPv6 entraría desde la puerta de enlace de
+# Docker, que la app trata como proxy de confianza (podría elegir su IP con X-Forwarded-For).
+# Para exponerla sin proxy define APP_BIND=0.0.0.0 y TRUST_PROXY=false (ver docs/04).
+#
 services:
   app:
     build: .
@@ -16,7 +21,7 @@ services:
     volumes:
       - leadlibre-data:/data
     ports:
-      - "${APP_PORT:-3000}:3000"
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-3000}:3000"
     depends_on:
       db:
         condition: service_healthy
@@ -40,11 +45,13 @@ services:
     image: caddy:2-alpine
     profiles: ["https"]
     restart: unless-stopped
+    # Red del host: Caddy ve la IP real de cada cliente, también por IPv6 (detrás de los puertos
+    # publicados de Docker, los clientes IPv6 llegarían desde la puerta de enlace y compartirían
+    # una sola IP en los límites de intentos). Usa los puertos 80 y 443 del servidor.
+    network_mode: host
     environment:
       DOMAIN: ${DOMAIN:?Define DOMAIN en .env para usar HTTPS}
-    ports:
-      - "80:80"
-      - "443:443"
+      APP_PORT: ${APP_PORT:-3000}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

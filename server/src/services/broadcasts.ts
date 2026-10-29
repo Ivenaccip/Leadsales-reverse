@@ -4,10 +4,11 @@ import { AppError, badRequest, notFound } from '../lib/errors.js';
 import { marketFromPhone } from '../lib/phone.js';
 import type { ContactRow } from '../types.js';
 import { getChannel } from '../whatsapp/provider.js';
-import type { TemplateParams } from '../whatsapp/types.js';
+import { isMetaThrottle, type TemplateParams } from '../whatsapp/types.js';
 import { normalizeCategory, roundMoney } from './credits.js';
 import { dispatchWebhook } from './events.js';
-import { sendMessage } from './messages.js';
+import { abandonAutoRetry, isNetworkFailure, sendMessage } from './messages.js';
+import { dayStart, nextDay, workspaceTimezone } from './reports.js';
 import { checkTemplateParams, findTemplate } from './templates.js';
 
 export interface Audience {
@@ -55,7 +56,9 @@ export interface BroadcastRow {
 }
 
 const KNOWN_KEYS = new Set(['nombre', 'primer_nombre', 'telefono', 'correo', 'empresa']);
-const PLACEHOLDER = /\{([a-z_]+(?:\.[A-Za-z0-9_]+)?)(?:\|([^}]*))?\}/g;
+// A default value stops at the next brace: with [^}]* every '{' rescanned the rest of an unclosed
+// input, quadratic time on the shared event loop. web/src/components/inbox/helpers.tsx mirrors it.
+const PLACEHOLDER = /\{([a-z_]+(?:\.[A-Za-z0-9_]+)?)(?:\|([^{}]*))?\}/g;
 
 export function renderPlaceholders(
   template: string,
@@ -95,14 +98,10 @@ export function renderTemplateParams(
   };
 }
 
-// Meta throughput limits: temporary, so the send is retried later instead of failing the recipient.
-const META_THROTTLE_CODES = new Set([4, 80007, 130429, 131056]);
+// Meta throughput limits (isMetaThrottle) are retried later instead of failing the recipient.
+export { isMetaThrottle };
 // Account, number or template problems: every remaining recipient would fail the same way.
 const META_ACCOUNT_CODES = new Set([0, 3, 10, 190, 368, 131005, 131031, 131042, 131045, 131048, 131057, 132000, 132001, 132012, 132015, 132016, 133010]);
-
-export function isMetaThrottle(code: number | null | undefined): boolean {
-  return code != null && META_THROTTLE_CODES.has(code);
-}
 
 export function isMetaAccountError(code: number | null | undefined): boolean {
   return code != null && (META_ACCOUNT_CODES.has(code) || (code >= 200 && code <= 299));
@@ -138,8 +137,22 @@ export function checkBroadcastParams(components: any[], params: BroadcastParams 
   checkTemplateParams(components, resolveParams(params ?? {}, SAMPLE_CONTACT));
 }
 
-/** WHERE clause for an audience; returns SQL using parameters starting at $2 ($1 = workspace id). */
-export function audienceWhere(a: Audience): { sql: string; params: unknown[] } {
+/** An audience date as a calendar day (YYYY-MM-DD); older drafts may hold a full timestamp. */
+function audienceDay(v: string): string {
+  const day = String(v).slice(0, 10);
+  const t = Date.parse(`${day}T00:00:00Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(t) || !new Date(t).toISOString().startsWith(day)) {
+    throw badRequest('Las fechas de la audiencia deben ser AAAA-MM-DD', 'VALIDATION');
+  }
+  return day;
+}
+
+/**
+ * WHERE clause for an audience; returns SQL using parameters starting at $2 ($1 = workspace id).
+ * "Creados desde/hasta" are calendar days of the workspace's time zone `tz`, passed as instants as
+ * services/reports.ts does: no zone name ever reaches SQL.
+ */
+export function audienceWhere(a: Audience, tz: string): { sql: string; params: unknown[] } {
   const params: unknown[] = [];
   const conds = ['c.workspace_id = $1', 'NOT c.opted_out'];
   const p = (v: unknown) => {
@@ -154,8 +167,8 @@ export function audienceWhere(a: Audience): { sql: string; params: unknown[] } {
     conds.push(`NOT EXISTS (SELECT 1 FROM contact_tags ct WHERE ct.contact_id = c.id AND ct.tag_id = ANY(${p(a.exclude_tag_ids)}::uuid[]))`);
   }
   if (a.assigned_user_id) conds.push(`c.assigned_user_id = ${p(a.assigned_user_id)}::uuid`);
-  if (a.created_from) conds.push(`c.created_at >= ${p(a.created_from)}::timestamptz`);
-  if (a.created_to) conds.push(`c.created_at < (${p(a.created_to)}::date + 1)`);
+  if (a.created_from) conds.push(`c.created_at >= ${p(dayStart(audienceDay(a.created_from), tz).toISOString())}::timestamptz`);
+  if (a.created_to) conds.push(`c.created_at < ${p(dayStart(nextDay(audienceDay(a.created_to)), tz).toISOString())}::timestamptz`);
   return { sql: conds.join(' AND '), params };
 }
 
@@ -182,7 +195,7 @@ export async function estimateAudience(
   templateCategory: string,
 ): Promise<Estimate> {
   const category = normalizeCategory(templateCategory) ?? 'marketing';
-  const where = audienceWhere(audience);
+  const where = audienceWhere(audience, await workspaceTimezone(ctx, workspaceId));
   const { rows } = await ctx.db.query<{ phone: string }>(`SELECT c.phone FROM contacts c WHERE ${where.sql}`, [workspaceId, ...where.params]);
   const counts = new Map<string, number>();
   for (const r of rows) {
@@ -229,13 +242,19 @@ export async function launchBroadcast(ctx: AppContext, workspaceId: string, id: 
     }
   }
   const future = b.scheduled_at && new Date(b.scheduled_at).getTime() > Date.now() + 5000;
+  const tz = await workspaceTimezone(ctx, workspaceId);
 
   // Lock the row so two launches (double click, pause/resume) cannot both start it.
   const launched = await ctx.db.tx(async (q) => {
+    // The channel row comes first, in the order DELETE /api/channels takes them (the channel, then its
+    // broadcasts through ON DELETE SET NULL): a draft's broadcast row is updated twice below, and the
+    // second update re-checks its channel_id foreign key, which would deadlock with that delete.
+    const live = await q.query(`SELECT 1 FROM channels WHERE id = $1 FOR KEY SHARE`, [channel.id]);
+    if (!live.rows[0]) throw new AppError(400, 'NO_CHANNEL', 'El número de WhatsApp de la difusión se desconectó. Revisa Ajustes → Canales.');
     const cur = await q.query<{ status: string }>(`SELECT status FROM broadcasts WHERE id = $1 AND workspace_id = $2 FOR UPDATE`, [id, workspaceId]);
     if (cur.rows[0]?.status !== b.status) return false;
     if (b.status === 'draft' && est) {
-      const where = audienceWhere(b.audience);
+      const where = audienceWhere(b.audience, tz);
       await q.query(
         `INSERT INTO broadcast_recipients (broadcast_id, contact_id)
          SELECT $${where.params.length + 2}::uuid, c.id FROM contacts c WHERE ${where.sql} ON CONFLICT DO NOTHING`,
@@ -250,6 +269,9 @@ export async function launchBroadcast(ctx: AppContext, workspaceId: string, id: 
       `UPDATE broadcasts SET status = $2, last_error = NULL, started_at = CASE WHEN $2 = 'running' THEN COALESCE(started_at, now()) ELSE started_at END WHERE id = $1`,
       [b.id, future ? 'scheduled' : 'running'],
     );
+    // A job queued before a pause (for a scheduled_at edited since, or a throttle or network backoff)
+    // would keep the dedupe key and drop this one: this launch decides when the broadcast runs.
+    await q.query(`DELETE FROM jobs WHERE dedupe_key = $1 AND status = 'queued'`, [`broadcast:${b.id}`]);
     await ctx.queue.enqueue(
       'broadcast.process',
       { broadcastId: b.id },
@@ -279,6 +301,16 @@ const PAUSING_CODES = new Set([
 ]);
 const BATCH = 20;
 const THROTTLE_RETRY_MS = 60_000;
+// A network outage on our side (nothing reached Meta) is retried with backoff, 30 s up to 8 min
+// (about 15 minutes in all), and then the broadcast pauses: no recipient is ever failed for it.
+const NETWORK_RETRIES = 5;
+const NETWORK_RETRY_BASE_MS = 30_000;
+/** Stored on a recipient (or scheduled message) that waits for an automatic retry. */
+export const withRetryNote = (reason: string) => `${reason.trim().replace(/([^.!?])$/, '$1.')} Se reintentará automáticamente.`;
+
+/** What a run sends: when an edit while paused changes it, a run started before must not keep going. */
+const sendSpec = (x: Pick<BroadcastRow, 'template_name' | 'template_language' | 'channel_id' | 'params'>) =>
+  JSON.stringify([x.template_name, x.template_language, x.channel_id, x.params]);
 
 async function pauseBroadcast(ctx: AppContext, b: BroadcastRow, reason: string) {
   await ctx.db.query(`UPDATE broadcasts SET status = 'paused', last_error = $2 WHERE id = $1 AND status = 'running'`, [b.id, reason]);
@@ -289,7 +321,7 @@ async function pauseBroadcast(ctx: AppContext, b: BroadcastRow, reason: string) 
  * Job "broadcast.process": atomically claims a batch of recipients (so concurrent runs
  * never message anyone twice), sends respecting the rate limit, then re-queues itself.
  */
-export async function processBroadcast(ctx: AppContext, p: { broadcastId: string }): Promise<void> {
+export async function processBroadcast(ctx: AppContext, p: { broadcastId: string; netRetry?: number }): Promise<void> {
   const { rows } = await ctx.db.query<BroadcastRow & { ws_active: boolean }>(
     `SELECT b.*, w.is_active AS ws_active FROM broadcasts b JOIN workspaces w ON w.id = b.workspace_id WHERE b.id = $1`,
     [p.broadcastId],
@@ -297,11 +329,21 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
   const b = rows[0];
   if (!b) return;
   if (b.status === 'scheduled') {
+    // Only once due by the database clock (the queue's): a job that outlived an edit of scheduled_at
+    // must not start the broadcast early.
     const started = await ctx.db.query(
-      `UPDATE broadcasts SET status = 'running', started_at = COALESCE(started_at, now()) WHERE id = $1 AND status = 'scheduled' RETURNING id`,
+      `UPDATE broadcasts SET status = 'running', started_at = COALESCE(started_at, now())
+       WHERE id = $1 AND status = 'scheduled' AND (scheduled_at IS NULL OR scheduled_at <= now() + interval '5 seconds') RETURNING id`,
       [b.id],
     );
-    if (!started.rows[0]) return;
+    if (!started.rows[0]) {
+      const cur = await ctx.db.query<{ status: string; scheduled_at: Date | null }>(`SELECT status, scheduled_at FROM broadcasts WHERE id = $1`, [b.id]);
+      const s = cur.rows[0];
+      if (s?.status === 'scheduled' && s.scheduled_at) {
+        await ctx.queue.enqueue('broadcast.process', { broadcastId: b.id }, { dedupeKey: `broadcast:${b.id}`, runAt: new Date(s.scheduled_at) });
+      }
+      return;
+    }
     b.status = 'running';
   }
   if (b.status !== 'running') return;
@@ -326,49 +368,67 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
       [[...pending], st.rows[0]?.status === 'cancelled' ? 'skipped' : 'queued'],
     );
   };
-  const requeue = (rid: string, error: string | null) => {
+  const requeue = async (rid: string, contactId: string, error: string | null) => {
     pending.delete(rid);
-    return ctx.db.query(
+    const { rows } = await ctx.db.query<{ status: string }>(
       `UPDATE broadcast_recipients SET claimed_at = NULL, message_id = NULL, error = $2,
          status = CASE WHEN (SELECT status FROM broadcasts WHERE id = $3) = 'cancelled' THEN 'skipped' ELSE 'queued' END
-       WHERE id = $1`,
+       WHERE id = $1 RETURNING status`,
       [rid, error, b.id],
     );
+    // Cancelled while this send was in flight: its failed message will not be retried after all.
+    if (rows[0]?.status === 'skipped') await abandonAutoRetry(ctx, { broadcastId: b.id, contactId });
   };
-  const finish = (rid: string, status: string, messageId: string | null, error: string | null) => {
+  const finish = async (rid: string, contactId: string, status: string, messageId: string | null, error: string | null) => {
     pending.delete(rid);
-    return ctx.db.query(`UPDATE broadcast_recipients SET status = $2, message_id = $3, error = $4, processed_at = now() WHERE id = $1`, [
+    await ctx.db.query(`UPDATE broadcast_recipients SET status = $2, message_id = $3, error = $4, processed_at = now() WHERE id = $1`, [
       rid,
       status,
       messageId,
       error,
     ]);
+    // Ended without a send (skipped, or an error before storing one): an earlier attempt's message
+    // that said it would be retried will not be.
+    if (!messageId) await abandonAutoRetry(ctx, { broadcastId: b.id, contactId });
   };
 
   const gapMs = Math.ceil(1000 / ctx.config.broadcastRatePerSecond);
+  const spec = sendSpec(b);
   let throttled = false;
+  let networkDown = false;
   for (const r of claimed.rows) {
-    const current = await ctx.db.query<{ status: string }>(`SELECT status FROM broadcasts WHERE id = $1`, [b.id]);
+    const current = await ctx.db.query<BroadcastRow>(
+      `SELECT status, template_name, template_language, channel_id, params FROM broadcasts WHERE id = $1`,
+      [b.id],
+    );
     if (current.rows[0]?.status !== 'running') {
       await release(); // paused or cancelled meanwhile
       return;
     }
+    if (sendSpec(current.rows[0]) !== spec) {
+      // Edited while paused and resumed during this batch: a fresh run sends the rest with the new values.
+      await release();
+      await ctx.queue.enqueue('broadcast.process', { broadcastId: b.id }, { dedupeKey: `broadcast:${b.id}` });
+      return;
+    }
     // A previous run may have sent this one and died before recording it: never send twice.
-    // A send Meta refused outright (failed, no wamid) never went out, so it may be retried.
-    const already = await ctx.db.query<{ id: string; status: string }>(
-      `SELECT id, status FROM messages WHERE broadcast_id = $1 AND contact_id = $2 AND NOT (status = 'failed' AND wamid IS NULL)
-       ORDER BY created_at DESC LIMIT 1`,
+    // A send that never went out (failed, no wamid: Meta refused it or it never reached Meta) may be
+    // retried, as that same message so the chat keeps one bubble.
+    const prior = await ctx.db.query<{ id: string; status: string; unsent: boolean }>(
+      `SELECT id, status, (status = 'failed' AND wamid IS NULL) AS unsent FROM messages WHERE broadcast_id = $1 AND contact_id = $2
+       ORDER BY created_at DESC`,
       [b.id, r.contact_id],
     );
-    if (already.rows[0]) {
-      await finish(r.id, already.rows[0].status === 'failed' ? 'failed' : 'sent', already.rows[0].id, null);
+    const already = prior.rows.find((m) => !m.unsent);
+    if (already) {
+      await finish(r.id, r.contact_id, already.status === 'failed' ? 'failed' : 'sent', already.id, null);
       continue;
     }
     const started = Date.now();
     const c = await ctx.db.query<ContactRow>(`SELECT * FROM contacts WHERE id = $1`, [r.contact_id]);
     const contact = c.rows[0];
     if (!contact || contact.opted_out) {
-      await finish(r.id, 'skipped', null, null);
+      await finish(r.id, r.contact_id, 'skipped', null, null);
       continue;
     }
     try {
@@ -380,11 +440,20 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
         userId: b.created_by,
         broadcastId: b.id,
         content: { type: 'template', name: b.template_name, language: b.template_language, params: resolveParams(b.params ?? {}, contact) },
+        // Throttled and network-failed recipients go back to the queue, also when the broadcast pauses.
+        autoRetry: true,
+        retryOf: prior.rows[0]?.id ?? null,
       });
       const code = msg.error?.code ?? null;
       if (msg.status === 'failed' && isMetaThrottle(code)) {
-        await requeue(r.id, msg.error?.message ?? null);
+        await requeue(r.id, r.contact_id, withRetryNote('Meta limitó la velocidad de envío.'));
         throttled = true;
+        break;
+      }
+      if (isNetworkFailure(msg)) {
+        // Nothing reached Meta: every recipient would fail alike until the network is back.
+        await requeue(r.id, r.contact_id, withRetryNote('No se pudo conectar con WhatsApp (falla de red del servidor).'));
+        networkDown = true;
         break;
       }
       if (msg.status === 'failed' && isMetaAccountError(code)) {
@@ -395,28 +464,41 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
       }
       if (msg.status === 'unknown') {
         // Meta may have delivered it: never resend this one, and stop before a Meta outage burns the audience.
-        await finish(r.id, 'sent', msg.id, msg.error?.message ?? null);
+        await finish(r.id, r.contact_id, 'sent', msg.id, msg.error?.message ?? null);
         await pauseBroadcast(ctx, b, 'No pudimos confirmar un envío con Meta (falla de red o de Meta). Revisa que todo funcione y reanuda la difusión.');
         await release();
         return;
       }
-      await finish(r.id, msg.status === 'failed' ? 'failed' : 'sent', msg.id, msg.error?.message ?? null);
+      await finish(r.id, r.contact_id, msg.status === 'failed' ? 'failed' : 'sent', msg.id, msg.error?.message ?? null);
     } catch (err: any) {
       if (err instanceof AppError && PAUSING_CODES.has(err.code)) {
         await pauseBroadcast(ctx, b, err.message);
         await release();
         return;
       }
-      await finish(r.id, 'failed', null, String(err?.message ?? err).slice(0, 500));
+      await finish(r.id, r.contact_id, 'failed', null, String(err?.message ?? err).slice(0, 500));
     }
     const wait = gapMs - (Date.now() - started);
     if (wait > 0) await new Promise((res) => setTimeout(res, wait));
   }
 
-  if (throttled) {
-    // Meta asked us to slow down: hand the rest of the batch back and continue in a while.
+  if (throttled || networkDown) {
+    // Meta asked us to slow down, or could not be reached: hand the rest of the batch back and continue in a while.
     await release();
-    await ctx.queue.enqueue('broadcast.process', { broadcastId: b.id }, { delayMs: THROTTLE_RETRY_MS, dedupeKey: `broadcast:${b.id}` });
+    const netRetry = p.netRetry ?? 0;
+    if (networkDown && netRetry >= NETWORK_RETRIES) {
+      await pauseBroadcast(
+        ctx,
+        b,
+        'No se pudo conectar con WhatsApp durante varios minutos (falla de red del servidor). Revisa la conexión a internet del servidor y reanuda la difusión.',
+      );
+      return;
+    }
+    await ctx.queue.enqueue(
+      'broadcast.process',
+      networkDown ? { broadcastId: b.id, netRetry: netRetry + 1 } : { broadcastId: b.id },
+      { delayMs: networkDown ? NETWORK_RETRY_BASE_MS * 2 ** netRetry : THROTTLE_RETRY_MS, dedupeKey: `broadcast:${b.id}` },
+    );
     ctx.realtime.emit(b.workspace_id, 'broadcast:update', await getBroadcast(ctx.db, b.workspace_id, b.id));
     return;
   }

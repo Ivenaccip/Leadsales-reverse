@@ -76,7 +76,7 @@ describe('placeholders', () => {
     expect(p).toEqual({ header: { type: 'text', text: 'Tacos SA' }, body: ['Ana', '20%'], buttons: [{ index: 0, text: 'promo' }] });
   });
   it('builds audience filters with numbered params', () => {
-    const w = audienceWhere({ tag_ids: ['a'], stage_ids: ['b'], exclude_tag_ids: ['c'] });
+    const w = audienceWhere({ tag_ids: ['a'], stage_ids: ['b'], exclude_tag_ids: ['c'] }, 'UTC');
     expect(w.params).toEqual([['b'], ['a'], ['c']]);
     expect(w.sql).toContain('$2');
     expect(w.sql).toContain('$4');
@@ -166,7 +166,9 @@ describe('inbound parsing', () => {
   });
   it('detects opt-out keywords in typed text, template buttons and interactive replies (#46, #62)', () => {
     expect(optOutKeyword(parseInboundContent({ type: 'text', text: { body: ' BAJA ' } }))).toBe('baja');
-    expect(optOutKeyword(parseInboundContent({ type: 'button', button: { text: 'Baja', payload: 'Baja' } }))).toBe('baja');
+    // On a button, everyday words are answers the business wrote (a survey's "Baja"); only explicit phrases opt out
+    expect(optOutKeyword(parseInboundContent({ type: 'button', button: { text: 'Baja', payload: 'Baja' } }))).toBeNull();
+    expect(optOutKeyword(parseInboundContent({ type: 'button', button: { text: 'Stop promotions', payload: 'Stop promotions' } }))).toBe('stop promotions');
     expect(optOutKeyword(parseInboundContent({ type: 'button', button: { text: 'No gracias', payload: 'STOP' } }))).toBe('stop');
     expect(optOutKeyword(parseInboundContent({ type: 'interactive', interactive: { type: 'list_reply', list_reply: { id: 'x', title: 'Unsubscribe' } } }))).toBe('unsubscribe');
     expect(optOutKeyword(parseInboundContent({ type: 'text', text: { body: 'quiero darme de baja mañana' } }))).toBeNull();

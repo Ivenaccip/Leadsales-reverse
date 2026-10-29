@@ -221,6 +221,21 @@ export function verificationGap(channel: Channel, billingMode: BillingMode | und
     : 'Captura también el token de acceso de tu propia app de Meta: sin él no se puede verificar el número.';
 }
 
+/**
+ * Whether the card offers "Activar" for a disabled number. Nothing else re-enables one (testing or
+ * re-keying it only reports), e.g. after the workspace went prepaid and back. A number that still
+ * needs the operator's verification shows how to verify it instead (the server refuses it).
+ */
+export function canReactivateChannel(channel: Channel, billingMode: BillingMode | undefined, isAdmin: boolean, manageCloud: boolean): boolean {
+  if (!isAdmin || channel.status !== 'disabled') return false;
+  if (channel.provider !== 'cloud_api') return true;
+  return manageCloud && !needsOperatorVerification(channel, billingMode);
+}
+
+export function reactivateChannel(channel: Channel) {
+  return api.patch<{ channel: Channel }>(`/api/channels/${channel.id}`, { status: 'active' });
+}
+
 /** What the operator must do to bring back a number disabled by the switch to prepaid. */
 export function PrepaidVerificationNote() {
   return (
@@ -407,6 +422,16 @@ export function ChannelsTab() {
     }
   }
 
+  async function activate(c: Channel) {
+    try {
+      await reactivateChannel(c);
+      toast.success(`"${c.name}" está activo de nuevo`);
+    } catch (e) {
+      toast.error(errorMessage(e));
+    }
+    refresh();
+  }
+
   async function makeDefault(c: Channel) {
     await api.patch(`/api/channels/${c.id}`, { is_default: true }).catch((e) => toast.error(errorMessage(e)));
     refresh();
@@ -473,6 +498,11 @@ export function ChannelsTab() {
           actions={
             isAdmin && (
               <>
+                {canReactivateChannel(c, billingMode, isAdmin, manageCloud) && (
+                  <Button size="sm" onClick={() => activate(c)}>
+                    Activar
+                  </Button>
+                )}
                 {c.provider === 'cloud_api' && (
                   <>
                     <Button size="sm" variant="outline" onClick={() => test(c)} icon={<CheckCircle2 className="h-4 w-4" />}>

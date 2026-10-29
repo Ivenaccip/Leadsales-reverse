@@ -181,6 +181,69 @@ export async function saveMedia(
   return rows[0];
 }
 
+/**
+ * A fresh path for a file being downloaded, on the same disk as the media store so saving it is
+ * a rename. The caller writes it and passes it to saveMediaFile (or deletes it on failure).
+ */
+export async function mediaTempPath(ctx: AppContext): Promise<string> {
+  const dir = path.join(ctx.config.dataDir, 'media', '.tmp');
+  await fs.mkdir(dir, { recursive: true });
+  return path.join(dir, `${crypto.randomUUID()}.part`);
+}
+
+/**
+ * Deletes partial downloads older than `maxAgeMs` from the temp folder. A download that fails
+ * removes its own file; one cut off by a crash leaves it behind. A live download writes its file
+ * all the time (and a job times out after 10 minutes), so an hour without a write means nobody owns it.
+ */
+export async function removeStaleMediaTemp(ctx: AppContext, maxAgeMs = 3600_000): Promise<number> {
+  const dir = path.join(ctx.config.dataDir, 'media', '.tmp');
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return 0;
+    throw err;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!name.endsWith('.part')) continue;
+    const file = path.join(dir, name);
+    const st = await fs.stat(file).catch(() => null);
+    if (!st?.isFile() || Date.now() - st.mtimeMs < maxAgeMs) continue;
+    await fs.rm(file, { force: true });
+    removed++;
+  }
+  return removed;
+}
+
+/** saveMedia for a file already on disk (see mediaTempPath): it is moved into the store, never read into memory. */
+export async function saveMediaFile(
+  ctx: AppContext,
+  workspaceId: string,
+  tempPath: string,
+  mime: string,
+  filename: string | null,
+  waMediaIds: Record<string, string> = {},
+): Promise<MediaFile> {
+  const rel = path.join('media', workspaceId, `${crypto.randomUUID()}${extFor(mime, filename)}`);
+  const abs = path.join(ctx.config.dataDir, rel);
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+  const { size } = await fs.stat(tempPath);
+  await fs.rename(tempPath, abs);
+  try {
+    const { rows } = await ctx.db.query<MediaFile>(
+      `INSERT INTO media_files (workspace_id, path, mime, size, filename, wa_media_ids)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [workspaceId, rel, mime.split(';')[0].trim(), size, filename, JSON.stringify(waMediaIds)],
+    );
+    return rows[0];
+  } catch (err) {
+    await fs.rm(abs, { force: true }).catch(() => {});
+    throw err;
+  }
+}
+
 export async function getMedia(ctx: AppContext, workspaceId: string, id: string): Promise<MediaFile> {
   const { rows } = await ctx.db.query<MediaFile>(`SELECT * FROM media_files WHERE id = $1 AND workspace_id = $2`, [id, workspaceId]);
   if (!rows[0]) throw notFound('Archivo');

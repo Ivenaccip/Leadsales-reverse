@@ -24,8 +24,12 @@ export interface Db extends Queryable {
 pg.types.setTypeParser(1700, (v) => parseFloat(v));
 pg.types.setTypeParser(20, (v) => Number(v));
 
-function createPgDb(url: string): Db {
+function createPgDb(url: string, onIdleError?: (err: Error) => void): Db {
   const pool = new pg.Pool({ connectionString: url, max: 10 });
+  // A connection that drops while idle in the pool (database restart or failover, a proxy's idle
+  // timeout) is already discarded and replaced on demand. Without a listener the pool re-emits the
+  // error as an unhandled 'error' event, which ends the whole process.
+  pool.on('error', (err) => onIdleError?.(err));
   return {
     kind: 'postgres',
     async query(sql, params = []) {
@@ -99,9 +103,9 @@ async function createPgliteDb(dir: string | null): Promise<Db> {
  * embedded PostgreSQL (PGlite) stored in DATA_DIR/pgdata: zero setup for small teams.
  * Pass dataDir = null for an in-memory database (tests).
  */
-export async function createDb(opts: { databaseUrl: string | null; dataDir: string | null }): Promise<Db> {
+export async function createDb(opts: { databaseUrl: string | null; dataDir: string | null; onIdleError?: (err: Error) => void }): Promise<Db> {
   const db = opts.databaseUrl
-    ? createPgDb(opts.databaseUrl)
+    ? createPgDb(opts.databaseUrl, opts.onIdleError)
     : await createPgliteDb(opts.dataDir ? path.join(opts.dataDir, 'pgdata') : null);
   await migrate(db);
   return db;

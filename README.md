@@ -97,8 +97,11 @@ tarifas: [`docs/05-creditos-y-costos.md`](docs/05-creditos-y-costos.md).
 
 - `ALLOW_SIGNUP=true` permite que cada miembro cree su espacio de trabajo.
 - Cada negocio suma a su equipo con **enlaces de invitación** (Ajustes → Equipo): sirven
-  aunque `ALLOW_SIGNUP=false` y nadie puede agregar la cuenta de otra persona ni ponerle
-  contraseña.
+  aunque `ALLOW_SIGNUP=false` y nadie puede agregar la cuenta de otra persona. LeadLibre
+  no envía correos: si alguien creó la cuenta de un correo ajeno, el operador la recupera
+  desde Administración (ver [`docs/04-despliegue.md`](docs/04-despliegue.md)).
+- `docker compose` publica la app solo en `127.0.0.1` (Caddy o tu proxy llegan a ella
+  ahí), para que nadie elija su IP con `X-Forwarded-For`.
 - Corre **una sola réplica** del contenedor `app` (el tiempo real vive en memoria); ver
   [`docs/04-despliegue.md`](docs/04-despliegue.md).
 - Cada espacio conecta su propio número y paga a Meta con su tarjeta (`meta_direct`), o

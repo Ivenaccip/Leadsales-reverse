@@ -1,8 +1,8 @@
 import { lazy, Suspense, type ReactNode } from 'react';
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { Layout } from './components/Layout';
-import { PageLoader } from './components/ui';
-import { useSession } from './lib/session';
+import { Button, PageLoader } from './components/ui';
+import { noWorkspaceReason, useSession } from './lib/session';
 import { LoginPage, RegisterPage } from './pages/Login';
 
 const InboxPage = lazy(() => import('./pages/Inbox'));
@@ -18,14 +18,18 @@ const AdminPage = lazy(() => import('./pages/Admin'));
 const InvitationPage = lazy(() => import('./pages/Invitation'));
 
 function RequireAuth({ children }: { children: ReactNode }) {
-  const { loading, user, workspace } = useSession();
+  const session = useSession();
   const location = useLocation();
-  if (loading) return <PageLoader />;
-  if (!user) return <Navigate to="/login" state={{ from: location.pathname }} replace />;
-  if (!workspace && !user.is_superadmin) {
+  if (session.loading) return <PageLoader />;
+  if (!session.user) return <Navigate to="/login" state={{ from: location.pathname }} replace />;
+  const blocked = noWorkspaceReason(session);
+  if (blocked) {
     return (
-      <div className="p-10 text-center text-slate-600">
-        Tu usuario no pertenece a ningún espacio de trabajo activo. Pide a un administrador que te envíe una invitación.
+      <div className="space-y-4 p-10 text-center text-slate-600">
+        <p>{blocked}</p>
+        <Button variant="outline" onClick={() => void session.logout()}>
+          Cerrar sesión
+        </Button>
       </div>
     );
   }

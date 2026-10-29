@@ -21,6 +21,38 @@ export class Realtime {
   resolveAssignee: ((contactId: string) => Promise<string | null>) | null = null;
   /** Last assignee seen per contact, to tell restricted agents when a conversation leaves them. */
   private assignees = new Map<string, string | null>();
+  /**
+   * Eviction counters per scope (ws:{id}, ws:{id}:u:{userId}, user:{id}, sid:{id}), kept only while
+   * a 'join' watches them. A join reads rights from the database and only then enters rooms: if an
+   * eviction that concerns it ran in between, its rights may predate the change that caused it, so
+   * it must read them again (see app.ts). Per scope, so one tenant's evictions never make another
+   * tenant's joins retry (or give up).
+   */
+  private evictions = new Map<string, { count: number; watchers: number }>();
+
+  /** Watches evictions of these scopes until release(); count() only grows while watched. */
+  watchEvictions(scopes: string[]): { count: () => number; release: () => void } {
+    const entries = scopes.map((scope) => {
+      let e = this.evictions.get(scope);
+      if (!e) this.evictions.set(scope, (e = { count: 0, watchers: 0 }));
+      e.watchers++;
+      return [scope, e] as const;
+    });
+    let released = false;
+    return {
+      count: () => entries.reduce((n, [, e]) => n + e.count, 0),
+      release: () => {
+        if (released) return;
+        released = true;
+        for (const [scope, e] of entries) if (--e.watchers === 0) this.evictions.delete(scope);
+      },
+    };
+  }
+
+  private bump(scope: string) {
+    const e = this.evictions.get(scope);
+    if (e) e.count++;
+  }
 
   emit(workspaceId: string, event: string, data: unknown): void {
     const room = `ws:${workspaceId}`;
@@ -48,6 +80,7 @@ export class Realtime {
    * to join again, so permission changes (removal, deactivation, visibility) apply at once.
    */
   async evict(workspaceId: string, userId?: string): Promise<void> {
+    this.bump(userId ? `ws:${workspaceId}:u:${userId}` : `ws:${workspaceId}`);
     if (!this.io) return;
     for (const room of [`ws:${workspaceId}`, `ws:${workspaceId}:restricted`]) {
       const sockets = await this.io.in(room).fetchSockets();
@@ -61,6 +94,7 @@ export class Realtime {
 
   /** Same as evict() for every workspace a user's sockets joined (e.g. superadmin rights removed). */
   async evictUser(userId: string): Promise<void> {
+    this.bump(`user:${userId}`);
     if (!this.io) return;
     for (const s of await this.io.in(`user:${userId}`).fetchSockets()) {
       const workspaces = new Set<string>();
@@ -75,6 +109,7 @@ export class Realtime {
 
   /** Tells the sockets of ended sessions to log out ('session:revoked') and disconnects them. */
   async endSessions(target: { sid: string } | { userId: string; exceptSid?: string }): Promise<void> {
+    this.bump('sid' in target ? `sid:${target.sid}` : `user:${target.userId}`);
     if (!this.io) return;
     const room = 'sid' in target ? `sid:${target.sid}` : `user:${target.userId}`;
     for (const s of await this.io.in(room).fetchSockets()) {

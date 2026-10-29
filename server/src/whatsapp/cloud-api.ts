@@ -1,3 +1,7 @@
+import { createWriteStream } from 'node:fs';
+import { rm } from 'node:fs/promises';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import {
   MetaApiError,
   type CreateTemplateInput,
@@ -33,12 +37,21 @@ function isMetaMediaHost(host: string): boolean {
   return h === 'lookaside.fbsbx.com' || h === 'graph.facebook.com' || h.endsWith('.fbsbx.com') || h.endsWith('.fbcdn.net') || h.endsWith('.whatsapp.net');
 }
 
-async function readCapped(res: Response, max: number): Promise<Buffer> {
-  const tooBig = () => permanent(new MetaApiError(`El archivo supera el máximo de ${Math.round(max / 1024 / 1024)} MB`, null, 413));
+const DEFAULT_MAX_MEDIA_BYTES = 100 * 1024 * 1024;
+
+function tooBig(max: number) {
+  return permanent(new MetaApiError(`El archivo supera el máximo de ${Math.round(max / 1024 / 1024)} MB`, null, 413));
+}
+
+async function refuseDeclaredSize(res: Response, max: number) {
   if (Number(res.headers.get('content-length') ?? 0) > max) {
     await res.body?.cancel().catch(() => {});
-    throw tooBig();
+    throw tooBig(max);
   }
+}
+
+async function readCapped(res: Response, max: number): Promise<Buffer> {
+  await refuseDeclaredSize(res, max);
   if (!res.body) return Buffer.from(await res.arrayBuffer());
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -49,7 +62,7 @@ async function readCapped(res: Response, max: number): Promise<Buffer> {
     size += value.byteLength;
     if (size > max) {
       await reader.cancel().catch(() => {});
-      throw tooBig();
+      throw tooBig(max);
     }
     chunks.push(value);
   }
@@ -151,6 +164,41 @@ export class CloudApiProvider implements WhatsAppProvider {
   }
 
   async downloadMedia(mediaId: string) {
+    const { res, mime } = await this.openMedia(mediaId);
+    const data = await readCapped(res, this.o.maxMediaBytes ?? DEFAULT_MAX_MEDIA_BYTES);
+    return { data, mime };
+  }
+
+  /**
+   * Streams the file straight to `dest` (a new path: it is created, and removed again on any
+   * failure), never holding it in memory: inbound documents go up to 100 MB and several
+   * downloads run at once.
+   */
+  async downloadMediaToFile(mediaId: string, dest: string): Promise<{ size: number; mime: string }> {
+    const { res, mime } = await this.openMedia(mediaId);
+    const max = this.o.maxMediaBytes ?? DEFAULT_MAX_MEDIA_BYTES;
+    await refuseDeclaredSize(res, max);
+    let size = 0;
+    const counter = new Transform({
+      transform(chunk: Buffer, _enc, cb) {
+        size += chunk.length;
+        cb(size > max ? tooBig(max) : null, size > max ? undefined : chunk);
+      },
+    });
+    try {
+      const body = res.body ? Readable.fromWeb(res.body as any) : Readable.from([]);
+      await pipeline(body, counter, createWriteStream(dest, { flags: 'wx' }));
+    } catch (err) {
+      await res.body?.cancel().catch(() => {});
+      // 'wx' never touches a file that was already there; anything this call wrote goes.
+      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') await rm(dest, { force: true }).catch(() => {});
+      throw err;
+    }
+    return { size, mime };
+  }
+
+  /** Resolves a media id to the open response of its file (headers read, body not yet). */
+  private async openMedia(mediaId: string): Promise<{ res: Response; mime: string }> {
     // Media ids are numeric. Anything else (e.g. "123?fields=url") would let a forged webhook
     // choose the Graph path and query, and then make us fetch whatever URL that node returns.
     if (!/^\d{1,32}$/.test(mediaId)) throw permanent(new MetaApiError('Id de archivo de Meta inválido', null, 400));
@@ -177,9 +225,11 @@ export class CloudApiProvider implements WhatsAppProvider {
       }
       url = this.mediaUrl(next);
     }
-    if (!res.ok) throw new MetaApiError(`No se pudo descargar el archivo (HTTP ${res.status})`, null, res.status);
-    const data = await readCapped(res, this.o.maxMediaBytes ?? 100 * 1024 * 1024);
-    return { data, mime: meta?.mime_type ?? '' };
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      throw new MetaApiError(`No se pudo descargar el archivo (HTTP ${res.status})`, null, res.status);
+    }
+    return { res, mime: meta?.mime_type ?? '' };
   }
 
   async getPhoneInfo() {

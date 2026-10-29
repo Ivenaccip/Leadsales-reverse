@@ -73,7 +73,11 @@ export interface MessageRow {
   wamid: string | null;
   reply_to_wamid: string | null;
   status: string;
-  error: { code?: number | null; title?: string; message?: string } | null;
+  /**
+   * network: the send failed before reaching Meta (DNS, connection, TLS), so nothing was sent and it may be retried.
+   * auto_retry: the sender (broadcast, scheduled send) will retry it by itself, as this same row.
+   */
+  error: { code?: number | null; title?: string; message?: string; network?: boolean; auto_retry?: boolean } | null;
   sent_by: string | null;
   user_id: string | null;
   broadcast_id: string | null;
@@ -84,6 +88,8 @@ export interface MessageRow {
   charged_prepaid?: boolean;
   /** False while the work queued after storing/updating the message (jobs, webhooks) is not committed yet. */
   followups_done?: boolean;
+  /** Meta's timestamp (seconds) of an inbound message or echo: chat order follows it across Meta seconds. */
+  wa_ts?: number | null;
   created_at: Date;
   status_updated_at: Date | null;
 }

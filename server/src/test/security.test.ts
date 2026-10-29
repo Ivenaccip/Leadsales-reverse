@@ -186,6 +186,8 @@ describe('broadcasts never run twice', () => {
     const jobs = await env.built.ctx.db.query(`SELECT count(*)::int AS n FROM jobs WHERE type = 'broadcast.process' AND status = 'queued' AND payload->>'broadcastId' = $1`, [id]);
     expect(jobs.rows[0].n).toBe(1);
     await env.built.ctx.queue.enqueue('broadcast.process', { broadcastId: id });
+    // A scheduled broadcast never starts before its time, whatever its jobs say: make it due too.
+    await env.built.ctx.db.query(`UPDATE broadcasts SET scheduled_at = now() WHERE id = $1`, [id]);
     await env.built.ctx.db.query(`UPDATE jobs SET run_at = now() WHERE status = 'queued'`);
     await env.drain();
     const msgs = await env.built.ctx.db.query(`SELECT contact_id, count(*)::int AS n FROM messages WHERE broadcast_id = $1 GROUP BY contact_id`, [id]);

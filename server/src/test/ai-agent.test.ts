@@ -230,13 +230,13 @@ describe('AI agent fixes', () => {
     expect(jobs.rows.map((j: any) => j.status)).toEqual(['done']);
   });
 
-  it('does not answer contacts who opted out', async () => {
+  it('does not answer the opt-out itself, but still answers a contact who opted out of broadcasts', async () => {
     const before = claudeCalls().length;
     const id = await say('5215577770003', 'BAJA');
-    await say('5215577770003', 'hola');
-    await env.built.ctx.queue.enqueue('ai.reply', { workspaceId, contactId: id });
-    await env.drain();
     expect(claudeCalls().length).toBe(before);
-    expect((await messagesOf(id)).filter((m: any) => m.direction === 'out')).toHaveLength(0);
+    replies.push({ content: [{ type: 'text', text: 'Hola, ¿en qué te ayudo?' }], stop_reason: 'end_turn' });
+    await say('5215577770003', 'hola');
+    expect(claudeCalls().length).toBe(before + 1);
+    expect((await messagesOf(id)).filter((m: any) => m.direction === 'out').map((m: any) => m.body)).toEqual(['Hola, ¿en qué te ayudo?']);
   });
 });

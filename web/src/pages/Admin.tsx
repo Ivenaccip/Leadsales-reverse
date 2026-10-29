@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
 import { Navigate, useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Building2, Coins, LogIn, MessageCircle, Users } from 'lucide-react';
+import { AlertTriangle, Building2, Coins, KeyRound, LogIn, MessageCircle, Trash2, Users } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
 import { CATEGORY_LABEL, credits, dateTime, MARKET_LABEL, number } from '../lib/format';
 import { useSession } from '../lib/session';
-import { Alert, Badge, Button, Card, Field, Input, Modal, Page, PageHeader, PageLoader, Select, Stat, Tabs, Toggle, useToast } from '../components/ui';
+import { Alert, Badge, Button, Card, Field, Input, Modal, Page, PageHeader, PageLoader, Select, Stat, Tabs, Toggle, useConfirm, useToast } from '../components/ui';
 
 interface AdminWorkspace {
   id: string;
@@ -21,13 +21,118 @@ interface AdminWorkspace {
   owner_email: string | null;
 }
 
-interface AdminUser {
+export interface AdminUser {
   id: string;
   email: string;
   name: string;
   is_superadmin: boolean;
   created_at: string;
   workspaces: number;
+  /** Names of its workspaces, comma-separated (null when it has none). */
+  workspace_names: string | null;
+}
+
+/**
+ * Account recovery the operator can offer (emails are not verified, so an account may have been
+ * created by whoever held an invitation link). Same limits as the server: never on the operator's
+ * own account or another operator's, and only accounts outside every workspace can be deleted.
+ */
+export function userRecoveryActions(u: Pick<AdminUser, 'id' | 'is_superadmin' | 'workspaces'>, meId: string): { password: boolean; remove: boolean } {
+  const other = u.id !== meId && !u.is_superadmin;
+  return { password: other, remove: other && u.workspaces === 0 };
+}
+
+const PASSWORD_CHARS = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+/** A random temporary password (no look-alike characters, so it can be dictated). */
+export function temporaryPassword(length = 12): string {
+  // 32-bit values keep the modulo bias negligible.
+  const values = crypto.getRandomValues(new Uint32Array(length));
+  return [...values].map((v) => PASSWORD_CHARS[v % PASSWORD_CHARS.length]).join('');
+}
+
+export function AdminUserRow({
+  u,
+  meId,
+  onToggleSuper,
+  onPassword,
+  onDelete,
+}: {
+  u: AdminUser;
+  meId: string;
+  onToggleSuper: () => void;
+  onPassword: () => void;
+  onDelete: () => void;
+}) {
+  const can = userRecoveryActions(u, meId);
+  return (
+    <div className="flex flex-wrap items-center gap-4 px-5 py-3">
+      <div className="min-w-0 flex-1">
+        <p className="font-medium text-slate-900">{u.name}</p>
+        <p className="text-xs text-slate-500">
+          {u.email} · desde {dateTime(u.created_at).split(',')[0]}
+        </p>
+        <p className="text-xs text-slate-500">{u.workspaces > 0 ? `Espacios (${u.workspaces}): ${u.workspace_names ?? ''}` : 'Sin espacios de trabajo'}</p>
+      </div>
+      <Toggle checked={u.is_superadmin} onChange={onToggleSuper} label="Administrador de la instancia" disabled={u.id === meId} />
+      {(can.password || can.remove) && (
+        <div className="flex gap-2">
+          {can.password && (
+            <Button size="sm" variant="outline" icon={<KeyRound className="h-4 w-4" />} onClick={onPassword}>
+              Poner contraseña temporal
+            </Button>
+          )}
+          {can.remove && (
+            <Button size="sm" variant="ghost" icon={<Trash2 className="h-4 w-4" />} onClick={onDelete} className="text-red-600 hover:bg-red-50">
+              Borrar cuenta
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TempPasswordModal({ u, onClose }: { u: AdminUser; onClose: () => void }) {
+  const toast = useToast();
+  const [password, setPassword] = useState(() => temporaryPassword());
+  const save = useMutation({
+    mutationFn: () => api.post(`/api/admin/users/${u.id}/password`, { password }),
+    onSuccess: () => {
+      toast.success(`Contraseña temporal guardada para ${u.email}. Sus sesiones abiertas se cerraron.`);
+      onClose();
+    },
+    onError: (e) => toast.error(errorMessage(e)),
+  });
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Poner contraseña temporal"
+      size="sm"
+      footer={
+        <Button onClick={() => save.mutate()} loading={save.isPending} disabled={password.length < 8}>
+          Guardar contraseña
+        </Button>
+      }
+    >
+      <div className="space-y-4 text-sm text-slate-600">
+        <p>
+          Para <b>{u.email}</b>
+          {u.workspace_names ? ` (espacios: ${u.workspace_names})` : ''}. Comprueba antes que quien lo pide es el dueño de ese correo.
+        </p>
+        <Field label="Contraseña temporal" hint="Mínimo 8 caracteres. Compártela por un medio seguro y pide que la cambie al entrar.">
+          <div className="flex gap-2">
+            <Input value={password} onChange={(e) => setPassword(e.target.value)} className="font-mono" autoComplete="off" />
+            <Button variant="outline" onClick={() => setPassword(temporaryPassword())}>
+              Generar
+            </Button>
+          </div>
+        </Field>
+        <Alert tone="info">Se cerrarán todas las sesiones abiertas de esa cuenta.</Alert>
+      </div>
+    </Modal>
+  );
 }
 
 const CATS = ['marketing', 'utility', 'authentication', 'service'];
@@ -153,6 +258,8 @@ export default function AdminPage() {
   const qc = useQueryClient();
   const [tab, setTab] = useState<'workspaces' | 'rates' | 'users'>('workspaces');
   const [topup, setTopup] = useState<AdminWorkspace | null>(null);
+  const [passwordFor, setPasswordFor] = useState<AdminUser | null>(null);
+  const confirm = useConfirm();
   const overview = useQuery({
     queryKey: ['admin', 'overview'],
     queryFn: () =>
@@ -196,6 +303,23 @@ export default function AdminPage() {
     } catch (e) {
       toast.error(errorMessage(e));
     }
+  }
+
+  async function deleteUser(u: AdminUser) {
+    const ok = await confirm(`Se borrará la cuenta ${u.email}. No pertenece a ningún espacio de trabajo. Esta acción no se puede deshacer.`, {
+      title: 'Borrar cuenta',
+      confirmText: 'Borrar cuenta',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.delete(`/api/admin/users/${u.id}`);
+      toast.success('Cuenta borrada');
+    } catch (e) {
+      // USER_HAS_WORKSPACES: it joined a workspace since the list loaded.
+      toast.error(errorMessage(e));
+    }
+    void qc.invalidateQueries({ queryKey: ['admin'] });
   }
 
   const o = overview.data;
@@ -295,21 +419,21 @@ export default function AdminPage() {
             <Card padded={false}>
               <div className="divide-y divide-slate-100">
                 {(users.data ?? []).map((u) => (
-                  <div key={u.id} className="flex flex-wrap items-center gap-4 px-5 py-3">
-                    <div className="min-w-0 flex-1">
-                      <p className="font-medium text-slate-900">{u.name}</p>
-                      <p className="text-xs text-slate-500">
-                        {u.email} · {u.workspaces} espacio(s) · desde {dateTime(u.created_at).split(',')[0]}
-                      </p>
-                    </div>
-                    <Toggle checked={u.is_superadmin} onChange={() => toggleSuper(u)} label="Administrador de la instancia" disabled={u.id === user.id} />
-                  </div>
+                  <AdminUserRow
+                    key={u.id}
+                    u={u}
+                    meId={user.id}
+                    onToggleSuper={() => void toggleSuper(u)}
+                    onPassword={() => setPasswordFor(u)}
+                    onDelete={() => void deleteUser(u)}
+                  />
                 ))}
               </div>
             </Card>
           ))}
       </div>
       {topup && <TopupModal ws={topup} onClose={() => setTopup(null)} />}
+      {passwordFor && <TempPasswordModal u={passwordFor} onClose={() => setPasswordFor(null)} />}
     </Page>
   );
 }

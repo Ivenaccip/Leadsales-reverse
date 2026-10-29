@@ -124,9 +124,10 @@ describe('invitations (contract 7)', () => {
   });
 
   it('the invitation page asks for the right step', () => {
-    const inv = { email: 'Ana@X.com', account_exists: true };
-    expect(invitationStep(inv, null)).toBe('login');
-    expect(invitationStep({ ...inv, account_exists: false }, null)).toBe('register');
+    const inv = { email: 'Ana@X.com' };
+    // The preview no longer says whether the account exists: register (with a login link) first.
+    expect(invitationStep(inv, null)).toBe('register');
+    expect(invitationStep(inv, null, true)).toBe('login');
     expect(invitationStep(inv, { email: 'ana@x.com' })).toBe('accept');
     expect(invitationStep(inv, { email: 'otro@x.com' })).toBe('switch_account');
   });

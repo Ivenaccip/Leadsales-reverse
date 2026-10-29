@@ -1,8 +1,9 @@
 import { useMemo, useRef, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { Link } from 'react-router-dom';
 import { FileText, Plus, RefreshCw, Trash2, X } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
-import { useChannels, useTemplates } from '../lib/queries';
+import { useChannels, useTemplates, viewedChannel } from '../lib/queries';
 import { useRealtime } from '../lib/realtime';
 import { useSession } from '../lib/session';
 import { CATEGORY_LABEL, dateTime } from '../lib/format';
@@ -106,9 +107,14 @@ export default function TemplatesPage() {
   const qc = useQueryClient();
   const toast = useToast();
   const confirm = useConfirm();
-  const channels = useChannels().data ?? [];
+  const channelsQ = useChannels();
+  const channels = channelsQ.data ?? [];
   const [channelId, setChannelId] = useState('');
-  const effective = channelId || (channels.find((c) => c.is_default) ?? channels[0])?.id || '';
+  const effective = channelId || viewedChannel(channels)?.id || '';
+  // Meta calls (sync, create, delete) go only through enabled numbers; viewing works on any.
+  const shown = channels.find((c) => c.id === effective);
+  const shownDisabled = shown?.status === 'disabled';
+  const disabledHint = 'Número deshabilitado: reactívalo en Ajustes → Canales';
   const templatesQ = useTemplates(effective || undefined);
   const [viewing, setViewing] = useState<Template | null>(null);
   const [creating, setCreating] = useState(false);
@@ -143,6 +149,7 @@ export default function TemplatesPage() {
   }
 
   const templates = templatesQ.data ?? [];
+  const viewingDisabled = !!viewing && channels.find((c) => c.id === viewing.channel_id)?.status === 'disabled';
 
   return (
     <Page>
@@ -157,16 +164,24 @@ export default function TemplatesPage() {
                   {channels.map((c) => (
                     <option key={c.id} value={c.id}>
                       {c.name} {c.display_phone ? `(${c.display_phone})` : ''}
+                      {c.status === 'disabled' ? ' · deshabilitado' : ''}
                     </option>
                   ))}
                 </Select>
               )}
               {isAdmin && (
                 <>
-                  <Button variant="outline" icon={<RefreshCw className="h-4 w-4" />} onClick={() => sync.mutate()} loading={sync.isPending}>
+                  <Button
+                    variant="outline"
+                    icon={<RefreshCw className="h-4 w-4" />}
+                    onClick={() => sync.mutate()}
+                    loading={sync.isPending}
+                    disabled={shownDisabled}
+                    title={shownDisabled ? disabledHint : undefined}
+                  >
                     Sincronizar con Meta
                   </Button>
-                  <Button icon={<Plus className="h-4 w-4" />} onClick={() => setCreating(true)}>
+                  <Button icon={<Plus className="h-4 w-4" />} onClick={() => setCreating(true)} disabled={shownDisabled} title={shownDisabled ? disabledHint : undefined}>
                     Nueva plantilla
                   </Button>
                 </>
@@ -183,7 +198,23 @@ export default function TemplatesPage() {
         </Alert>
       </div>
 
-      {!effective ? (
+      {shown && shownDisabled && (
+        <div className="mb-4">
+          <Alert tone="warning" title={`El número ${shown.name} está deshabilitado`}>
+            {shown.last_error && <p>{shown.last_error}</p>}
+            <p>
+              Puedes ver sus plantillas, pero para sincronizarlas, crear o eliminar alguna hay que reactivarlo.{' '}
+              <Link to="/ajustes/canales" className="underline">
+                Ir a canales
+              </Link>
+            </p>
+          </Alert>
+        </div>
+      )}
+
+      {channelsQ.isLoading ? (
+        <PageLoader />
+      ) : !effective ? (
         <Card>
           <EmptyState icon={<FileText className="h-6 w-6" />} title="Conecta un número de WhatsApp" description="Las plantillas pertenecen a tu cuenta de WhatsApp Business. Conecta un canal en Ajustes → Canales." />
         </Card>
@@ -194,8 +225,8 @@ export default function TemplatesPage() {
           <EmptyState
             icon={<FileText className="h-6 w-6" />}
             title="No hay plantillas en este canal"
-            description="Sincroniza las que ya tienes en Meta o crea una nueva."
-            action={isAdmin && <Button onClick={() => sync.mutate()}>Sincronizar</Button>}
+            description={shownDisabled ? 'Reactiva el número para sincronizar sus plantillas de Meta.' : 'Sincroniza las que ya tienes en Meta o crea una nueva.'}
+            action={isAdmin && !shownDisabled && <Button onClick={() => sync.mutate()}>Sincronizar</Button>}
           />
         </Card>
       ) : (
@@ -227,7 +258,13 @@ export default function TemplatesPage() {
           title={<span className="font-mono">{viewing.name}</span>}
           footer={
             isAdmin && (
-              <Button variant="danger" icon={<Trash2 className="h-4 w-4" />} onClick={() => remove(viewing)}>
+              <Button
+                variant="danger"
+                icon={<Trash2 className="h-4 w-4" />}
+                onClick={() => remove(viewing)}
+                disabled={viewingDisabled}
+                title={viewingDisabled ? disabledHint : undefined}
+              >
                 Eliminar
               </Button>
             )
@@ -247,7 +284,7 @@ export default function TemplatesPage() {
         </Modal>
       )}
 
-      {creating && effective && <CreateTemplateModal channelId={effective} onClose={() => setCreating(false)} />}
+      {creating && effective && !shownDisabled && <CreateTemplateModal channelId={effective} onClose={() => setCreating(false)} />}
     </Page>
   );
 }

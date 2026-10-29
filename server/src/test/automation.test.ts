@@ -211,17 +211,19 @@ describe('automation fixes', () => {
     await env.api('PUT', '/api/workspace/settings', { away: { enabled: false, text: 'x', hours: {} } });
   });
 
-  it('sends no automated message to a contact who opted out', async () => {
+  it('does not answer the opt-out itself, but still answers what the contact writes later (opting out only stops broadcasts)', async () => {
     await menuMode();
     const id = await say('5215500006003', 'BAJA');
     expect((await env.api('GET', `/api/contacts/${id}`)).body.contact.opted_out).toBe(true);
-    await say('5215500006003', 'hola');
     expect(await outs(id)).toHaveLength(0);
+    await say('5215500006003', 'hola');
+    expect((await outs(id)).map((m: any) => m.body.split('\n')[0])).toEqual(['¡Hola! ¿Qué necesitas?']);
 
     await env.api('PUT', '/api/workspace/settings', { automation_mode: 'off', welcome: { enabled: true, text: '¡Bienvenido!' }, away: { enabled: true, text: 'Cerrado', hours: {} } });
     const fresh = await say('5215500006004', 'STOP');
-    await say('5215500006004', 'hola');
     expect(await outs(fresh)).toHaveLength(0);
+    await say('5215500006004', 'hola');
+    expect((await outs(fresh)).map((m: any) => m.body)).toEqual(['Cerrado']);
     await env.api('PUT', '/api/workspace/settings', { welcome: { enabled: false, text: '' }, away: { enabled: false, text: 'x', hours: {} } });
   });
 

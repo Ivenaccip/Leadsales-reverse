@@ -1,10 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
-import { badRequest } from '../lib/errors.js';
+import { hashPassword } from '../lib/auth.js';
+import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { topup } from '../services/credits.js';
-import { disableUnverifiedCloudChannels } from './channels.js';
-import { parse, requireSuperadmin, uuid } from './helpers.js';
+import { newPasswordSchema } from './auth.js';
+import { disableUnverifiedCloudChannels, enableAfterPrepaid } from './channels.js';
+import { noContent, parse, requireSuperadmin, uuid } from './helpers.js';
 
 const MARKETS = ['MX', 'CO', 'BR', 'AR', 'CL', 'PE', 'ES', 'NA', 'LATAM', 'OTHER'];
 
@@ -49,6 +51,7 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
     );
     if (!rows[0]) throw badRequest('Espacio no encontrado');
     if (body.billing_mode === 'prepaid') await disableUnverifiedCloudChannels(ctx, id);
+    if (body.billing_mode === 'meta_direct') await enableAfterPrepaid(ctx, id);
     if (body.is_active === false) await ctx.realtime.evict(id);
     return { workspace: rows[0] };
   });
@@ -105,7 +108,8 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
     await requireSuperadmin(ctx, req);
     const { rows } = await ctx.db.query(
       `SELECT u.id, u.email, u.name, u.is_superadmin, u.created_at,
-         (SELECT count(*)::int FROM memberships m WHERE m.user_id = u.id) AS workspaces
+         (SELECT count(*)::int FROM memberships m WHERE m.user_id = u.id) AS workspaces,
+         (SELECT string_agg(w.name, ', ' ORDER BY w.name) FROM memberships m JOIN workspaces w ON w.id = m.workspace_id WHERE m.user_id = u.id) AS workspace_names
        FROM users u ORDER BY u.created_at`,
     );
     return { users: rows };
@@ -121,4 +125,45 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
     if (!body.is_superadmin) await ctx.realtime.evictUser(id);
     return { ok: true };
   });
+
+  // Account recovery. Emails are not verified, so whoever holds an invitation link (the inviting
+  // admin too) can create the account for that email; the real person asks the operator, who
+  // checks the account's workspaces and sets a temporary password or deletes it.
+  app.post('/api/admin/users/:id/password', async (req) => {
+    const me = await requireSuperadmin(ctx, req);
+    const { id } = parse(z.object({ id: uuid }), req.params);
+    const body = parse(z.object({ password: newPasswordSchema }), req.body);
+    const target = await accountOf(ctx, id);
+    // Without the current password, a stolen operator session must not take over operators' accounts.
+    if (id === me.id || target.is_superadmin) throw badRequest('La contraseña de un administrador de la instancia solo la cambia su dueño, desde su perfil');
+    const hash = await hashPassword(body.password);
+    await ctx.db.tx(async (q) => {
+      await q.query(`UPDATE users SET password_hash = $2, password_version = password_version + 1 WHERE id = $1`, [id, hash]);
+      await q.query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [id]);
+    });
+    await ctx.realtime.endSessions({ userId: id });
+    return { ok: true };
+  });
+
+  app.delete('/api/admin/users/:id', async (req, reply) => {
+    const me = await requireSuperadmin(ctx, req);
+    const { id } = parse(z.object({ id: uuid }), req.params);
+    const target = await accountOf(ctx, id);
+    if (id === me.id) throw badRequest('No puedes borrar tu propia cuenta');
+    if (target.is_superadmin) throw badRequest('Quítale primero el rol de administrador de la instancia');
+    // Only an account outside every workspace: nobody loses a teammate (or a last owner) by accident.
+    const { rows } = await ctx.db.query(
+      `DELETE FROM users u WHERE u.id = $1 AND NOT u.is_superadmin AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = u.id) RETURNING id`,
+      [id],
+    );
+    if (!rows[0]) throw conflict('Esta cuenta es miembro de algún espacio de trabajo: quítala de sus espacios antes de borrarla', 'USER_HAS_WORKSPACES');
+    await ctx.realtime.endSessions({ userId: id });
+    return noContent(reply);
+  });
+}
+
+async function accountOf(ctx: AppContext, id: string) {
+  const { rows } = await ctx.db.query<{ is_superadmin: boolean }>(`SELECT is_superadmin FROM users WHERE id = $1`, [id]);
+  if (!rows[0]) throw notFound('Usuario');
+  return rows[0];
 }

@@ -170,6 +170,8 @@ describe('WhatsApp Cloud API channel', () => {
       to: '5215598765432',
       type: 'text',
       text: { body: 'Claro, te comparto https://tienda.mx', preview_url: true },
+      // Meta echoes it in the statuses: they settle the send even when its answer is lost
+      biz_opaque_callback_data: r.body.message.id,
     });
   });
 

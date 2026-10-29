@@ -1,9 +1,12 @@
 import crypto from 'node:crypto';
 import type { AppContext } from '../context.js';
+import type { Queryable } from '../db/index.js';
+import { AppError } from '../lib/errors.js';
 import type { BotMenu, BotMenuOption, ContactRow, MessageRow, WorkspaceRow, WorkspaceSettings } from '../types.js';
+import { optOutKeyword } from '../whatsapp/inbound.js';
 import { pickAssignee } from './assignment.js';
 import { getContact, updateContact } from './contacts.js';
-import { isWindowOpen, sendMessage } from './messages.js';
+import { isWindowOpen, sendMessage, type SendOptions } from './messages.js';
 
 export const DEFAULT_SETTINGS: Required<Pick<WorkspaceSettings, 'automation_mode' | 'welcome' | 'away' | 'bot' | 'agent_visibility'>> = {
   automation_mode: 'off',
@@ -56,9 +59,99 @@ export function isWithinBusinessHours(hours: Record<string, [string, string][]>,
   return ranges.some(([from, to]) => hhmm >= from && hhmm < to);
 }
 
+/** Senders whose message means a person of the team took the conversation (inbox or WhatsApp Business app). */
+export const HUMAN_SENDERS = ['user', 'phone'];
+
+type Content = Pick<MessageRow, 'type' | 'body' | 'payload'>;
+
+/** A customer message asking to stop (STOP, BAJA...): it gets no automatic answer. */
+export const isOptOutMessage = (m: Content) => optOutKeyword({ type: m.type, body: m.body, media: null, payload: m.payload }) !== null;
+
+/**
+ * True when the customer sent an opt-out message after message `since`: whatever was being prepared
+ * for `since` is dropped. Only that cancels: a contact who opted out before (or whom the team took
+ * off broadcasts) keeps getting answers to what they write.
+ */
+export async function optedOutSince(q: Queryable, contactId: string, since: string): Promise<boolean> {
+  const { rows } = await q.query<Content>(
+    `SELECT m.type, m.body, m.payload FROM messages m
+     WHERE m.contact_id = $1 AND m.direction = 'in' AND m.created_at > (SELECT created_at FROM messages WHERE id = $2)
+     ORDER BY m.created_at DESC LIMIT 50`,
+    [contactId, since],
+  );
+  return rows.some(isOptOutMessage);
+}
+
+/** What an automated send checks again, under the contact's lock, right before it goes out. */
+export interface TurnCheck {
+  contactId: string;
+  /** The customer message being answered: what happened after it is what changed meanwhile. */
+  since: string;
+  /** Out messages from these senders after `since` mean the customer was already answered. */
+  answeredBy: string[];
+  /** Stop if an AI reply already answered `since` or a later customer message (another run of the job). */
+  aiAnswered?: boolean;
+  /** Messages this run already sent (they never count as an answer). */
+  own?: string[];
+  /** Stop if the menu bot was finished meanwhile (a takeover marks bot_state.done). */
+  botDone?: boolean;
+  /** Stop if the AI was paused meanwhile. */
+  aiPaused?: boolean;
+}
+
+/**
+ * Precondition of an automated send (sendMessage runs it with the contact row locked, before
+ * anything is stored or charged): cancels it with SEND_SKIPPED when a person answered, the bot was
+ * stopped or the AI paused, or the customer sent an opt-out message after the one it answers.
+ */
+export function stillOurTurn(t: TurnCheck): NonNullable<SendOptions['precondition']> {
+  return async (q: Queryable) => {
+    const { rows } = await q.query<{ ai_paused: boolean; opted_out: boolean; bot_done: boolean; answered: boolean; ai_answered: boolean }>(
+      `WITH since AS (SELECT created_at FROM messages WHERE id = $2)
+       SELECT c.ai_paused, c.opted_out, COALESCE(c.bot_state->>'done' = 'true', false) AS bot_done,
+         EXISTS (SELECT 1 FROM messages m
+                 WHERE m.contact_id = c.id AND m.direction = 'out' AND m.sent_by = ANY($3::text[]) AND NOT (m.id = ANY($4::uuid[]))
+                   AND m.created_at > (SELECT created_at FROM since)) AS answered,
+         $5::boolean AND EXISTS (SELECT 1 FROM messages a
+                 WHERE a.contact_id = c.id AND a.direction = 'out' AND a.sent_by = 'ai' AND NOT (a.id = ANY($4::uuid[]))
+                   AND a.payload->>'ai_last_in' IN (SELECT i.id::text FROM messages i
+                     WHERE i.contact_id = c.id AND i.direction = 'in' AND i.created_at >= (SELECT created_at FROM since))) AS ai_answered
+       FROM contacts c WHERE c.id = $1`,
+      [t.contactId, t.since, t.answeredBy, t.own ?? [], !!t.aiAnswered],
+    );
+    const r = rows[0];
+    if (
+      !r ||
+      r.answered ||
+      r.ai_answered ||
+      (t.botDone && r.bot_done) ||
+      (t.aiPaused && r.ai_paused) ||
+      // An opt-out message always sets opted_out: without it there is nothing to look for.
+      (r.opted_out && (await optedOutSince(q, t.contactId, t.since)))
+    ) {
+      throw new AppError(409, 'SEND_SKIPPED', 'Envío omitido: la conversación cambió mientras se preparaba la respuesta');
+    }
+  };
+}
+
+export const isSendSkipped = (err: unknown) => err instanceof AppError && err.code === 'SEND_SKIPPED';
+
+/** Sends an automated message; false when the conversation changed meanwhile and it was not sent. */
+export async function sendAutomated(ctx: AppContext, o: SendOptions): Promise<boolean> {
+  try {
+    await sendMessage(ctx, o);
+    return true;
+  } catch (err) {
+    if (isSendSkipped(err)) return false;
+    throw err;
+  }
+}
+
 /**
  * Runs after every inbound customer message (job "automation.inbound"):
- * away message, welcome message, menu bot (Leadbot-style) or AI agent.
+ * away message, welcome message, menu bot (Leadbot-style) or AI agent. A contact who opted out of
+ * broadcasts still gets answers to what they write; the opt-out message itself starts no automation,
+ * and neither does a message the customer followed with one (both in one webhook, or a backlog).
  */
 export async function handleInboundAutomation(
   ctx: AppContext,
@@ -69,12 +162,20 @@ export async function handleInboundAutomation(
   if (!ws?.is_active) return;
   const settings = settingsWithDefaults(ws.settings);
   const contact = await getContact(ctx.db, p.workspaceId, p.contactId);
-  // Someone who asked to stop ('BAJA', 'STOP') gets no automated message; the team still can write.
-  if (contact.opted_out) return;
   const msgRes = await ctx.db.query<MessageRow>(`SELECT * FROM messages WHERE id = $1`, [p.messageId]);
   const message = msgRes.rows[0];
   if (!message || !isWindowOpen(contact.last_inbound_at)) return;
+  if (contact.opted_out && (await optedOutSince(ctx.db, contact.id, message.id))) return;
   const mode = settings.automation_mode ?? 'off';
+  // Notices are not sent over a person who already answered this message.
+  const notice = (text: string) =>
+    sendAutomated(ctx, {
+      workspaceId: ws.id,
+      contactId: contact.id,
+      content: { type: 'text', text },
+      sentBy: 'system',
+      precondition: stillOurTurn({ contactId: contact.id, since: message.id, answeredBy: HUMAN_SENDERS }),
+    });
 
   if (mode !== 'ai' && settings.away?.enabled && !isWithinBusinessHours(settings.away.hours, ws.timezone)) {
     // Check and mark in one statement: only one of several messages in a burst sends the notice.
@@ -83,15 +184,11 @@ export async function handleInboundAutomation(
        WHERE id = $1 AND (last_away_at IS NULL OR last_away_at < now() - interval '12 hours') RETURNING id`,
       [contact.id],
     );
-    if (claimed.rows[0]) {
-      await sendMessage(ctx, { workspaceId: ws.id, contactId: contact.id, content: { type: 'text', text: settings.away.text }, sentBy: 'system' });
-    }
+    if (claimed.rows[0]) await notice(settings.away.text);
   }
 
   if (mode === 'off') {
-    if (p.isNew && settings.welcome?.enabled && settings.welcome.text.trim()) {
-      await sendMessage(ctx, { workspaceId: ws.id, contactId: contact.id, content: { type: 'text', text: settings.welcome.text }, sentBy: 'system' });
-    }
+    if (p.isNew && settings.welcome?.enabled && settings.welcome.text.trim()) await notice(settings.welcome.text);
     return;
   }
   if (mode === 'menu') {
@@ -214,14 +311,15 @@ async function sendMenu(
   at: { indices: number[]; labels: string[] },
   interactive: boolean,
   nested: boolean,
+  precondition: SendOptions['precondition'],
   intro?: string,
-) {
+): Promise<boolean> {
   const prompt = intro ? `${intro}\n\n${menu.prompt}` : menu.prompt;
   const text = `${prompt}\n\n${menu.options.map((o) => `*${o.key}.* ${o.label}`).join('\n')}${nested ? '\n\n*0.* Menú principal' : ''}`;
-  const base = { workspaceId: ws.id, contactId: contact.id, sentBy: 'bot' as const };
+  const base = { workspaceId: ws.id, contactId: contact.id, sentBy: 'bot' as const, precondition };
   if (interactive && menu.options.length <= 3 && !nested) {
     const titles = uniqueTitles(menu.options, 20);
-    await sendMessage(ctx, {
+    return sendAutomated(ctx, {
       ...base,
       content: {
         type: 'interactive',
@@ -241,7 +339,7 @@ async function sendMenu(
       ...(o.label.length > 24 ? { description: o.label.slice(0, 72) } : {}),
     }));
     if (nested) rows.push({ id: MENU_HOME_ID, title: 'Menú principal' });
-    await sendMessage(ctx, {
+    return sendAutomated(ctx, {
       ...base,
       content: {
         type: 'interactive',
@@ -253,13 +351,26 @@ async function sendMenu(
         },
       },
     });
-  } else {
-    await sendMessage(ctx, { ...base, content: { type: 'text', text } });
   }
+  return sendAutomated(ctx, { ...base, content: { type: 'text', text } });
 }
 
-async function saveState(ctx: AppContext, contactId: string, state: { path: string[]; done?: boolean }) {
-  await ctx.db.query(`UPDATE contacts SET bot_state = $2 WHERE id = $1`, [contactId, JSON.stringify({ ...state, updated_at: new Date().toISOString() })]);
+/**
+ * Saves where the customer is in the menu, unless a person took the chat after `since` (a takeover
+ * sets bot_state.done, which only a restart by the customer may clear). False when it did: the
+ * bot stops there.
+ */
+async function saveState(ctx: AppContext, contactId: string, since: string, state: { path: string[]; done?: boolean }, restart = false): Promise<boolean> {
+  const { rows } = await ctx.db.query(
+    `UPDATE contacts SET bot_state = $2 WHERE id = $1
+       AND ($4 OR COALESCE(bot_state->>'done' = 'true', false) = false)
+       AND NOT EXISTS (SELECT 1 FROM messages m
+                       WHERE m.contact_id = $1 AND m.direction = 'out' AND m.sent_by = ANY($5::text[])
+                         AND m.created_at > (SELECT l.created_at FROM messages l WHERE l.id = $3))
+     RETURNING id`,
+    [contactId, JSON.stringify({ ...state, updated_at: new Date().toISOString() }), since, restart, HUMAN_SENDERS],
+  );
+  return rows.length > 0;
 }
 
 async function runMenuBot(ctx: AppContext, ws: WorkspaceRow, settings: ReturnType<typeof settingsWithDefaults>, contact: ContactRow, message: MessageRow) {
@@ -271,17 +382,22 @@ async function runMenuBot(ctx: AppContext, ws: WorkspaceRow, settings: ReturnTyp
   const input = (replyId ?? message.body ?? '').trim();
   const resetWord = !tap && RESET_WORDS.has(norm(input));
   const state = contact.bot_state;
+  // Every send and state write stops once a person took over after this message.
+  const guard = (ownDone = false) =>
+    stillOurTurn({ contactId: contact.id, since: message.id, answeredBy: HUMAN_SENDERS, botDone: !ownDone });
+  const save = (s: { path: string[]; done?: boolean }, restart = false) => saveState(ctx, contact.id, message.id, s, restart);
 
-  if (!state || (state.done && resetWord && norm(input) !== '0')) {
-    await saveState(ctx, contact.id, { path: [] });
-    await sendMenu(ctx, ws, contact, bot.menu, { indices: [], labels: [] }, bot.interactive, false);
+  const restart = !!state?.done && resetWord && norm(input) !== '0';
+  if (!state || restart) {
+    if (!(await save({ path: [] }, restart))) return;
+    await sendMenu(ctx, ws, contact, bot.menu, { indices: [], labels: [] }, bot.interactive, false, guard());
     return;
   }
   if (state.done) return;
 
   if (resetWord || tap?.kind === 'home') {
-    await saveState(ctx, contact.id, { path: [] });
-    await sendMenu(ctx, ws, contact, bot.menu, { indices: [], labels: [] }, bot.interactive, false);
+    if (!(await save({ path: [] }))) return;
+    await sendMenu(ctx, ws, contact, bot.menu, { indices: [], labels: [] }, bot.interactive, false, guard());
     return;
   }
 
@@ -302,7 +418,7 @@ async function runMenuBot(ctx: AppContext, ws: WorkspaceRow, settings: ReturnTyp
     if (option) at = { indices: [...current.indices, current.menu.options.indexOf(option)], labels: [...current.labels, option.label] };
   }
   if (!option) {
-    await sendMenu(ctx, ws, contact, current.menu, current, bot.interactive, current.keys.length > 0, bot.fallback);
+    await sendMenu(ctx, ws, contact, current.menu, current, bot.interactive, current.keys.length > 0, guard(), bot.fallback);
     return;
   }
 
@@ -312,19 +428,17 @@ async function runMenuBot(ctx: AppContext, ws: WorkspaceRow, settings: ReturnTyp
   if (option.assign_user_id) patch.assignedUserId = option.assign_user_id;
   if (Object.keys(patch).length) await updateContact(ctx, ws.id, contact.id, patch).catch((err) => ctx.log.warn({ err: err.message }, 'bot action failed'));
 
-  if (option.reply?.trim()) {
-    await sendMessage(ctx, { workspaceId: ws.id, contactId: contact.id, content: { type: 'text', text: option.reply }, sentBy: 'bot' });
-  }
+  const say = (text: string, ownDone = false) =>
+    sendAutomated(ctx, { workspaceId: ws.id, contactId: contact.id, content: { type: 'text', text }, sentBy: 'bot', precondition: guard(ownDone) });
+  if (option.reply?.trim() && !(await say(option.reply))) return;
   if (option.submenu?.options?.length) {
-    await saveState(ctx, contact.id, { path: [...keys, option.key] });
-    await sendMenu(ctx, ws, contact, option.submenu, at, bot.interactive, true);
+    if (!(await save({ path: [...keys, option.key] }))) return;
+    await sendMenu(ctx, ws, contact, option.submenu, at, bot.interactive, true, guard());
     return;
   }
-  await saveState(ctx, contact.id, { path: keys, done: true });
+  if (!(await save({ path: keys, done: true }))) return;
   if (option.handoff) {
-    if (bot.handoff_message?.trim() && !option.reply?.trim()) {
-      await sendMessage(ctx, { workspaceId: ws.id, contactId: contact.id, content: { type: 'text', text: bot.handoff_message }, sentBy: 'bot' });
-    }
+    if (bot.handoff_message?.trim() && !option.reply?.trim() && !(await say(bot.handoff_message, true))) return;
     await assignIfUnassigned(ctx, ws.id, contact.id);
   }
 }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   BarChart3,
   Bot,
@@ -16,7 +16,7 @@ import {
   Shield,
   Users,
 } from 'lucide-react';
-import { useSession } from '../lib/session';
+import { useSession, workspaceUsable } from '../lib/session';
 import { connectRealtime, useRealtime, useRealtimeResync } from '../lib/realtime';
 import { useCredits } from '../lib/queries';
 import { credits as fmtCredits } from '../lib/format';
@@ -36,8 +36,17 @@ const NAV = [
   { to: '/ajustes', label: 'Ajustes', icon: Settings },
 ];
 
+/**
+ * Whether to offer "Nuevo espacio": the server lets only the instance operator create workspaces
+ * when sign-up is closed (ALLOW_SIGNUP=false).
+ */
+export function canCreateWorkspace(user: { is_superadmin: boolean } | null, instance: { allowSignup: boolean } | undefined): boolean {
+  return !!user?.is_superadmin || !!instance?.allowSignup;
+}
+
 function WorkspaceMenu() {
   const { workspaces, workspace, switchWorkspace, user, logout, setSession } = useSession();
+  const instance = useQuery({ queryKey: ['instance'], queryFn: () => api.get<{ allowSignup: boolean }>('/api/instance'), staleTime: Infinity, enabled: !user?.is_superadmin });
   const [open, setOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState('');
@@ -88,26 +97,33 @@ function WorkspaceMenu() {
             {workspaces.map((w) => (
               <button
                 key={w.id}
+                disabled={!workspaceUsable(user, w)}
+                title={w.is_active === false ? 'El administrador de la instancia suspendió este espacio' : undefined}
                 onClick={() => {
                   switchWorkspace(w.id);
                   setOpen(false);
                   navigate('/bandeja');
                 }}
-                className={cx('flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-slate-100', w.id === workspace?.id && 'bg-brand-50 text-brand-800')}
+                className={cx(
+                  'flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60',
+                  w.id === workspace?.id && 'bg-brand-50 text-brand-800',
+                )}
               >
                 <span className="flex-1 truncate">{w.name}</span>
-                <span className="text-xs text-slate-400">{w.role === 'owner' ? 'Propietario' : w.role === 'admin' ? 'Admin' : 'Agente'}</span>
+                <span className="text-xs text-slate-400">{w.is_active === false ? 'Suspendido' : w.role === 'owner' ? 'Propietario' : w.role === 'admin' ? 'Admin' : 'Agente'}</span>
               </button>
             ))}
-            <button
-              onClick={() => {
-                setCreating(true);
-                setOpen(false);
-              }}
-              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-slate-100"
-            >
-              <Plus className="h-4 w-4" /> Nuevo espacio
-            </button>
+            {canCreateWorkspace(user, instance.data) && (
+              <button
+                onClick={() => {
+                  setCreating(true);
+                  setOpen(false);
+                }}
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-slate-100"
+              >
+                <Plus className="h-4 w-4" /> Nuevo espacio
+              </button>
+            )}
             <div className="my-1 border-t border-slate-100" />
             <NavLink to="/ajustes/perfil" onClick={() => setOpen(false)} className="block rounded-lg px-3 py-2 text-sm hover:bg-slate-100">
               Mi perfil

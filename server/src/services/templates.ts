@@ -1,6 +1,6 @@
 import type { AppContext } from '../context.js';
 import type { Queryable } from '../db/index.js';
-import { badRequest } from '../lib/errors.js';
+import { badRequest, notFound } from '../lib/errors.js';
 import type { ChannelRow } from '../types.js';
 import { providerFor } from '../whatsapp/provider.js';
 import type { CreateTemplateInput, TemplateParams } from '../whatsapp/types.js';
@@ -24,9 +24,18 @@ const VAR_RE = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*|\d+)\s*\}\}/g;
 
 export function variablesIn(text: string | undefined | null): string[] {
   if (!text) return [];
-  const out: string[] = [];
-  for (const m of text.matchAll(VAR_RE)) if (!out.includes(m[1])) out.push(m[1]);
-  return out;
+  // A Set keeps this linear: stored templates are parsed again on every listing and send.
+  return [...new Set(Array.from(text.matchAll(VAR_RE), (m) => m[1]))];
+}
+
+/**
+ * Variables in the order their values are given: Meta fills positional parameters by number
+ * (parameters[0] is {{1}}) wherever {{1}} sits in the text, so numbered ones go by number; named
+ * ones are matched by name and keep their order of appearance.
+ */
+export function orderedVariables(text: string | undefined | null): string[] {
+  const vars = variablesIn(text);
+  return vars.length && vars.every((v) => /^\d+$/.test(v)) ? vars.sort((a, b) => Number(a) - Number(b)) : vars;
 }
 
 export type TemplateHeaderInput =
@@ -64,11 +73,11 @@ export function templateSchema(components: any[]): TemplateInputs {
   // An authentication body is preset by Meta: its only variable is the code (as we store it after
   // creating one, before a sync brings Meta's text, it has no text at all).
   const otp = buttons.some(isOtpButton);
-  const bodyVars = variablesIn(body?.text);
+  const bodyVars = orderedVariables(body?.text);
   return {
     header: header
       ? header.format === 'TEXT' || !header.format
-        ? { type: 'text' as const, variables: variablesIn(header.text) }
+        ? { type: 'text' as const, variables: orderedVariables(header.text) }
         : { type: String(header.format).toLowerCase() as 'image' | 'video' | 'document' | 'location', variables: [] }
       : null,
     body: otp && !bodyVars.length ? ['1'] : bodyVars,
@@ -258,6 +267,10 @@ export async function upsertTemplate(
 export async function syncTemplates(ctx: AppContext, channel: ChannelRow): Promise<number> {
   const remote = await providerFor(ctx, channel).listTemplates();
   await ctx.db.tx(async (q) => {
+    // Channel first, as DELETE /api/channels locks it before cascading to its templates: an insert's
+    // foreign-key check after an upsert locked an existing template would deadlock with that delete.
+    const live = await q.query(`SELECT 1 FROM channels WHERE id = $1 FOR KEY SHARE`, [channel.id]);
+    if (!live.rows[0]) throw notFound('Canal');
     for (const t of remote) {
       await upsertTemplate(q, channel, { ...t, meta_id: t.id });
     }

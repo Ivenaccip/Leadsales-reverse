@@ -81,23 +81,55 @@ export async function assertPublicUrl(url: string, allowPrivate: boolean): Promi
 type LookupCb = (err: NodeJS.ErrnoException | null, address?: any, family?: number) => void;
 
 /**
+ * Resolver for tenant-chosen hostnames. dns.lookup runs getaddrinfo on libuv's small thread pool,
+ * shared with every other lookup in the process (Meta's API, file I/O): a tenant whose domain's
+ * nameservers never answer would hold those threads and stall every tenant's sends. c-ares
+ * resolves on the event loop, with a short timeout.
+ */
+export const webhookResolver = new dns.promises.Resolver({ timeout: 2000, tries: 1 });
+
+function lookupError(code: string, message: string): NodeJS.ErrnoException {
+  const e = new Error(message) as NodeJS.ErrnoException;
+  e.code = code;
+  return e;
+}
+
+async function resolvePublic(hostname: string, family: number): Promise<dns.LookupAddress[]> {
+  const host = hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+  if (net.isIP(host)) return [{ address: host, family: net.isIP(host) }];
+  // RFC 6761: never sent to DNS, always this machine.
+  if (host === 'localhost' || host.endsWith('.localhost')) throw lookupError('EPRIVATE', `Destino no permitido (red privada): ${hostname}`);
+  const [v4, v6] = await Promise.allSettled([
+    family === 6 ? Promise.resolve([]) : webhookResolver.resolve4(host),
+    family === 4 ? Promise.resolve([]) : webhookResolver.resolve6(host),
+  ]);
+  const list = [
+    ...(v4.status === 'fulfilled' ? v4.value.map((address) => ({ address, family: 4 })) : []),
+    ...(v6.status === 'fulfilled' ? v6.value.map((address) => ({ address, family: 6 })) : []),
+  ];
+  if (!list.length) {
+    const failed = [v4, v6].find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    throw failed?.reason ?? lookupError('ENOTFOUND', `No se encontró la dirección de ${hostname}`);
+  }
+  return list;
+}
+
+/**
  * DNS lookup used at connect time: the address that is actually dialed is the one
  * checked, so DNS rebinding between a check and the request cannot reach private hosts.
  */
 export function publicOnlyLookup(hostname: string, options: any, cb: LookupCb) {
   const opts = typeof options === 'object' && options ? options : {};
-  dns.lookup(hostname, { ...opts, all: true }, (err, addresses) => {
-    if (err) return cb(err);
-    const list = addresses as unknown as dns.LookupAddress[];
-    const bad = list.find((a) => isPrivateIp(a.address));
-    if (bad || !list.length) {
-      const e = new Error(`Destino no permitido (red privada): ${hostname}`) as NodeJS.ErrnoException;
-      e.code = 'EPRIVATE';
-      return cb(e);
-    }
-    if (opts.all) return cb(null, list);
-    cb(null, list[0].address, list[0].family);
-  });
+  resolvePublic(hostname, Number(opts.family) || 0).then(
+    (list) => {
+      if (list.some((a) => isPrivateIp(a.address))) {
+        return cb(lookupError('EPRIVATE', `Destino no permitido (red privada): ${hostname}`));
+      }
+      if (opts.all) return cb(null, list);
+      cb(null, list[0].address, list[0].family);
+    },
+    (err) => cb(err),
+  );
 }
 
 /** fetch for tenant-configured URLs (outgoing webhooks): public destinations only. */

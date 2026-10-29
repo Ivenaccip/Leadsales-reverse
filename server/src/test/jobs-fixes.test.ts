@@ -124,7 +124,7 @@ describe('worker slots and lanes', () => {
         },
         'wa.webhook': async () => void core++,
       },
-      { lanes: { default: { concurrency: 2 }, webhooks: { concurrency: 4, perWorkspace: 2 } } },
+      { lanes: { default: { concurrency: 2 }, inbound: { concurrency: 2 }, webhooks: { concurrency: 4, perWorkspace: 2 } } },
     );
     const attacker = crypto.randomUUID();
     const victim = crypto.randomUUID();

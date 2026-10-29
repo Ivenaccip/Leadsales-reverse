@@ -47,6 +47,32 @@ export function normalizePhone(input: string, defaultCountryCode = '52'): string
   return d;
 }
 
+/**
+ * Other ways the same mobile line is commonly written, for a WhatsApp id.
+ * - Brazil: older accounts have no 9th digit (55 DD 8765-4321 vs 55 DD 9 8765-4321).
+ * - Argentina: WhatsApp reports mobiles as 549 + area + number; people write 54 + area + number,
+ *   often with the local "15" mobile prefix after a 2-4 digit area code.
+ */
+export function phoneVariants(waId: string): string[] {
+  const d = digitsOnly(waId);
+  const out = new Set<string>();
+  if (d.startsWith('55')) {
+    const ddd = d.slice(2, 4);
+    const sub = d.slice(4);
+    if (sub.length === 8 && /^[6-9]/.test(sub)) out.add(`55${ddd}9${sub}`);
+    if (sub.length === 9 && /^9[6-9]/.test(sub)) out.add(`55${ddd}${sub.slice(1)}`);
+  } else if (d.startsWith('54')) {
+    const national = d.startsWith('549') && d.length === 13 ? d.slice(3) : d.length === 12 ? d.slice(2) : null;
+    if (national) {
+      out.add(`54${national}`);
+      out.add(`549${national}`);
+      for (const area of [2, 3, 4]) out.add(`54${national.slice(0, area)}15${national.slice(area)}`);
+    }
+  }
+  out.delete(d);
+  return [...out];
+}
+
 // Countries whose subscriber numbers can be 4 digits: their full international numbers have 7.
 const SHORT_NUMBER_CODES = ['683', '690', '290'];
 

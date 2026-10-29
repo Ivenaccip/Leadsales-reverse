@@ -140,7 +140,9 @@ describe('team invitations (#1, #22)', () => {
     expect(pending.filter((i: any) => i.email === 'owner@other.com')).toHaveLength(1);
 
     const info = await env.api('GET', `/api/invitations/${token(forNew.body.invite_url)}`, undefined, { cookie: '', ws: null });
-    expect(info.body).toMatchObject({ workspace_name: 'Tenant', email: 'nueva@tenant.com', role: 'agent', account_exists: false });
+    expect(info.body).toMatchObject({ workspace_name: 'Tenant', email: 'nueva@tenant.com', role: 'agent' });
+    // the preview does not reveal whether the email has an account (r3 #51)
+    expect(info.body).not.toHaveProperty('account_exists');
 
     // a new person creates the invited account (even with sign-up closed) and is signed in
     env.built.ctx.config.allowSignup = false;
@@ -163,7 +165,7 @@ describe('team invitations (#1, #22)', () => {
 
     // an existing account must be signed in with the invited email to accept
     const t2 = token(forOther.body.invite_url);
-    expect((await env.api('GET', `/api/invitations/${t2}`, undefined, { cookie: '', ws: null })).body.account_exists).toBe(true);
+    expect((await env.api('GET', `/api/invitations/${t2}`, undefined, { cookie: '', ws: null })).body).not.toHaveProperty('account_exists');
     const wrong = await env.api('POST', `/api/invitations/${t2}/accept`, undefined, { cookie: op.cookie, ws: null });
     expect(wrong.status).toBe(403);
     expect(wrong.body.error.code).toBe('INVITATION_EMAIL_MISMATCH');

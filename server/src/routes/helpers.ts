@@ -7,6 +7,8 @@ import { AppError, badRequest, forbidden, unauthorized } from '../lib/errors.js'
 import type { Role } from '../types.js';
 
 export const COOKIE = 'll_token';
+/** Signed entries of the accounts that signed in from this browser (see knownDevice). */
+export const DEVICE_COOKIE = 'll_device';
 
 export interface AuthUser {
   id: string;
@@ -45,14 +47,18 @@ export interface AuthSession {
   sid: string;
 }
 
-/** The token must point to a live (not revoked) session of an existing user. */
+/**
+ * The token must point to a live (not revoked) session of an existing user, opened with the
+ * current password: a login that verified the old password while it was being changed gets a
+ * session stamped with the old version, which never works.
+ */
 export async function requireSession(ctx: AppContext, req: FastifyRequest): Promise<AuthSession> {
   const token = tokenFrom(req);
   const payload = token ? verifyToken(ctx.config.jwtSecret, token) : null;
   if (!payload) throw unauthorized();
   const { rows } = await ctx.db.query<AuthUser & { stale: boolean }>(
     `SELECT u.id, u.email, u.name, u.is_superadmin, s.last_seen_at < now() - interval '5 minutes' AS stale
-     FROM sessions s JOIN users u ON u.id = s.user_id
+     FROM sessions s JOIN users u ON u.id = s.user_id AND u.password_version = s.password_version
      WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL`,
     [payload.sid, payload.uid],
   );

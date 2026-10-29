@@ -2,13 +2,28 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { badRequest, notFound } from '../lib/errors.js';
-import { createTemplate, syncTemplates, templateSchema, variablesIn, type TemplateRow } from '../services/templates.js';
+import { createTemplate, orderedVariables, syncTemplates, templateSchema, variablesIn, type TemplateRow } from '../services/templates.js';
 import { getChannel, providerFor } from '../whatsapp/provider.js';
 import { explainMetaError, MetaApiError } from '../whatsapp/types.js';
 import { ADMIN_ROLES, noContent, parse, requireWs, uuid } from './helpers.js';
 
 function withSchema(t: TemplateRow) {
   return { ...t, inputs: templateSchema(t.components) };
+}
+
+/**
+ * Meta answers most template mistakes with code 100 ("Invalid parameter") and the real reason in
+ * error_user_msg (the error's message) or error_data.details: both are kept so the admin can fix it.
+ */
+function metaError(err: MetaApiError, prefix = '') {
+  const d = err.details as { details?: unknown; error_subcode?: unknown } | undefined;
+  const extra = typeof d?.details === 'string' ? d.details.trim() : '';
+  const reason = extra && !err.message.includes(extra) ? `${err.message} ${extra}` : err.message;
+  return badRequest(`${prefix}${explainMetaError(err.code, reason)}`, 'META_ERROR', {
+    code: err.code,
+    subcode: typeof d?.error_subcode === 'number' ? d.error_subcode : null,
+    message: reason,
+  });
 }
 
 const createSchema = z.object({
@@ -35,7 +50,13 @@ const createSchema = z.object({
     .array(
       z.discriminatedUnion('type', [
         z.object({ type: z.literal('QUICK_REPLY'), text: z.string().trim().min(1).max(25) }),
-        z.object({ type: z.literal('URL'), text: z.string().trim().min(1).max(25), url: z.string().url(), example: z.string().url().optional() }),
+        // Meta's limit for a button URL; it also bounds the work done on it here.
+        z.object({
+          type: z.literal('URL'),
+          text: z.string().trim().min(1).max(25),
+          url: z.string().url().max(2000),
+          example: z.string().url().max(2000).optional(),
+        }),
         z.object({ type: z.literal('PHONE_NUMBER'), text: z.string().trim().min(1).max(25), phone_number: z.string().regex(/^\+?\d{8,15}$/) }),
       ]),
     )
@@ -75,14 +96,17 @@ export function buildCreateComponents(b: z.infer<typeof createSchema>) {
     }
     components.push(h);
   }
+  // One example per variable in order of appearance (as the editor lists them). Meta reads
+  // body_text by number, {{1}} first, wherever each variable sits in the text.
   const vars = variablesIn(b.body.text);
   const body: any = { type: 'BODY', text: b.body.text };
   if (vars.length) {
     const ex = b.body.examples ?? [];
     if (ex.length < vars.length) throw badRequest(`Agrega un ejemplo para cada variable del cuerpo (${vars.length})`);
+    const exampleOf = new Map(vars.map((v, i) => [v, ex[i]]));
     body.example = named
-      ? { body_text_named_params: vars.map((v, i) => ({ param_name: v, example: ex[i] })) }
-      : { body_text: [ex.slice(0, vars.length)] };
+      ? { body_text_named_params: vars.map((v) => ({ param_name: v, example: exampleOf.get(v) })) }
+      : { body_text: [orderedVariables(b.body.text).map((v) => exampleOf.get(v))] };
   }
   components.push(body);
   if (b.footer) components.push({ type: 'FOOTER', text: b.footer });
@@ -90,7 +114,7 @@ export function buildCreateComponents(b: z.infer<typeof createSchema>) {
     components.push({
       type: 'BUTTONS',
       buttons: b.buttons.map((btn) =>
-        btn.type === 'URL' && variablesIn(btn.url).length ? { ...btn, example: [btn.example ?? btn.url.replace(/\{\{.*?\}\}/g, 'ejemplo')] } : btn,
+        btn.type === 'URL' && variablesIn(btn.url).length ? { ...btn, example: [btn.example ?? btn.url.replace(/\{\{[^{}]*\}\}/g, 'ejemplo')] } : btn,
       ),
     });
   }
@@ -117,7 +141,7 @@ export async function templateRoutes(app: FastifyInstance, ctx: AppContext) {
       const count = await syncTemplates(ctx, channel);
       return { synced: count };
     } catch (err) {
-      if (err instanceof MetaApiError) throw badRequest(explainMetaError(err.code, err.message), 'META_ERROR');
+      if (err instanceof MetaApiError) throw metaError(err);
       throw err;
     }
   });
@@ -137,7 +161,7 @@ export async function templateRoutes(app: FastifyInstance, ctx: AppContext) {
       });
       return { template: withSchema(t) };
     } catch (err) {
-      if (err instanceof MetaApiError) throw badRequest(`Meta rechazó la plantilla: ${explainMetaError(err.code, err.message)}`, 'META_ERROR');
+      if (err instanceof MetaApiError) throw metaError(err, 'Meta rechazó la plantilla: ');
       throw err;
     }
   });
@@ -152,7 +176,7 @@ export async function templateRoutes(app: FastifyInstance, ctx: AppContext) {
     try {
       await providerFor(ctx, channel).deleteTemplate(t.name);
     } catch (err) {
-      if (err instanceof MetaApiError) throw badRequest(explainMetaError(err.code, err.message), 'META_ERROR');
+      if (err instanceof MetaApiError) throw metaError(err);
       throw err;
     }
     await ctx.db.query(`DELETE FROM templates WHERE channel_id = $1 AND name = $2`, [t.channel_id, t.name]);

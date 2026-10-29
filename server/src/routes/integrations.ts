@@ -8,10 +8,12 @@ import { renderPlaceholders } from '../services/broadcasts.js';
 import { CONTACT_COLUMNS, createContact, updateContact, type Contact } from '../services/contacts.js';
 import { WEBHOOK_EVENTS } from '../services/events.js';
 import { getWorkspace, sendMessage } from '../services/messages.js';
-import { listFunnels } from './crm.js';
+import { listFunnels, TAG_NAME_MAX, TAG_SEPARATORS } from './crm.js';
 import { ADMIN_ROLES, noContent, parse, requireApiKey, requireWs, uuid } from './helpers.js';
 
 const MAX_WEBHOOKS = 10;
+
+const phoneInput = z.string().min(6).max(40);
 
 const publicUrl = z
   .string()
@@ -134,9 +136,27 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
     throw badRequest(`No existe la etapa "${stage}"`);
   }
 
+  /**
+   * Tag ids by name, creating the missing ones. "VIP, Expo" means two tags, as in a CSV import:
+   * names never contain ; , or | (they would not import back whole), except an existing tag
+   * created before that rule, which keeps matching by its exact name.
+   */
   async function tagIdsByName(workspaceId: string, names: string[]): Promise<string[]> {
+    const wanted: string[] = [];
+    for (const raw of names.map((n) => n.trim()).filter(Boolean)) {
+      const existing = TAG_SEPARATORS.test(raw)
+        ? await ctx.db.query(`SELECT 1 FROM tags WHERE workspace_id = $1 AND name = $2`, [workspaceId, raw])
+        : null;
+      wanted.push(...(existing && !existing.rows[0] ? raw.split(TAG_SEPARATORS).map((n) => n.trim()).filter(Boolean) : [raw]));
+    }
     const ids: string[] = [];
-    for (const name of names.map((n) => n.trim()).filter(Boolean)) {
+    for (const name of wanted) {
+      const found = await ctx.db.query<{ id: string }>(`SELECT id FROM tags WHERE workspace_id = $1 AND name = $2`, [workspaceId, name]);
+      if (found.rows[0]) {
+        ids.push(found.rows[0].id);
+        continue;
+      }
+      if (name.length > TAG_NAME_MAX) throw badRequest(`La etiqueta "${name.slice(0, 60)}…" supera ${TAG_NAME_MAX} caracteres`);
       const t = await ctx.db.query<{ id: string }>(
         `INSERT INTO tags (workspace_id, name) VALUES ($1, $2) ON CONFLICT (workspace_id, name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
         [workspaceId, name],
@@ -153,22 +173,22 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
 
   app.get('/api/v1/contacts', async (req) => {
     const k = await requireApiKey(ctx, req);
-    const q = parse(z.object({ phone: z.string().min(6) }), req.query);
+    const q = parse(z.object({ phone: phoneInput }), req.query);
     const contact = await findByPhone(k.workspaceId, q.phone);
     if (!contact) throw notFound('Contacto');
     return { contact };
   });
 
   const upsertSchema = z.object({
-    phone: z.string().min(6),
+    phone: phoneInput,
     name: z.string().trim().max(120).optional(),
     email: z.string().trim().email().optional(),
     company: z.string().trim().max(120).optional(),
     deal_value: z.number().min(0).optional(),
     custom_fields: z.record(z.string(), z.any()).optional(),
-    tags: z.array(z.string()).optional(),
-    funnel: z.string().optional(),
-    stage: z.string().optional(),
+    tags: z.array(z.string().max(1000)).max(50).optional(),
+    funnel: z.string().max(200).optional(),
+    stage: z.string().max(200).optional(),
     source: z.string().max(40).optional(),
   });
 
@@ -206,17 +226,19 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
     const k = await requireApiKey(ctx, req);
     const body = parse(
       z.object({
-        phone: z.string().min(6),
-        name: z.string().optional(),
+        phone: phoneInput,
+        name: z.string().trim().max(120).optional(),
         text: z.string().min(1).max(4096).optional(),
+        // Values are rendered for the contact before anything else is checked: bounded like the
+        // inbox's template params (WhatsApp's own limits), so a request's work stays bounded too.
         template: z
           .object({
-            name: z.string().min(1),
-            language: z.string().min(2).default('es_MX'),
+            name: z.string().min(1).max(512),
+            language: z.string().min(2).max(20).default('es_MX'),
             // Text for a header variable, or the location a LOCATION header needs.
             header: z
               .union([
-                z.string(),
+                z.string().max(60),
                 z.object({
                   type: z.literal('location'),
                   latitude: z.number().min(-90).max(90),
@@ -226,8 +248,11 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
                 }),
               ])
               .optional(),
-            body: z.array(z.string()).optional(),
-            buttons: z.array(z.object({ index: z.number().int(), text: z.string(), sub_type: z.enum(['url', 'copy_code']).optional() })).optional(),
+            body: z.array(z.string().max(1024)).max(30).optional(),
+            buttons: z
+              .array(z.object({ index: z.number().int().min(0).max(9), text: z.string().max(200), sub_type: z.enum(['url', 'copy_code']).optional() }))
+              .max(10)
+              .optional(),
           })
           .optional(),
       }),

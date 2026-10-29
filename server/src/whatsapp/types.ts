@@ -75,8 +75,19 @@ export class MetaApiError extends Error {
   }
 }
 
-/** Human explanations (Spanish) for the Cloud API errors people hit most. */
-export function explainMetaError(code: number | null | undefined, fallback: string): string {
+// Meta throughput limits: temporary, so senders that retry by themselves try again later.
+const META_THROTTLE_CODES = new Set([4, 80007, 130429, 131056]);
+
+export function isMetaThrottle(code: number | null | undefined): boolean {
+  return code != null && META_THROTTLE_CODES.has(code);
+}
+
+/**
+ * Human explanation (Spanish) of a Cloud API error. `detail` is Meta's own text (error_user_msg,
+ * error_data.details or message): for the codes people hit most the Spanish summary comes first and
+ * Meta's text is kept after it, since a code like 100 covers many different mistakes.
+ */
+export function explainMetaError(code: number | null | undefined, detail: string): string {
   const map: Record<number, string> = {
     0: 'No se pudo autenticar con Meta. Revisa el token de acceso.',
     190: 'El token de acceso expiró o es inválido. Genera un token permanente (usuario del sistema).',
@@ -108,8 +119,12 @@ export function explainMetaError(code: number | null | undefined, fallback: stri
     132015: 'La plantilla está pausada por baja calidad.',
     132016: 'La plantilla fue deshabilitada por baja calidad.',
     133010: 'El número no está registrado en la Cloud API.',
-    130429: 'Límite de velocidad alcanzado. Se reintentará.',
+    // No promise of a retry here: only broadcasts and scheduled messages retry, and they say so.
+    130429: 'Meta limitó la velocidad de envío de este número. Espera un momento antes de volver a enviar.',
     80007: 'Límite de llamadas a la API alcanzado para esta cuenta.',
   };
-  return (code != null && map[code]) || fallback;
+  const known = code != null ? map[code] : undefined;
+  const d = (detail ?? '').trim().slice(0, 500);
+  if (!known) return d || 'Error de WhatsApp';
+  return d && d !== known ? `${known} Detalle de Meta: ${d}` : known;
 }

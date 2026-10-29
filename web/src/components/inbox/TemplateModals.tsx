@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { FileText, Search } from 'lucide-react';
 import { api, errorMessage } from '../../lib/api';
 import { CATEGORY_LABEL } from '../../lib/format';
-import { useChannels, useTemplates } from '../../lib/queries';
+import { defaultChannel, useChannels, useTemplates } from '../../lib/queries';
 import type { Contact, Template } from '../../lib/types';
 import {
   categoryColor,
@@ -27,18 +27,27 @@ export interface TemplateChoice {
 export function useContactChannelId(contact: Contact | undefined): string | undefined {
   const channels = useChannels();
   if (contact?.channel_id) return contact.channel_id;
-  const list = channels.data ?? [];
-  return (list.find((c) => c.is_default) ?? list[0])?.id;
+  return defaultChannel(channels.data)?.id;
 }
 
 /** Lists approved templates of a channel and lets the user fill in their variables. */
 export function TemplatePicker({ channelId, choice, onChange }: { channelId: string | undefined; choice: TemplateChoice; onChange: (c: TemplateChoice) => void }) {
   const templates = useTemplates(channelId);
+  const channels = useChannels();
   const [q, setQ] = useState('');
   const approved = useMemo(() => (templates.data ?? []).filter((t) => t.status === 'APPROVED'), [templates.data]);
   const filtered = approved.filter((t) => t.name.toLowerCase().includes(q.toLowerCase()));
 
-  if (!channelId) return <Alert tone="warning">Conecta un número de WhatsApp para usar plantillas.</Alert>;
+  if (!channelId) {
+    // No sending number: either none is connected or every one is disabled (e.g. after the switch to prepaid).
+    return (
+      <Alert tone="warning">
+        {channels.data?.length
+          ? 'Tus números de WhatsApp están deshabilitados. Reactiva uno en Ajustes → Canales para usar plantillas.'
+          : 'Conecta un número de WhatsApp para usar plantillas.'}
+      </Alert>
+    );
+  }
   if (templates.isLoading) {
     return (
       <div className="flex justify-center py-8">

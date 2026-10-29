@@ -6,6 +6,17 @@ import { assertSendableMedia, type MediaFile } from '../services/media.js';
 import { ADMIN_ROLES, noContent, parse, requireWs, uuid } from './helpers.js';
 
 const color = z.string().regex(/^#[0-9a-fA-F]{6}$/, 'Color inválido (usa #RRGGBB)');
+
+export const TAG_NAME_MAX = 40;
+/** Characters a CSV import splits a tags cell on: a name with one would not import back whole. */
+export const TAG_SEPARATORS = /[;,|]/;
+export const tagName = z
+  .string()
+  .trim()
+  .min(1)
+  .max(TAG_NAME_MAX)
+  .refine((n) => !TAG_SEPARATORS.test(n), 'El nombre de una etiqueta no puede llevar ; , ni |');
+
 const stageInput = z.object({ name: z.string().trim().min(1).max(60), color: color.optional(), kind: z.enum(['open', 'won', 'lost']).optional() });
 
 async function ownFunnel(ctx: AppContext, workspaceId: string, id: string) {
@@ -183,7 +194,7 @@ export async function crmRoutes(app: FastifyInstance, ctx: AppContext) {
 
   app.post('/api/tags', async (req) => {
     const a = await requireWs(ctx, req);
-    const body = parse(z.object({ name: z.string().trim().min(1).max(40), color: color.optional() }), req.body);
+    const body = parse(z.object({ name: tagName, color: color.optional() }), req.body);
     const { rows } = await ctx.db.query(
       `INSERT INTO tags (workspace_id, name, color) VALUES ($1, $2, $3)
        ON CONFLICT (workspace_id, name) DO UPDATE SET color = COALESCE($4, tags.color) RETURNING *`,
@@ -195,7 +206,7 @@ export async function crmRoutes(app: FastifyInstance, ctx: AppContext) {
   app.patch('/api/tags/:id', async (req) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
-    const body = parse(z.object({ name: z.string().trim().min(1).max(40).optional(), color: color.optional() }), req.body);
+    const body = parse(z.object({ name: tagName.optional(), color: color.optional() }), req.body);
     const { rows } = await ctx.db.query(
       `UPDATE tags SET name = COALESCE($3, name), color = COALESCE($4, color) WHERE id = $1 AND workspace_id = $2 RETURNING *`,
       [id, a.workspaceId, body.name ?? null, body.color ?? null],
