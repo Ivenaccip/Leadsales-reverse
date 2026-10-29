@@ -1,37 +1,102 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
-import { api, getWorkspaceId, setUnauthorizedHandler, setWorkspaceId } from './api';
-import type { Role, User, WorkspaceSummary } from './types';
+import { useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { api, ApiError, getWorkspaceId, getWorkspaceOpener, setUnauthorizedHandler, setWorkspaceId } from './api';
+import { disconnectRealtime, setRealtimeSessionHandlers } from './realtime';
+import type { Role, User, Workspace, WorkspaceSummary } from './types';
 
 interface SessionValue {
   loading: boolean;
   user: User | null;
   workspaces: WorkspaceSummary[];
+  /** The current workspace: a membership, or (instance operator only) any workspace opened from Administración. */
   workspace: WorkspaceSummary | null;
   role: Role | null;
   isAdmin: boolean;
   setSession: (s: { user: User; workspaces: WorkspaceSummary[] }) => void;
-  switchWorkspace: (id: string) => void;
+  switchWorkspace: (id: string, summary?: WorkspaceSummary) => void;
   refresh: () => Promise<void>;
   logout: () => Promise<void>;
 }
 
 const SessionContext = createContext<SessionValue | null>(null);
 
+/**
+ * Cached queries and the realtime socket belong to the user who was signed in when they were
+ * created (the server authenticates a socket only at its handshake). Both are dropped when that
+ * user signs out or another one signs in, so nothing of the previous user leaks into the tab.
+ */
+export function createClientSession(qc: QueryClient) {
+  let owner: string | null = null;
+  const reset = () => {
+    disconnectRealtime();
+    qc.clear();
+  };
+  return {
+    begin(userId: string) {
+      if (owner === userId) return;
+      if (owner) reset();
+      owner = userId;
+    },
+    end() {
+      owner = null;
+      reset();
+    },
+  };
+}
+
+/**
+ * Which workspace to use after loading the session. `stored`/`opener` come from the browser, which
+ * may be shared: a workspace without a membership is kept only for the operator who opened it, never
+ * inherited from whoever used the tab before.
+ */
+export function pickWorkspace(
+  user: User,
+  workspaces: WorkspaceSummary[],
+  stored: string | null,
+  opener: string | null,
+): { id: string | null; foreign: boolean } {
+  const own = workspaces.find((w) => w.id === stored);
+  if (own) return { id: own.id, foreign: false };
+  // The instance operator may work inside any workspace (Administración → Abrir) without a membership.
+  if (stored && user.is_superadmin && opener === user.id) return { id: stored, foreign: true };
+  return { id: workspaces[0]?.id ?? null, foreign: false };
+}
+
+/** The operator to remember as opener when `id` is stored: only a superadmin without a membership there. */
+export function workspaceOpener(user: User | null, workspaces: WorkspaceSummary[], id: string | null): string | null {
+  return id && user?.is_superadmin && !workspaces.some((w) => w.id === id) ? user.id : null;
+}
+
+const placeholder = (id: string): WorkspaceSummary => ({ id, name: 'Espacio de trabajo', role: 'owner', billing_mode: 'meta_direct', is_active: true });
+
 export function SessionProvider({ children }: { children: ReactNode }) {
   const qc = useQueryClient();
+  const [client] = useState(() => createClientSession(qc));
   const [loading, setLoading] = useState(true);
   const [user, setUser] = useState<User | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [wsId, setWsId] = useState<string | null>(getWorkspaceId());
+  const [foreign, setForeign] = useState<WorkspaceSummary | null>(null);
 
-  const apply = useCallback((s: { user: User; workspaces: WorkspaceSummary[] }) => {
-    setUser(s.user);
-    setWorkspaces(s.workspaces);
-    const current = s.workspaces.find((w) => w.id === getWorkspaceId()) ?? s.workspaces[0] ?? null;
-    setWorkspaceId(current?.id ?? null);
-    setWsId(current?.id ?? null);
-  }, []);
+  const apply = useCallback(
+    (s: { user: User; workspaces: WorkspaceSummary[] }) => {
+      client.begin(s.user.id);
+      setUser(s.user);
+      setWorkspaces(s.workspaces);
+      const pick = pickWorkspace(s.user, s.workspaces, getWorkspaceId(), getWorkspaceOpener());
+      setForeign((prev) => (pick.foreign && pick.id ? (prev?.id === pick.id ? prev : placeholder(pick.id)) : null));
+      setWorkspaceId(pick.id, workspaceOpener(s.user, s.workspaces, pick.id));
+      setWsId(pick.id);
+    },
+    [client],
+  );
+
+  const signOut = useCallback(() => {
+    client.end();
+    setUser(null);
+    setWorkspaces([]);
+    setForeign(null);
+  }, [client]);
 
   const refresh = useCallback(async () => {
     try {
@@ -45,32 +110,60 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }, [apply]);
 
   useEffect(() => {
-    setUnauthorizedHandler(() => {
-      setUser(null);
-      qc.clear();
+    setUnauthorizedHandler(signOut);
+    setRealtimeSessionHandlers({
+      revoked: signOut,
+      // A refused handshake usually means the session ended: a 401 here signs out (see api.ts).
+      unauthorized: () => void api.get('/api/auth/me').catch(() => {}),
     });
     void refresh();
-  }, [refresh, qc]);
+  }, [refresh, signOut]);
+
+  // A workspace opened as operator is not in /api/auth/me: load its name and billing mode.
+  const foreignId = foreign?.id ?? null;
+  useEffect(() => {
+    if (!user?.is_superadmin || !foreignId || foreignId !== wsId || workspaces.some((w) => w.id === wsId)) return;
+    let cancelled = false;
+    api
+      .get<{ workspace: Workspace }>('/api/workspace')
+      .then(({ workspace: w }) => {
+        if (cancelled || getWorkspaceId() !== w.id) return;
+        setForeign({ id: w.id, name: w.name, role: 'owner', billing_mode: w.billing_mode, is_active: w.is_active });
+      })
+      .catch((err) => {
+        // Deleted (or otherwise unreachable) workspace: fall back to a membership.
+        if (cancelled || !(err instanceof ApiError) || err.status >= 500 || err.status === 401) return;
+        const next = workspaces[0]?.id ?? null;
+        setForeign(null);
+        setWorkspaceId(next);
+        setWsId(next);
+        qc.clear();
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user, foreignId, wsId, workspaces, qc]);
 
   const switchWorkspace = useCallback(
-    (id: string) => {
-      setWorkspaceId(id);
+    (id: string, summary?: WorkspaceSummary) => {
+      const member = workspaces.some((w) => w.id === id);
+      setForeign(member ? null : { ...(summary ?? placeholder(id)), id, role: 'owner' });
+      setWorkspaceId(id, workspaceOpener(user, workspaces, id));
       setWsId(id);
       qc.clear();
     },
-    [qc],
+    [qc, workspaces, user],
   );
 
   const logout = useCallback(async () => {
     await api.post('/api/auth/logout').catch(() => {});
-    setUser(null);
-    setWorkspaces([]);
-    qc.clear();
-  }, [qc]);
+    signOut();
+  }, [signOut]);
 
   const value = useMemo<SessionValue>(() => {
-    const workspace = workspaces.find((w) => w.id === wsId) ?? null;
-    const role = workspace?.role ?? (user?.is_superadmin && wsId ? 'owner' : null);
+    const workspace = workspaces.find((w) => w.id === wsId) ?? (user?.is_superadmin && foreign?.id === wsId ? foreign : null);
+    // Same rule as the server: the instance operator is an owner in every workspace.
+    const role = user?.is_superadmin && wsId ? 'owner' : (workspace?.role ?? null);
     return {
       loading,
       user,
@@ -86,7 +179,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       refresh,
       logout,
     };
-  }, [loading, user, workspaces, wsId, apply, switchWorkspace, refresh, logout]);
+  }, [loading, user, workspaces, wsId, foreign, apply, switchWorkspace, refresh, logout]);
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
 }

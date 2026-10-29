@@ -341,8 +341,77 @@ CREATE UNIQUE INDEX IF NOT EXISTS messages_ws_wamid ON messages (workspace_id, w
 ALTER TABLE broadcast_recipients ADD COLUMN IF NOT EXISTS claimed_at timestamptz;
 `;
 
+// Hardening after the adversarial review: revocable sessions, invitations instead of
+// admin-created accounts, billing mode recorded at charge time, 6-decimal money, and
+// job ownership/lanes for fast crash recovery and per-tenant fairness.
+const hardening = `
+CREATE TABLE IF NOT EXISTS sessions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  last_seen_at timestamptz NOT NULL DEFAULT now(),
+  revoked_at timestamptz,
+  user_agent text,
+  ip text
+);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user_id);
+
+CREATE TABLE IF NOT EXISTS invitations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  email text NOT NULL,
+  name text,
+  role text NOT NULL CHECK (role IN ('admin', 'agent')),
+  token_hash text NOT NULL UNIQUE,
+  invited_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL,
+  accepted_at timestamptz,
+  accepted_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  revoked_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS invitations_ws ON invitations (workspace_id);
+
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS charged_prepaid boolean NOT NULL DEFAULT false;
+-- Before 004 the wallet followed the workspace's current mode: keep that for messages that can
+-- still be settled (refund on failure, reconciliation), so upgrading does not strand their charges.
+UPDATE messages m SET charged_prepaid = true FROM workspaces w
+  WHERE w.id = m.workspace_id AND w.billing_mode = 'prepaid' AND m.direction = 'out' AND NOT m.charged_prepaid
+    AND (m.status NOT IN ('delivered', 'read', 'failed') OR NOT m.pricing_reconciled);
+CREATE INDEX IF NOT EXISTS contacts_ws_wa_id ON contacts (workspace_id, wa_id) WHERE wa_id IS NOT NULL;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS followups_done boolean NOT NULL DEFAULT true;
+ALTER TABLE workspaces ALTER COLUMN credit_balance TYPE numeric(16,6);
+ALTER TABLE credit_ledger ALTER COLUMN amount TYPE numeric(16,6);
+ALTER TABLE credit_ledger ALTER COLUMN balance_after TYPE numeric(16,6);
+ALTER TABLE messages ALTER COLUMN cost TYPE numeric(16,6);
+ALTER TABLE broadcasts ALTER COLUMN estimated_cost TYPE numeric(16,6);
+ALTER TABLE rate_card ALTER COLUMN price TYPE numeric(12,6);
+
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS operator_verified boolean NOT NULL DEFAULT false;
+-- Since 850282e only the operator could connect numbers in prepaid workspaces: keep them working.
+UPDATE channels SET operator_verified = true
+  WHERE provider = 'cloud_api' AND NOT operator_verified
+    AND workspace_id IN (SELECT id FROM workspaces WHERE billing_mode = 'prepaid');
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS locked_by text;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS workspace_id uuid;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lane text NOT NULL DEFAULT 'default';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS serial_key text;
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_serial_running ON jobs (serial_key) WHERE serial_key IS NOT NULL AND status = 'running';
+CREATE INDEX IF NOT EXISTS jobs_lane_ready ON jobs (lane, status, run_at);
+CREATE INDEX IF NOT EXISTS jobs_lane_ws_queued ON jobs (lane, workspace_id, run_at) WHERE status = 'queued';
+UPDATE jobs SET lane = 'webhooks',
+  workspace_id = (SELECT e.workspace_id FROM webhook_endpoints e WHERE e.id::text = jobs.payload->>'endpointId')
+WHERE type = 'webhook.deliver' AND status IN ('queued', 'running');
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+  id text PRIMARY KEY,
+  seen_at timestamptz NOT NULL DEFAULT now()
+);
+`;
+
 export const migrations: { name: string; sql: string }[] = [
   { name: '001_init', sql: init },
   { name: '002_rate_card_seed', sql: seedRates },
   { name: '003_wamid_per_workspace', sql: wamidPerWorkspace },
+  { name: '004_hardening', sql: hardening },
 ];

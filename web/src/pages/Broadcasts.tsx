@@ -15,6 +15,7 @@ import {
   emptyTemplateValue,
   fromBroadcastParams,
   isTemplateValueComplete,
+  templateUnsupportedReason,
   toBroadcastParams,
   type TemplateFormValue,
 } from '../components/TemplateForm';
@@ -54,6 +55,8 @@ const RECIPIENT_STATUS: Record<string, { label: string; color: 'gray' | 'blue' |
   failed: { label: 'Fallido', color: 'red' },
   skipped: { label: 'Omitido', color: 'yellow' },
   pending: { label: 'Enviando', color: 'gray' },
+  sending: { label: 'Enviando', color: 'gray' },
+  unknown: { label: 'Sin confirmar', color: 'yellow' },
 };
 
 function pct(part: number, whole: number) {
@@ -405,6 +408,7 @@ function BroadcastWizard() {
                     {approved.map((t) => (
                       <option key={t.id} value={`${t.name}|${t.language}`}>
                         {t.name} ({t.language}) · {CATEGORY_LABEL[t.category] ?? t.category}
+                        {templateUnsupportedReason(t) ? ' · no compatible' : ''}
                       </option>
                     ))}
                   </Select>
@@ -621,6 +625,22 @@ interface Recipient {
   cost: number | null;
 }
 
+const SETTLED = new Set(['sent', 'delivered', 'read']);
+
+/**
+ * The "Detalle" column. A recipient back in the queue after a Meta rate limit keeps the reason
+ * (it is retried, not failed), and an unconfirmed send may still arrive: both are warnings.
+ */
+export function recipientDetail(r: Pick<Recipient, 'status' | 'error' | 'message_status' | 'message_error'>): { text: string; tone: 'error' | 'warning' } | null {
+  // The recipient row keeps the "unconfirmed" reason after Meta confirms the message: it no longer applies.
+  if (r.message_status && SETTLED.has(r.message_status) && !r.message_error?.message) return null;
+  const text = r.message_error?.message ?? r.error ?? '';
+  if (!text) return null;
+  if (r.status === 'queued') return { text: `En espera: ${text}`, tone: 'warning' };
+  if (r.message_status === 'unknown') return { text, tone: 'warning' };
+  return { text, tone: 'error' };
+}
+
 function BroadcastDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -822,6 +842,7 @@ function BroadcastDetail() {
                 <option value="delivered">Entregados</option>
                 <option value="read">Leídos</option>
                 <option value="failed">Fallidos</option>
+                <option value="unknown">Sin confirmar</option>
                 <option value="skipped">Omitidos</option>
               </Select>
             }
@@ -848,6 +869,7 @@ function BroadcastDetail() {
                     {recipients.map((r) => {
                       const st = r.status === 'sent' && r.message_status ? r.message_status : r.status;
                       const meta = RECIPIENT_STATUS[st] ?? { label: st, color: 'gray' as const };
+                      const detail = recipientDetail(r);
                       return (
                         <tr key={r.id} className="cursor-pointer hover:bg-slate-50" onClick={() => navigate(`/bandeja/${r.contact_id}`)}>
                           <td className="px-4 py-2">
@@ -857,7 +879,7 @@ function BroadcastDetail() {
                           <td className="px-4 py-2">
                             <Badge color={meta.color}>{meta.label}</Badge>
                           </td>
-                          <td className="max-w-72 px-4 py-2 text-xs text-red-600">{r.message_error?.message ?? r.error ?? ''}</td>
+                          <td className={cx('max-w-72 px-4 py-2 text-xs', detail?.tone === 'warning' ? 'text-amber-700' : 'text-red-600')}>{detail?.text ?? ''}</td>
                           <td className="px-4 py-2 text-right text-xs text-slate-600">{r.cost ? `$${Number(r.cost).toFixed(4)}` : '—'}</td>
                           <td className="px-4 py-2 text-xs text-slate-500">{r.processed_at ? dateTime(r.processed_at) : '—'}</td>
                         </tr>

@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { countryFromPhone, marketFromPhone, normalizePhone } from '../lib/phone.js';
+import { countryFromPhone, isValidPhone, marketFromPhone, normalizePhone } from '../lib/phone.js';
 import { decrypt, encrypt } from '../lib/crypto.js';
 import { renderPlaceholders, resolveParams, audienceWhere } from '../services/broadcasts.js';
 import { fitTitle, isWithinBusinessHours, matchOption, resolveMenu } from '../services/automation.js';
 import { buildTemplateComponents, renderTemplateText, templateSchema, variablesIn } from '../services/templates.js';
 import { buildCreateComponents } from '../routes/templates.js';
 import { normalizeCategory } from '../services/credits.js';
-import { parseInboundContent } from '../whatsapp/inbound.js';
+import { optOutKeyword, parseInboundContent } from '../whatsapp/inbound.js';
 import crypto from 'node:crypto';
 
 const contact = { name: 'Ana López', phone: '5215512345678', email: null, company: 'Tacos SA', custom_fields: { ciudad: 'CDMX' } } as any;
@@ -28,6 +28,29 @@ describe('phone', () => {
     expect(marketFromPhone('59399123456')).toBe('LATAM');
     expect(marketFromPhone('34612345678')).toBe('ES');
     expect(marketFromPhone('4915112345678')).toBe('OTHER');
+  });
+  it('prices +1 numbers outside the US and Canada as their own market (#50)', () => {
+    expect(countryFromPhone('18765551234')).toBe('JM');
+    expect(marketFromPhone('18765551234')).toBe('LATAM');
+    expect(marketFromPhone('16585551234')).toBe('LATAM');
+    for (const n of ['12425551234', '12465551234', '18685551234', '13455551234', '14415551234', '17585551234', '13405551234', '16715551234']) {
+      expect(marketFromPhone(n)).toBe('OTHER');
+    }
+    expect(marketFromPhone('17875551234')).toBe('LATAM');
+    expect(marketFromPhone('12125551234')).toBe('NA');
+    expect(countryFromPhone('14165551234')).toBe('CA');
+    expect(countryFromPhone('16835551234')).toBe('CA');
+    expect(marketFromPhone('16835551234')).toBe('NA');
+  });
+  it('keeps wa_ids international and accepts short real numbers (#2, #10)', () => {
+    expect(normalizePhone('+6591234567')).toBe('6591234567');
+    expect(normalizePhone('+4791234567', '47')).toBe('4791234567');
+    expect(normalizePhone('+5215512345678')).toBe('525512345678');
+    expect(isValidPhone('6834567')).toBe(true); // Niue
+    expect(isValidPhone('6904567')).toBe(true); // Tokelau
+    expect(isValidPhone('5512345')).toBe(false);
+    expect(isValidPhone('12345')).toBe(false);
+    expect(isValidPhone('525512345678')).toBe(true);
   });
 });
 
@@ -140,6 +163,17 @@ describe('inbound parsing', () => {
     const btn = parseInboundContent({ type: 'interactive', interactive: { type: 'button_reply', button_reply: { id: '2', title: 'Soporte' } } });
     expect(btn.payload?.reply_id).toBe('2');
     expect(parseInboundContent({ type: 'weird' }).type).toBe('unsupported');
+  });
+  it('detects opt-out keywords in typed text, template buttons and interactive replies (#46, #62)', () => {
+    expect(optOutKeyword(parseInboundContent({ type: 'text', text: { body: ' BAJA ' } }))).toBe('baja');
+    expect(optOutKeyword(parseInboundContent({ type: 'button', button: { text: 'Baja', payload: 'Baja' } }))).toBe('baja');
+    expect(optOutKeyword(parseInboundContent({ type: 'button', button: { text: 'No gracias', payload: 'STOP' } }))).toBe('stop');
+    expect(optOutKeyword(parseInboundContent({ type: 'interactive', interactive: { type: 'list_reply', list_reply: { id: 'x', title: 'Unsubscribe' } } }))).toBe('unsubscribe');
+    expect(optOutKeyword(parseInboundContent({ type: 'text', text: { body: 'quiero darme de baja mañana' } }))).toBeNull();
+    expect(optOutKeyword(parseInboundContent({ type: 'image', image: { id: '1', caption: 'stop' } }))).toBeNull();
+    // Options of the bot's own menu are choices, even one labelled "Baja"
+    expect(optOutKeyword(parseInboundContent({ type: 'interactive', interactive: { type: 'button_reply', button_reply: { id: 'menu:1', title: 'Baja' } } }))).toBeNull();
+    expect(optOutKeyword(parseInboundContent({ type: 'interactive', interactive: { type: 'list_reply', list_reply: { id: 'menu:0.2', title: 'Stop' } } }))).toBeNull();
   });
   it('normalizes Meta pricing categories', () => {
     expect(normalizeCategory('marketing_lite')).toBe('marketing');

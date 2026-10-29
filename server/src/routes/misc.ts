@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { badRequest, forbidden } from '../lib/errors.js';
-import { getMedia, mediaAbsPath, saveMedia } from '../services/media.js';
+import { assertWhatsAppMedia, getMedia, mediaAbsPath, saveMedia } from '../services/media.js';
 import { overviewReport } from '../services/reports.js';
 import { ADMIN_ROLES, agentRestricted, parse, requireWs, uuid } from './helpers.js';
 
@@ -22,7 +22,14 @@ const INLINE_SAFE = new Set([
   'audio/opus',
 ]);
 
-const ALLOWED_MIME = /^(image\/(jpeg|png|webp)|video\/(mp4|3gpp)|audio\/(ogg|mpeg|mp4|aac|amr|opus)|application\/(pdf|msword|vnd\.[\w.-]+|zip)|text\/(plain|csv))$/;
+// Names some browsers give to types WhatsApp knows under its canonical name (sent to Meta as is).
+const MIME_ALIASES: Record<string, string> = {
+  'image/jpg': 'image/jpeg',
+  'audio/mp3': 'audio/mpeg',
+  'audio/x-m4a': 'audio/mp4',
+  'audio/m4a': 'audio/mp4',
+  'audio/x-aac': 'audio/aac',
+};
 
 /** Créditos, reportes y archivos. */
 export async function miscRoutes(app: FastifyInstance, ctx: AppContext) {
@@ -83,10 +90,17 @@ export async function miscRoutes(app: FastifyInstance, ctx: AppContext) {
     const a = await requireWs(ctx, req);
     const file = await req.file({ limits: { fileSize: ctx.config.maxUploadMb * 1024 * 1024 } });
     if (!file) throw badRequest('Adjunta un archivo');
-    const mime = file.mimetype.split(';')[0].trim();
-    if (!ALLOWED_MIME.test(mime)) throw badRequest(`Tipo de archivo no soportado por WhatsApp: ${mime}`);
-    const data = await file.toBuffer();
-    if (file.file.truncated) throw badRequest(`El archivo supera ${ctx.config.maxUploadMb} MB`);
+    const declared = file.mimetype.split(';')[0].trim().toLowerCase();
+    const mime = MIME_ALIASES[declared] ?? declared;
+    // Same allow-list and per-type limits as the Cloud API /media endpoint, so an accepted upload can be sent.
+    assertWhatsAppMedia(mime, 0);
+    const tooLarge = () => badRequest(`El archivo supera ${ctx.config.maxUploadMb} MB`, 'MEDIA_TOO_LARGE');
+    // @fastify/multipart throws its own (English) error once the size limit is hit.
+    const data = await file.toBuffer().catch((err) => {
+      throw (err as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE' ? tooLarge() : err;
+    });
+    if (file.file.truncated) throw tooLarge();
+    assertWhatsAppMedia(mime, data.length, data, true);
     const saved = await saveMedia(ctx, a.workspaceId, data, mime, file.filename || null);
     return { media: { id: saved.id, mime: saved.mime, size: saved.size, filename: saved.filename } };
   });

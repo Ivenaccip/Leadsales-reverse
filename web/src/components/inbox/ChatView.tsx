@@ -7,7 +7,7 @@ import { stageMap, useFunnels, useMembers } from '../../lib/queries';
 import type { Contact, Message } from '../../lib/types';
 import { Avatar, Button, IconButton, Spinner } from '../ui';
 import { Composer } from './Composer';
-import { patchConversations, upsertMessage, type MessagesData } from './helpers';
+import { LIVE_QUERY, patchConversations, upsertMessage } from './helpers';
 import { MessageBubble } from './MessageBubble';
 import { ScheduleModal, SendTemplateModal } from './TemplateModals';
 
@@ -53,7 +53,7 @@ export function ChatView({
         `/api/contacts/${contact.id}/messages?limit=${PAGE}${pageParam ? `&before=${encodeURIComponent(pageParam)}` : ''}`,
       ),
     getNextPageParam: (last) => (last.has_more && last.messages.length ? last.messages[0].created_at : undefined),
-    staleTime: 60_000,
+    ...LIVE_QUERY,
   });
 
   // Pages arrive newest-first; each page is in chronological order.

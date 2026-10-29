@@ -25,6 +25,8 @@ export interface ChannelRow {
   status: string;
   last_error: string | null;
   is_default: boolean;
+  /** Connected or re-keyed by the instance operator: the tenant does not know its app secret. */
+  operator_verified?: boolean;
   created_at: Date;
 }
 
@@ -78,6 +80,10 @@ export interface MessageRow {
   billing_category: string | null;
   cost: number;
   pricing_reconciled: boolean;
+  /** The prepaid wallet pays for this message (workspace was prepaid when it was sent): refunds/adjustments touch the balance only then. */
+  charged_prepaid?: boolean;
+  /** False while the work queued after storing/updating the message (jobs, webhooks) is not committed yet. */
+  followups_done?: boolean;
   created_at: Date;
   status_updated_at: Date | null;
 }

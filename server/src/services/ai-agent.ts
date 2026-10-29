@@ -33,6 +33,8 @@ interface AgentContext {
   contact: Contact;
   stages: { id: string; name: string }[];
   tags: { id: string; name: string }[];
+  /** Reason of the handoff, once it is saved. */
+  handedOff?: string;
 }
 
 function buildTools(c: AgentContext): Anthropic.Beta.BetaTool[] {
@@ -124,6 +126,26 @@ function volatileContext(c: AgentContext): string {
   ].join('\n');
 }
 
+/**
+ * Customer messages that arrived while an AI reply was being written were not part of it (the reply
+ * records the last one it saw): list them after that reply, so they get answered next instead of
+ * hiding behind it.
+ */
+export function inSeenOrder(history: MessageRow[]): MessageRow[] {
+  const out: MessageRow[] = [];
+  for (const m of history) {
+    const seen = m.direction === 'out' && m.sent_by === 'ai' ? (m.payload as { ai_last_in?: string } | null)?.ai_last_in : undefined;
+    const at = seen ? out.findIndex((x) => x.id === seen) : -1;
+    if (at < 0) {
+      out.push(m);
+      continue;
+    }
+    const later = out.splice(at + 1);
+    out.push(...later.filter((x) => x.direction !== 'in'), m, ...later.filter((x) => x.direction === 'in'));
+  }
+  return out;
+}
+
 function historyToMessages(history: MessageRow[]): Anthropic.Beta.BetaMessageParam[] {
   const out: Anthropic.Beta.BetaMessageParam[] = [];
   for (const m of history) {
@@ -156,7 +178,7 @@ export async function runAiReply(ctx: AppContext, p: { workspaceId: string; cont
   if (!ws || ws.settings?.automation_mode !== 'ai') return;
   const settings = { ...DEFAULT_AI_SETTINGS, ...(ws.settings.ai ?? {}) };
   let contact = await getContact(ctx.db, ws.id, p.contactId);
-  if (contact.ai_paused || !isWindowOpen(contact.last_inbound_at)) return;
+  if (contact.ai_paused || contact.opted_out || !isWindowOpen(contact.last_inbound_at)) return;
 
   const apiKey = aiApiKey(ctx, ws);
   if (!apiKey) {
@@ -168,10 +190,11 @@ export async function runAiReply(ctx: AppContext, p: { workspaceId: string; cont
     `SELECT * FROM messages WHERE contact_id = $1 ORDER BY created_at DESC LIMIT $2`,
     [contact.id, HISTORY_LIMIT],
   );
-  const history = historyDesc.reverse();
+  const history = inSeenOrder(historyDesc.reverse());
   // Only answer if the customer spoke last (avoids double replies).
   const lastVisible = [...history].reverse().find((m) => m.direction !== 'internal');
   if (!lastVisible || lastVisible.direction !== 'in') return;
+  const lastSeenId = lastVisible.id;
 
   const aiReplies = await ctx.db.query<{ n: number }>(
     `SELECT count(*)::int AS n FROM messages WHERE contact_id = $1 AND sent_by = 'ai'`,
@@ -195,7 +218,6 @@ export async function runAiReply(ctx: AppContext, p: { workspaceId: string; cont
   const model = settings.model || DEFAULT_AI_MODEL;
   const useFallback = FALLBACK_MODELS.has(model);
 
-  let handedOff: string | null = null;
   let finalText = '';
   try {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -214,7 +236,8 @@ export async function runAiReply(ctx: AppContext, p: { workspaceId: string; cont
       });
 
       if (response.stop_reason === 'refusal') {
-        handedOff = 'La IA no pudo responder este mensaje';
+        await pauseForHuman(ctx, ws.id, contact.id, 'La IA no pudo responder este mensaje');
+        agentCtx.handedOff = 'La IA no pudo responder este mensaje';
         break;
       }
       const text = response.content
@@ -232,7 +255,6 @@ export async function runAiReply(ctx: AppContext, p: { workspaceId: string; cont
       const results: Anthropic.Beta.BetaToolResultBlockParam[] = [];
       for (const tu of toolUses) {
         const r = await executeTool(ctx, ws.id, agentCtx, tu.name, tu.input as Record<string, unknown>);
-        if (tu.name === 'handoff_to_human') handedOff = String((tu.input as any)?.reason ?? 'Solicitud de la IA');
         results.push({ type: 'tool_result', tool_use_id: tu.id, content: r.message, ...(r.error ? { is_error: true } : {}) });
         contact = await getContact(ctx.db, ws.id, contact.id);
         agentCtx.contact = contact;
@@ -250,15 +272,30 @@ export async function runAiReply(ctx: AppContext, p: { workspaceId: string; cont
             : 'error de conexión con la API de Claude';
     ctx.log.warn({ err: (err as Error).message, contact: contact.id }, 'AI reply failed');
     await addNote(ctx, ws.id, contact.id, await anyOwnerId(ctx, ws.id), `🤖 La IA no respondió: ${reason}.`).catch(() => {});
+    if (agentCtx.handedOff) {
+      // The handoff is already saved (a retry would stop at ai_paused): still say goodbye to the customer.
+      await sendReply(finalText || settings.handoff_message).catch((e) => ctx.log.warn({ err: e.message }, 'AI goodbye failed'));
+      return;
+    }
     if (err instanceof Anthropic.RateLimitError || (err instanceof Anthropic.APIError && (err.status ?? 0) >= 500)) throw err;
     return;
   }
 
-  if (finalText) {
-    await sendMessage(ctx, { workspaceId: ws.id, contactId: contact.id, content: { type: 'text', text: finalText }, sentBy: 'ai' });
-  }
-  if (handedOff) {
-    await handoff(ctx, ws.id, contact.id, finalText ? null : settings.handoff_message, handedOff);
+  await sendReply(finalText || (agentCtx.handedOff ? settings.handoff_message : ''));
+
+  async function sendReply(text: string) {
+    if (!text.trim()) return;
+    await sendMessage(ctx, {
+      workspaceId: ws!.id,
+      contactId: contact.id,
+      content: { type: 'text', text },
+      sentBy: 'ai',
+      // Remember the last customer message this reply answered (see inSeenOrder).
+      onCreated: async (q, m) => {
+        m.payload = { ...(m.payload ?? {}), ai_last_in: lastSeenId };
+        await q.query(`UPDATE messages SET payload = $2 WHERE id = $1`, [m.id, JSON.stringify(m.payload)]);
+      },
+    });
   }
 }
 
@@ -274,6 +311,11 @@ async function handoff(ctx: AppContext, workspaceId: string, contactId: string, 
   if (message?.trim()) {
     await sendMessage(ctx, { workspaceId, contactId, content: { type: 'text', text: message }, sentBy: 'ai' });
   }
+  await pauseForHuman(ctx, workspaceId, contactId, reason);
+}
+
+/** Pauses the AI for this contact and hands it to a person (round robin when nobody owns it). */
+async function pauseForHuman(ctx: AppContext, workspaceId: string, contactId: string, reason: string) {
   await updateContact(ctx, workspaceId, contactId, { aiPaused: true });
   await assignIfUnassigned(ctx, workspaceId, contactId);
   await addNote(ctx, workspaceId, contactId, await anyOwnerId(ctx, workspaceId), `🤖 La IA pasó la conversación a un humano: ${reason}`);
@@ -310,8 +352,15 @@ async function executeTool(
         await updateContact(ctx, workspaceId, c.contact.id, patch);
         return { message: 'Datos del cliente guardados' };
       }
-      case 'handoff_to_human':
+      case 'handoff_to_human': {
+        // Saved as soon as the model decides it: a failure in a later round must not lose it.
+        if (!c.handedOff) {
+          const reason = (typeof input.reason === 'string' && input.reason.trim()) || 'Solicitud de la IA';
+          await pauseForHuman(ctx, workspaceId, c.contact.id, reason);
+          c.handedOff = reason;
+        }
         return { message: 'Listo: un asesor humano continuará la conversación. Despídete brevemente.' };
+      }
       default:
         return { message: `Herramienta desconocida: ${name}`, error: true };
     }

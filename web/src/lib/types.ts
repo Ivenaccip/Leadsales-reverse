@@ -86,6 +86,8 @@ export interface Channel {
   is_default: boolean;
   has_access_token: boolean;
   has_app_secret: boolean;
+  /** Credentials typed by the instance operator in prepaid mode (only such numbers work there). */
+  operator_verified: boolean;
   webhook_url: string;
   created_at: string;
 }
@@ -157,7 +159,8 @@ export interface Message {
   payload: Record<string, any> | null;
   wamid: string | null;
   reply_to_wamid: string | null;
-  status: 'pending' | 'sent' | 'delivered' | 'read' | 'failed' | 'received' | 'note';
+  /** 'unknown': sent, but Meta's answer was lost (error explains it); a status webhook may still settle it. */
+  status: 'pending' | 'unknown' | 'sent' | 'delivered' | 'read' | 'failed' | 'received' | 'note';
   error: { code?: number | null; title?: string; message?: string } | null;
   sent_by: string | null;
   user_id: string | null;
@@ -184,6 +187,8 @@ export interface TemplateInputs {
   header: { type: 'text' | 'image' | 'video' | 'document' | 'location'; variables: string[] } | null;
   body: string[];
   buttons: { index: number; type: string; text: string; variables: string[] }[];
+  /** Why the server cannot send this template (Spanish), or null. */
+  unsupported?: string | null;
 }
 
 export interface Template {
@@ -201,11 +206,22 @@ export interface Template {
   inputs: TemplateInputs;
 }
 
+export interface LocationHeaderParam {
+  type: 'location';
+  latitude: number;
+  longitude: number;
+  name?: string;
+  address?: string;
+}
+
+/** Button parameter kind; omitted means a URL suffix. */
+export type TemplateButtonSubType = 'url' | 'copy_code';
+
 export interface TemplateParams {
-  header?: { type: 'text'; text: string } | { type: 'image' | 'video' | 'document'; link: string; filename?: string };
+  header?: { type: 'text'; text: string } | { type: 'image' | 'video' | 'document'; link: string; filename?: string } | LocationHeaderParam;
   body?: string[];
   bodyNamed?: Record<string, string>;
-  buttons?: { index: number; text: string }[];
+  buttons?: { index: number; text: string; sub_type?: TemplateButtonSubType }[];
 }
 
 export interface QuickReply {
@@ -230,10 +246,10 @@ export interface Audience {
 }
 
 export interface BroadcastParams {
-  header?: { type: 'text'; value: string } | { type: 'image' | 'video' | 'document'; link: string; filename?: string };
+  header?: { type: 'text'; value: string } | { type: 'image' | 'video' | 'document'; link: string; filename?: string } | LocationHeaderParam;
   body?: string[];
   bodyNamed?: Record<string, string>;
-  buttons?: { index: number; value: string }[];
+  buttons?: { index: number; value: string; sub_type?: TemplateButtonSubType }[];
 }
 
 export interface BroadcastStats {

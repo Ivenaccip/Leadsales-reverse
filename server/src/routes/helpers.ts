@@ -39,13 +39,31 @@ function tokenFrom(req: FastifyRequest): string | null {
   return null;
 }
 
-export async function requireUser(ctx: AppContext, req: FastifyRequest): Promise<AuthUser> {
+export interface AuthSession {
+  user: AuthUser;
+  /** Id of the `sessions` row behind the cookie (logout and password changes revoke it). */
+  sid: string;
+}
+
+/** The token must point to a live (not revoked) session of an existing user. */
+export async function requireSession(ctx: AppContext, req: FastifyRequest): Promise<AuthSession> {
   const token = tokenFrom(req);
   const payload = token ? verifyToken(ctx.config.jwtSecret, token) : null;
   if (!payload) throw unauthorized();
-  const { rows } = await ctx.db.query<AuthUser>(`SELECT id, email, name, is_superadmin FROM users WHERE id = $1`, [payload.uid]);
+  const { rows } = await ctx.db.query<AuthUser & { stale: boolean }>(
+    `SELECT u.id, u.email, u.name, u.is_superadmin, s.last_seen_at < now() - interval '5 minutes' AS stale
+     FROM sessions s JOIN users u ON u.id = s.user_id
+     WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL`,
+    [payload.sid, payload.uid],
+  );
   if (!rows[0]) throw unauthorized();
-  return rows[0];
+  const { stale, ...user } = rows[0];
+  if (stale) await ctx.db.query(`UPDATE sessions SET last_seen_at = now() WHERE id = $1`, [payload.sid]);
+  return { user, sid: payload.sid };
+}
+
+export async function requireUser(ctx: AppContext, req: FastifyRequest): Promise<AuthUser> {
+  return (await requireSession(ctx, req)).user;
 }
 
 /** Authenticated user + the workspace selected with the X-Workspace-Id header. */
@@ -53,18 +71,23 @@ export async function requireWs(ctx: AppContext, req: FastifyRequest, roles?: Ro
   const user = await requireUser(ctx, req);
   const workspaceId = String(req.headers['x-workspace-id'] ?? '');
   if (!/^[0-9a-f-]{36}$/i.test(workspaceId)) throw badRequest('Falta el encabezado X-Workspace-Id', 'NO_WORKSPACE');
+  // The instance operator supports every workspace as owner: a membership row (which a tenant
+  // could demote or deactivate) must never lower that.
+  if (user.is_superadmin) {
+    if (roles && !roles.includes('owner')) throw forbidden();
+    return { user, workspaceId, role: 'owner' };
+  }
   const { rows } = await ctx.db.query<{ role: Role; is_active: boolean; ws_active: boolean }>(
     `SELECT m.role, m.is_active, w.is_active AS ws_active FROM memberships m JOIN workspaces w ON w.id = m.workspace_id
      WHERE m.workspace_id = $1 AND m.user_id = $2`,
     [workspaceId, user.id],
   );
   const m = rows[0];
-  if (!m && !user.is_superadmin) throw forbidden('No perteneces a este espacio de trabajo');
-  if (m && !m.is_active) throw forbidden('Tu usuario está desactivado en este espacio de trabajo');
-  if (m && !m.ws_active && !user.is_superadmin) throw forbidden('Este espacio de trabajo está suspendido');
-  const role: Role = m?.role ?? 'owner'; // superadmins can support any workspace
-  if (roles && !roles.includes(role)) throw forbidden();
-  return { user, workspaceId, role };
+  if (!m) throw forbidden('No perteneces a este espacio de trabajo');
+  if (!m.is_active) throw forbidden('Tu usuario está desactivado en este espacio de trabajo');
+  if (!m.ws_active) throw forbidden('Este espacio de trabajo está suspendido');
+  if (roles && !roles.includes(m.role)) throw forbidden();
+  return { user, workspaceId, role: m.role };
 }
 
 export const ADMIN_ROLES: Role[] = ['owner', 'admin'];
@@ -104,19 +127,78 @@ export function noContent(reply: FastifyReply) {
   return reply.code(204).send();
 }
 
-/** Tiny in-memory limiter for login/register brute force protection. */
+export const tooManyAttempts = () => new AppError(429, 'TOO_MANY_REQUESTS', 'Demasiados intentos. Espera unos minutos.');
+
+/**
+ * In-memory fixed-window limiter for login/register brute force protection.
+ * Keys are hashed (an attacker-chosen string never stays in memory) and the map is bounded:
+ * when full it drops expired counters first and then the ones with the fewest attempts, so
+ * flooding it with junk keys can neither exhaust memory nor reset a counter that is close to blocking.
+ */
 export class RateLimiter {
   private hits = new Map<string, { count: number; reset: number }>();
-  constructor(private max: number, private windowMs: number) {}
-  check(key: string) {
-    const now = Date.now();
+  constructor(
+    private max: number,
+    private windowMs: number,
+    private maxKeys = 10_000,
+  ) {}
+
+  get size() {
+    return this.hits.size;
+  }
+
+  private live(key: string, now: number) {
     const h = this.hits.get(key);
-    if (!h || h.reset < now) {
-      this.hits.set(key, { count: 1, reset: now + this.windowMs });
-      if (this.hits.size > 10_000) this.hits.clear();
-      return;
+    if (h && h.reset <= now) {
+      this.hits.delete(key);
+      return undefined;
     }
+    return h;
+  }
+
+  /** True when the key already used up its attempts (does not count one). */
+  blocked(raw: string): boolean {
+    const h = this.live(sha256Hex(raw), Date.now());
+    return !!h && h.count >= this.max;
+  }
+
+  /** Counts one attempt, or throws 429 when the key is over its limit. */
+  hit(raw: string) {
+    const key = sha256Hex(raw);
+    const now = Date.now();
+    let h = this.live(key, now);
+    if (!h) {
+      this.makeRoom(now);
+      h = { count: 0, reset: now + this.windowMs };
+      this.hits.set(key, h);
+    }
+    if (h.count >= this.max) throw tooManyAttempts();
     h.count++;
-    if (h.count > this.max) throw new AppError(429, 'TOO_MANY_REQUESTS', 'Demasiados intentos. Espera unos minutos.');
+  }
+
+  /** Gives back an attempt counted with hit() (e.g. the password was right). */
+  undo(raw: string) {
+    const h = this.live(sha256Hex(raw), Date.now());
+    if (h && h.count > 0) h.count--;
+  }
+
+  private makeRoom(now: number) {
+    if (this.hits.size < this.maxKeys) return;
+    // Every window has the same length, so insertion order is expiry order: expired ones come first.
+    for (const [k, h] of this.hits) {
+      if (h.reset > now) break;
+      this.hits.delete(k);
+    }
+    if (this.hits.size < this.maxKeys) return;
+    let victim: string | null = null;
+    let fewest = Infinity;
+    for (const [k, h] of this.hits) {
+      if (h.count < fewest) {
+        victim = k;
+        fewest = h.count;
+        if (fewest <= 1) break;
+      }
+    }
+    if (victim) this.hits.delete(victim);
   }
 }

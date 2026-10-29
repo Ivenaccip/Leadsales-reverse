@@ -32,7 +32,8 @@ export interface CreateTemplateInput {
 
 export interface WhatsAppProvider {
   readonly kind: 'cloud_api' | 'sandbox';
-  send(to: string, message: WaMessage, replyToWamid?: string): Promise<{ wamid: string }>;
+  /** waId: the recipient id Meta resolved (contacts[0].wa_id), which can differ from `to` (e.g. Brazil, Argentina). */
+  send(to: string, message: WaMessage, replyToWamid?: string): Promise<{ wamid: string; waId?: string | null }>;
   markRead(wamid: string, typing?: boolean): Promise<void>;
   uploadMedia(data: Buffer, mime: string, filename: string): Promise<string>;
   downloadMedia(mediaId: string): Promise<{ data: Buffer; mime: string }>;
@@ -52,10 +53,15 @@ export interface ChannelCredentials {
 export interface TemplateParams {
   header?:
     | { type: 'text'; text: string }
-    | { type: 'image' | 'video' | 'document'; link?: string; mediaId?: string; filename?: string };
+    | { type: 'image' | 'video' | 'document'; link?: string; mediaId?: string; filename?: string }
+    | { type: 'location'; latitude: number; longitude: number; name?: string; address?: string };
   body?: string[];
   bodyNamed?: Record<string, string>;
-  buttons?: { index: number; text: string }[];
+  /**
+   * Values for buttons by position. The template's stored components decide the parameter kind
+   * (URL variable, coupon code); sub_type is only needed for a template that is not synced.
+   */
+  buttons?: { index: number; text: string; sub_type?: 'url' | 'copy_code' }[];
 }
 
 export class MetaApiError extends Error {

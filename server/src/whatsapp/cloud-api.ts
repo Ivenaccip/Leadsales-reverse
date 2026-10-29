@@ -14,6 +14,46 @@ export interface CloudApiOptions {
   phoneNumberId: string;
   wabaId: string | null;
   fetch?: typeof fetch;
+  /** Largest inbound media file we download (WhatsApp documents go up to 100 MB). */
+  maxMediaBytes?: number;
+}
+
+// Explicit timeouts: a hung Graph call must end long before the job runner re-queues the job.
+const API_TIMEOUT_MS = 30_000;
+const TRANSFER_TIMEOUT_MS = 120_000; // media uploads and downloads
+
+/** Marks an error the job runner must not retry (it reads `retry`). */
+function permanent<E extends Error>(e: E): E {
+  return Object.assign(e, { retry: false });
+}
+
+/** Meta serves media from its own CDNs; anything else in a Graph answer is not followed. */
+function isMetaMediaHost(host: string): boolean {
+  const h = host.toLowerCase();
+  return h === 'lookaside.fbsbx.com' || h === 'graph.facebook.com' || h.endsWith('.fbsbx.com') || h.endsWith('.fbcdn.net') || h.endsWith('.whatsapp.net');
+}
+
+async function readCapped(res: Response, max: number): Promise<Buffer> {
+  const tooBig = () => permanent(new MetaApiError(`El archivo supera el máximo de ${Math.round(max / 1024 / 1024)} MB`, null, 413));
+  if (Number(res.headers.get('content-length') ?? 0) > max) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig();
+  }
+  if (!res.body) return Buffer.from(await res.arrayBuffer());
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => {});
+      throw tooBig();
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
 }
 
 /** Client for the official WhatsApp Business Cloud API (Meta Graph API). */
@@ -29,7 +69,7 @@ export class CloudApiProvider implements WhatsAppProvider {
     return `${this.o.baseUrl}/${this.o.version}/${path.replace(/^\//, '')}`;
   }
 
-  private async call<T>(method: string, path: string, body?: unknown, form?: FormData): Promise<T> {
+  private async call<T>(method: string, path: string, body?: unknown, form?: FormData, timeoutMs = API_TIMEOUT_MS): Promise<T> {
     const headers: Record<string, string> = { Authorization: `Bearer ${this.o.accessToken}` };
     let payload: BodyInit | undefined;
     if (form) payload = form;
@@ -37,7 +77,7 @@ export class CloudApiProvider implements WhatsAppProvider {
       headers['Content-Type'] = 'application/json';
       payload = JSON.stringify(body);
     }
-    const res = await this.f(this.url(path), { method, headers, body: payload });
+    const res = await this.f(this.url(path), { method, headers, body: payload, signal: AbortSignal.timeout(timeoutMs) });
     const text = await res.text();
     let json: any = null;
     try {
@@ -70,10 +110,16 @@ export class CloudApiProvider implements WhatsAppProvider {
       ...message,
     };
     if (replyToWamid) body.context = { message_id: replyToWamid };
-    const r = await this.call<{ messages: { id: string }[] }>('POST', `${this.o.phoneNumberId}/messages`, body);
-    const wamid = r.messages?.[0]?.id;
+    const r = await this.call<{ messages?: { id: string }[]; contacts?: { input?: string; wa_id?: string }[] }>(
+      'POST',
+      `${this.o.phoneNumberId}/messages`,
+      body,
+    );
+    const wamid = r?.messages?.[0]?.id;
     if (!wamid) throw new MetaApiError('Meta no devolvió el id del mensaje', null, 502, r);
-    return { wamid };
+    // The WhatsApp id Meta resolved can differ from the number we sent to (Brazil's 9th digit, Argentina's 9).
+    const waId = String(r.contacts?.[0]?.wa_id ?? '');
+    return { wamid, waId: /^\d{6,20}$/.test(waId) ? waId : null };
   }
 
   async markRead(wamid: string, typing = false) {
@@ -87,15 +133,53 @@ export class CloudApiProvider implements WhatsAppProvider {
     form.append('messaging_product', 'whatsapp');
     form.append('type', mime);
     form.append('file', new Blob([new Uint8Array(data)], { type: mime }), filename);
-    const r = await this.call<{ id: string }>('POST', `${this.o.phoneNumberId}/media`, undefined, form);
+    const r = await this.call<{ id: string }>('POST', `${this.o.phoneNumberId}/media`, undefined, form, TRANSFER_TIMEOUT_MS);
     return r.id;
   }
 
+  /** Only Meta's media hosts (or the configured Graph origin, e.g. a local emulator) receive our token. */
+  private mediaUrl(raw: unknown): URL | null {
+    let u: URL;
+    try {
+      u = new URL(String(raw ?? ''));
+    } catch {
+      return null;
+    }
+    if (u.username || u.password) return null;
+    if (u.origin === new URL(this.o.baseUrl).origin) return u;
+    return u.protocol === 'https:' && !u.port && isMetaMediaHost(u.hostname) ? u : null;
+  }
+
   async downloadMedia(mediaId: string) {
-    const meta = await this.call<{ url: string; mime_type: string }>('GET', mediaId);
-    const res = await this.f(meta.url, { headers: { Authorization: `Bearer ${this.o.accessToken}` } });
+    // Media ids are numeric. Anything else (e.g. "123?fields=url") would let a forged webhook
+    // choose the Graph path and query, and then make us fetch whatever URL that node returns.
+    if (!/^\d{1,32}$/.test(mediaId)) throw permanent(new MetaApiError('Id de archivo de Meta inválido', null, 400));
+    const meta = await this.call<{ url?: string; mime_type?: string }>('GET', mediaId);
+    let url = this.mediaUrl(meta?.url);
+    let res: Response;
+    // Redirects are followed by hand so every hop is checked against the allowlist.
+    for (let hop = 0; ; hop++) {
+      if (!url) throw permanent(new MetaApiError('Meta devolvió una dirección de descarga no permitida', null, 502));
+      res = await this.f(url.toString(), {
+        headers: { Authorization: `Bearer ${this.o.accessToken}` },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
+      });
+      if (res.status < 300 || res.status >= 400) break;
+      const location = res.headers.get('location');
+      await res.body?.cancel().catch(() => {});
+      if (!location || hop >= 3) throw new MetaApiError(`No se pudo descargar el archivo (HTTP ${res.status})`, null, res.status);
+      let next: string | null = null;
+      try {
+        next = new URL(location, url).toString();
+      } catch {
+        /* invalid Location: refused below */
+      }
+      url = this.mediaUrl(next);
+    }
     if (!res.ok) throw new MetaApiError(`No se pudo descargar el archivo (HTTP ${res.status})`, null, res.status);
-    return { data: Buffer.from(await res.arrayBuffer()), mime: meta.mime_type };
+    const data = await readCapped(res, this.o.maxMediaBytes ?? 100 * 1024 * 1024);
+    return { data, mime: meta?.mime_type ?? '' };
   }
 
   async getPhoneInfo() {

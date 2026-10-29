@@ -15,6 +15,7 @@ const ReportsPage = lazy(() => import('./pages/Reports'));
 const CreditsPage = lazy(() => import('./pages/Credits'));
 const SettingsPage = lazy(() => import('./pages/Settings'));
 const AdminPage = lazy(() => import('./pages/Admin'));
+const InvitationPage = lazy(() => import('./pages/Invitation'));
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const { loading, user, workspace } = useSession();
@@ -24,7 +25,7 @@ function RequireAuth({ children }: { children: ReactNode }) {
   if (!workspace && !user.is_superadmin) {
     return (
       <div className="p-10 text-center text-slate-600">
-        Tu usuario no pertenece a ningún espacio de trabajo activo. Pide a tu administrador que te agregue.
+        Tu usuario no pertenece a ningún espacio de trabajo activo. Pide a un administrador que te envíe una invitación.
       </div>
     );
   }
@@ -42,6 +43,7 @@ export function App() {
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/registro" element={<RegisterPage />} />
+        <Route path="/invitacion/:token" element={<InvitationPage />} />
         <Route
           element={
             <RequireAuth>

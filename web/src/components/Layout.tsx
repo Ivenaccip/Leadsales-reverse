@@ -17,10 +17,11 @@ import {
   Users,
 } from 'lucide-react';
 import { useSession } from '../lib/session';
-import { connectRealtime, useRealtime } from '../lib/realtime';
+import { connectRealtime, useRealtime, useRealtimeResync } from '../lib/realtime';
 import { useCredits } from '../lib/queries';
 import { credits as fmtCredits } from '../lib/format';
 import { api, errorMessage } from '../lib/api';
+import { revokeContact } from './inbox/helpers';
 import { Avatar, Button, Field, Input, Modal, cx, useToast } from './ui';
 
 const NAV = [
@@ -78,6 +79,12 @@ function WorkspaceMenu() {
           <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
           <div className="absolute bottom-full left-0 z-40 mb-2 w-64 rounded-xl border border-slate-200 bg-white p-1 text-slate-700 shadow-xl">
             <p className="px-3 pb-1 pt-2 text-xs font-medium uppercase tracking-wide text-slate-400">Espacios de trabajo</p>
+            {workspace && !workspaces.some((w) => w.id === workspace.id) && (
+              <div className="flex w-full items-center gap-2 rounded-lg bg-brand-50 px-3 py-2 text-left text-sm text-brand-800">
+                <span className="flex-1 truncate">{workspace.name}</span>
+                <span className="text-xs text-slate-400">Operador</span>
+              </div>
+            )}
             {workspaces.map((w) => (
               <button
                 key={w.id}
@@ -137,9 +144,13 @@ export function Layout() {
 
   useEffect(() => {
     connectRealtime(workspace?.id ?? null);
-  }, [workspace?.id]);
+  }, [workspace?.id, user?.id]);
 
   useRealtime('credits:update', () => void qc.invalidateQueries({ queryKey: ['credits'] }));
+  // A restricted agent lost access to a conversation (assigned to someone else): forget it everywhere.
+  useRealtime<{ id: string }>('contact:revoked', (e) => revokeContact(qc, e.id));
+  // After a reconnection, events sent while the socket was down never arrive: refetch what is shown.
+  useRealtimeResync(() => void qc.invalidateQueries());
 
   const nav = NAV.filter((n) => !n.admin || isAdmin);
 

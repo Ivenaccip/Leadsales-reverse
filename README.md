@@ -96,6 +96,11 @@ tarifas: [`docs/05-creditos-y-costos.md`](docs/05-creditos-y-costos.md).
 ## Para operadores de una comunidad
 
 - `ALLOW_SIGNUP=true` permite que cada miembro cree su espacio de trabajo.
+- Cada negocio suma a su equipo con **enlaces de invitación** (Ajustes → Equipo): sirven
+  aunque `ALLOW_SIGNUP=false` y nadie puede agregar la cuenta de otra persona ni ponerle
+  contraseña.
+- Corre **una sola réplica** del contenedor `app` (el tiempo real vive en memoria); ver
+  [`docs/04-despliegue.md`](docs/04-despliegue.md).
 - Cada espacio conecta su propio número y paga a Meta con su tarjeta (`meta_direct`), o
   el operador recarga saldo (`prepaid`) desde **Administración**.
 - El operador mantiene actualizadas las tarifas de Meta (cambian cada trimestre).
@@ -119,7 +124,7 @@ Un solo proceso y un solo puerto; la cola de trabajos vive en PostgreSQL (sin Re
 
 ```bash
 npm run dev         # API (:3000) + interfaz con recarga en caliente (:5173)
-npm test            # pruebas de integración del servidor
+npm test            # pruebas del servidor (integración) y de la interfaz
 npm run typecheck
 ```
 

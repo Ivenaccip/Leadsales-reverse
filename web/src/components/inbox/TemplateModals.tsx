@@ -11,10 +11,12 @@ import {
   isTemplateValueComplete,
   TemplateForm,
   TemplatePreview,
+  templateUnsupportedReason,
   toTemplateParams,
   type TemplateFormValue,
 } from '../TemplateForm';
 import { Alert, Badge, Button, cx, EmptyState, Field, Input, Modal, Spinner, Textarea, useToast } from '../ui';
+import { sendProblem } from './helpers';
 
 export interface TemplateChoice {
   template: Template | null;
@@ -83,6 +85,7 @@ export function TemplatePicker({ channelId, choice, onChange }: { channelId: str
                     <span className="flex items-center gap-2">
                       <span className="font-mono text-sm font-medium text-slate-800">{tpl.name}</span>
                       <span className="text-xs text-slate-400">{tpl.language}</span>
+                      {templateUnsupportedReason(tpl) && <Badge color="yellow">No compatible</Badge>}
                       <Badge color={categoryColor(tpl.category)} className="ml-auto">
                         {CATEGORY_LABEL[tpl.category] ?? tpl.category}
                       </Badge>
@@ -147,7 +150,8 @@ export function SendTemplateModal({ open, onClose, contact, onSent }: { open: bo
         params: toTemplateParams(t, choice.value),
       });
       onSent(r.message);
-      if (r.message?.status === 'failed') toast.error(r.message.error?.message ?? 'Meta rechazó el mensaje');
+      const problem = r.message ? sendProblem(r.message) : null;
+      if (problem) toast.error(problem);
       else toast.success('Plantilla enviada');
       onClose();
     } catch (err) {

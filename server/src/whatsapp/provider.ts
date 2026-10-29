@@ -92,8 +92,10 @@ async function simulateStatuses(ctx: AppContext, channel: ChannelRow, wamid: str
     ['delivered', 2],
     ['read', 5],
   ];
+  // Meta echoes biz_opaque_callback_data in sent/delivered/read statuses.
+  const callback = typeof message.biz_opaque_callback_data === 'string' ? { biz_opaque_callback_data: message.biz_opaque_callback_data } : {};
   for (const [status, mult] of steps) {
-    const st = { id: wamid, status, timestamp: ts(), recipient_id: to, pricing };
+    const st = { id: wamid, status, timestamp: ts(), recipient_id: to, pricing, ...callback };
     await ctx.queue.enqueue('wa.webhook', { body: webhookEnvelope(channel, { statuses: [st] }) }, { delayMs: base * mult });
   }
 }

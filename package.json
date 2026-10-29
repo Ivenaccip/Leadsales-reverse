@@ -14,7 +14,7 @@
     "dev:web": "npm run dev -w web",
     "build": "npm run build -w web && npm run build -w server",
     "start": "node server/dist/index.js",
-    "test": "npm test -w server",
+    "test": "npm test -w server && npm test -w web",
     "typecheck": "npm run typecheck -w server && npm run typecheck -w web"
   },
   "engines": {

@@ -12,6 +12,8 @@ function StatusIcon({ status }: { status: Message['status'] }) {
   switch (status) {
     case 'pending':
       return <Clock className="h-3.5 w-3.5 text-slate-400" aria-label="Enviando" />;
+    case 'unknown':
+      return <AlertCircle className="h-3.5 w-3.5 text-amber-500" aria-label="Sin confirmar" />;
     case 'sent':
       return <Check className="h-3.5 w-3.5 text-slate-400" aria-label="Enviado" />;
     case 'delivered':
@@ -170,6 +172,7 @@ export function MessageBubble({ m, senderName }: { m: Message; senderName?: stri
           'relative max-w-[85%] rounded-lg px-3 py-2 text-sm text-slate-800 shadow-sm sm:max-w-[70%]',
           out ? 'rounded-tr-none bg-[#d9fdd3]' : 'rounded-tl-none bg-white',
           m.status === 'failed' && 'ring-1 ring-red-300',
+          m.status === 'unknown' && 'ring-1 ring-amber-300',
         )}
       >
         {(label || m.type === 'template') && (
@@ -184,11 +187,16 @@ export function MessageBubble({ m, senderName }: { m: Message; senderName?: stri
           <span>{timeOf(m.created_at)}</span>
           {out && <StatusIcon status={m.status} />}
         </div>
-        {m.status === 'failed' && m.error && (
-          <div className="mt-1.5 flex items-start gap-1 rounded bg-red-50 px-2 py-1 text-xs text-red-700">
+        {(m.status === 'failed' || m.status === 'unknown') && m.error && (
+          <div
+            className={cx(
+              'mt-1.5 flex items-start gap-1 rounded px-2 py-1 text-xs',
+              m.status === 'failed' ? 'bg-red-50 text-red-700' : 'bg-amber-50 text-amber-800',
+            )}
+          >
             <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
             <span>
-              {m.error.message ?? m.error.title ?? 'No se pudo enviar'}
+              {m.error.message ?? m.error.title ?? (m.status === 'failed' ? 'No se pudo enviar' : 'No pudimos confirmar el envío')}
               {m.error.code ? ` (código ${m.error.code})` : ''}
             </span>
           </div>

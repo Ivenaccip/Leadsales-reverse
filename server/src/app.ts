@@ -23,6 +23,7 @@ import { contactRoutes } from './routes/contacts.js';
 import { crmRoutes } from './routes/crm.js';
 import { COOKIE } from './routes/helpers.js';
 import { integrationRoutes } from './routes/integrations.js';
+import { invitationRoutes } from './routes/invitations.js';
 import { miscRoutes } from './routes/misc.js';
 import { templateRoutes } from './routes/templates.js';
 import { workspaceRoutes } from './routes/workspace.js';
@@ -88,6 +89,7 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
 
   await authRoutes(app, ctx);
   await workspaceRoutes(app, ctx);
+  await invitationRoutes(app, ctx);
   await channelRoutes(app, ctx);
   await metaWebhookRoutes(app, ctx);
   await crmRoutes(app, ctx);
@@ -112,36 +114,51 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
     app.setNotFoundHandler((_req, reply) => reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Ruta no encontrada' } }));
   }
 
-  // Realtime (Socket.IO on the same port).
+  // Realtime (Socket.IO on the same port). Rooms live in this process: run a single replica.
   const io = new IOServer(app.server, { path: '/socket.io', serveClient: false });
   io.use(async (socket, next) => {
-    const token = readCookie(socket.handshake.headers.cookie, COOKIE);
-    const payload = token ? verifyToken(config.jwtSecret, token) : null;
-    if (!payload) return next(new Error('unauthorized'));
-    socket.data.userId = payload.uid;
-    next();
+    try {
+      const token = readCookie(socket.handshake.headers.cookie, COOKIE);
+      const payload = token ? verifyToken(config.jwtSecret, token) : null;
+      if (!payload) return next(new Error('unauthorized'));
+      const { rows } = await db.query(`SELECT 1 FROM sessions WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`, [payload.sid, payload.uid]);
+      if (!rows[0]) return next(new Error('unauthorized'));
+      socket.data.userId = payload.uid;
+      socket.data.sid = payload.sid;
+      next();
+    } catch {
+      next(new Error('unauthorized'));
+    }
   });
   io.on('connection', (socket) => {
-    socket.on('join', async (workspaceId: string, ack?: (r: { ok: boolean }) => void) => {
+    // Lets logout/password changes reach this connection (Realtime.endSessions / evictUser).
+    socket.join([`user:${socket.data.userId}`, `sid:${socket.data.sid}`]);
+    socket.on('join', async (workspaceId: string, rawAck?: unknown) => {
+      // Clients choose the arguments: never call something that is not a function.
+      const ack = typeof rawAck === 'function' ? (rawAck as (r: { ok: boolean }) => void) : undefined;
       try {
         if (typeof workspaceId !== 'string' || !/^[0-9a-f-]{36}$/i.test(workspaceId)) return ack?.({ ok: false });
         const { rows } = await db.query<{ role: string | null; visibility: string | null; is_superadmin: boolean; ws_active: boolean }>(
           `SELECT m.role, w.settings->>'agent_visibility' AS visibility, u.is_superadmin, w.is_active AS ws_active
-           FROM users u JOIN workspaces w ON w.id = $1
+           FROM users u JOIN sessions s ON s.id = $3 AND s.user_id = u.id AND s.revoked_at IS NULL
+           JOIN workspaces w ON w.id = $1
            LEFT JOIN memberships m ON m.workspace_id = w.id AND m.user_id = u.id AND m.is_active
            WHERE u.id = $2`,
-          [workspaceId, socket.data.userId],
+          [workspaceId, socket.data.userId, socket.data.sid],
         );
         const r = rows[0];
         if (!r || (!r.is_superadmin && (!r.role || !r.ws_active))) {
-          for (const room of socket.rooms) if (room.startsWith(`ws:${workspaceId}`)) socket.leave(room);
+          // A refused switch must not leave the socket listening to the previous workspace either.
+          for (const room of socket.rooms) if (room.startsWith('ws:')) socket.leave(room);
           return ack?.({ ok: false });
         }
         for (const room of socket.rooms) if (room.startsWith('ws:')) socket.leave(room);
-        if (r.role === 'agent' && r.visibility === 'assigned') {
+        // Same rule as requireWs: the instance operator is an owner everywhere.
+        const role = r.is_superadmin ? 'owner' : r.role;
+        if (role === 'agent' && r.visibility === 'assigned') {
           socket.join([`ws:${workspaceId}:restricted`, `ws:${workspaceId}:u:${socket.data.userId}`]);
         } else {
-          socket.join(`ws:${workspaceId}`);
+          socket.join(role === 'agent' ? [`ws:${workspaceId}`] : [`ws:${workspaceId}`, `ws:${workspaceId}:admins`]);
         }
         ack?.({ ok: true });
       } catch {

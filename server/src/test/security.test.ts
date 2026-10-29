@@ -208,7 +208,8 @@ describe('restricted agents', () => {
     const secret = (await env.api('POST', '/api/contacts', { phone: '5255777001', name: 'De Ag2', assigned_user_id: ag2.body.id }, ownerA)).body.contact;
     // the owner schedules something for that contact
     const ch = (await env.built.ctx.db.query(`SELECT id FROM channels WHERE workspace_id = $1 AND provider = 'sandbox'`, [ownerA.workspaceId])).rows[0];
-    await env.api('POST', `/api/channels/${ch.id}/simulate`, { from: '5255777001', text: 'hola' }, ownerA);
+    // A real lead (stored as 52 + 5255777001): the sandbox simulator refuses to write into it.
+    expect((await env.api('POST', `/api/channels/${ch.id}/simulate`, { from: '525255777001', text: 'hola' }, ownerA)).status).toBe(409);
     await env.api('POST', `/api/contacts/${secret.id}/scheduled`, { send_at: new Date(Date.now() + 3600_000).toISOString(), content: { type: 'text', text: 'privado' } }, ownerA);
 
     const sched = await env.api('GET', '/api/scheduled', undefined, ag1);

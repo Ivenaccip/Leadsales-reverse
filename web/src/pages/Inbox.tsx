@@ -9,8 +9,8 @@ import type { Contact, Message } from '../lib/types';
 import { ChatView } from '../components/inbox/ChatView';
 import { ContactPanel, type ContactDetail } from '../components/inbox/ContactPanel';
 import { ConversationList } from '../components/inbox/ConversationList';
-import { findCachedContact, patchConversations, previewFor, removeConversations, upsertMessage } from '../components/inbox/helpers';
-import { Button, cx, EmptyState, PageLoader } from '../components/ui';
+import { findCachedContact, LIVE_QUERY, patchConversations, previewFor, removeConversations, upsertMessage } from '../components/inbox/helpers';
+import { Button, cx, EmptyState, PageLoader, useToast } from '../components/ui';
 
 function NoChatSelected() {
   return (
@@ -41,6 +41,7 @@ export default function InboxPage() {
   const { contactId } = useParams();
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const toast = useToast();
   const { user } = useSession();
   const myId = user?.id;
   const [panelOpen, setPanelOpen] = useState(() => typeof window !== 'undefined' && window.innerWidth >= 1280);
@@ -49,6 +50,7 @@ export default function InboxPage() {
     queryKey: ['contact', contactId],
     queryFn: () => api.get<ContactDetail>(`/api/contacts/${contactId}`),
     enabled: !!contactId,
+    ...LIVE_QUERY,
   });
 
   // Counters are cheap but contact events can come in bursts: refresh them at most twice per second.
@@ -100,8 +102,16 @@ export default function InboxPage() {
 
   useRealtime<Message>('message:update', (m) => upsertMessage(qc, m, false));
 
-  useRealtime<{ id: string; contact_id: string }>('scheduled:update', (e) => {
+  // Layout already dropped it from the caches; here only leave the conversation if it is open.
+  useRealtime<{ id: string }>('contact:revoked', (e) => {
+    if (e.id === contactId) navigate('/bandeja');
+  });
+
+  useRealtime<{ id: string; contact_id: string; status?: string; error?: string }>('scheduled:update', (e) => {
     void qc.invalidateQueries({ queryKey: ['contact', e.contact_id] });
+    if (e.status === 'failed' && e.contact_id === contactId) {
+      toast.error(`No se pudo enviar un mensaje programado${e.error ? `: ${e.error}` : ''}`);
+    }
   });
 
   const contact = detail.data?.contact;

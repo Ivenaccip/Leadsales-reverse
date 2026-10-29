@@ -22,8 +22,15 @@ const createSchema = z.object({
   language: z.string().trim().min(2).default('es_MX'),
   category: z.enum(['MARKETING', 'UTILITY', 'AUTHENTICATION']),
   header: z.object({ text: z.string().trim().min(1).max(60), example: z.string().max(60).optional() }).optional(),
-  body: z.object({ text: z.string().trim().min(1).max(1024), examples: z.array(z.string().min(1)).optional() }),
+  // Required except for AUTHENTICATION, whose text Meta writes itself.
+  body: z.object({ text: z.string().trim().min(1).max(1024), examples: z.array(z.string().min(1)).optional() }).optional(),
   footer: z.string().trim().max(60).optional(),
+  /** AUTHENTICATION only: add "Por tu seguridad, no compartas este código" (default true). */
+  security_recommendation: z.boolean().optional(),
+  /** AUTHENTICATION only: "Este código caduca en N minutos" in the footer. */
+  code_expiration_minutes: z.number().int().min(1).max(90).optional(),
+  /** AUTHENTICATION only: label of the copy-code button (WhatsApp's own label when omitted). */
+  otp_button_text: z.string().trim().min(1).max(25).optional(),
   buttons: z
     .array(
       z.discriminatedUnion('type', [
@@ -36,8 +43,25 @@ const createSchema = z.object({
     .optional(),
 });
 
+/**
+ * Authentication templates have no free text: Meta writes the body ("<code> es tu código de
+ * verificación") in the template's language, the footer only takes the expiration and exactly
+ * one one-time-password button is required. Header, body text, footer text and other buttons
+ * are not allowed, so the simple form's are ignored.
+ */
+function buildAuthComponents(b: z.infer<typeof createSchema>) {
+  const components: any[] = [{ type: 'BODY', add_security_recommendation: b.security_recommendation ?? true }];
+  if (b.code_expiration_minutes) components.push({ type: 'FOOTER', code_expiration_minutes: b.code_expiration_minutes });
+  const button: any = { type: 'OTP', otp_type: 'COPY_CODE' };
+  if (b.otp_button_text) button.text = b.otp_button_text;
+  components.push({ type: 'BUTTONS', buttons: [button] });
+  return { components, parameter_format: undefined };
+}
+
 /** Turns the simple form into Meta's template components (with the examples Meta requires). */
 export function buildCreateComponents(b: z.infer<typeof createSchema>) {
+  if (b.category === 'AUTHENTICATION') return buildAuthComponents(b);
+  if (!b.body) throw badRequest('Escribe el texto del mensaje');
   const components: any[] = [];
   const named = [b.header?.text, b.body.text].some((t) => variablesIn(t).some((v) => !/^\d+$/.test(v)));
   if (b.header) {

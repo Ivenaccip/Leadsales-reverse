@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Archive, Ban, ChevronLeft, ChevronRight, Download, Plus, Search, Tag as TagIcon, Trash2, Upload, UserPlus, Users, MoveRight, X } from 'lucide-react';
 import { api, errorMessage, getWorkspaceId, qs } from '../lib/api';
+import { decodeCsv } from '../lib/csv';
 import { stageMap, useFunnels, useMembers, useTags } from '../lib/queries';
 import { useRealtime } from '../lib/realtime';
 import { useSession } from '../lib/session';
@@ -621,16 +622,16 @@ function ImportModal({ onClose, onDone }: { onClose: () => void; onDone: () => v
     onError: (err) => toast.error(errorMessage(err)),
   });
 
-  function onFile(e: ChangeEvent<HTMLInputElement>) {
+  async function onFile(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      setCsv(String(reader.result ?? ''));
+    try {
+      setCsv(decodeCsv(await file.arrayBuffer()));
       setFileName(file.name);
-    };
-    reader.onerror = () => toast.error('No se pudo leer el archivo');
-    reader.readAsText(file, 'utf-8');
+    } catch {
+      toast.error('No se pudo leer el archivo');
+    }
   }
 
   const rows = csv.trim() ? csv.trim().split(/\r?\n/).length - 1 : 0;
@@ -692,7 +693,7 @@ function ImportModal({ onClose, onDone }: { onClose: () => void; onDone: () => v
           <div className="flex flex-wrap items-center gap-3">
             <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
               <Upload className="h-4 w-4" /> Elegir archivo .csv
-              <input type="file" accept=".csv,text/csv,text/plain" className="hidden" onChange={onFile} />
+              <input type="file" accept=".csv,text/csv,text/plain" className="hidden" onChange={(e) => void onFile(e)} />
             </label>
             {fileName && <span className="text-sm text-slate-500">{fileName}</span>}
           </div>

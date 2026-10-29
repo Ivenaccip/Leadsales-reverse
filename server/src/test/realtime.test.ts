@@ -13,6 +13,11 @@ async function login(email: string) {
   return { cookie: `ll_token=${r.cookies[0].value}`, id: JSON.parse(r.body).user.id as string };
 }
 
+async function ownerCookie() {
+  const r = await env.built.app.inject({ method: 'POST', url: '/api/auth/login', payload: { email: 'rt@test.com', password: 'secreto123' } });
+  return `ll_token=${r.cookies[0].value}`;
+}
+
 async function listen(cookie: string): Promise<{ events: { event: string; data: any }[] }> {
   const s = connect(base, { path: '/socket.io', extraHeaders: { cookie }, transports: ['websocket'] });
   sockets.push(s);
@@ -56,13 +61,76 @@ describe('realtime isolation', () => {
     expect(ack.ok).toBe(false);
   });
 
+  it('survives malformed cookies and non-function join acks (#18, #71)', async () => {
+    for (const transports of [['websocket'], ['polling']] as const) {
+      const bad = connect(base, { path: '/socket.io', extraHeaders: { cookie: 'll_token=%E0%A4%A' }, transports: [...transports], reconnection: false });
+      sockets.push(bad);
+      expect((await new Promise<Error>((r) => bad.on('connect_error', r))).message).toBe('unauthorized');
+    }
+    const owner = await ownerCookie();
+    const s = connect(base, { path: '/socket.io', extraHeaders: { cookie: owner }, transports: ['websocket'] });
+    sockets.push(s);
+    await new Promise<void>((r) => s.on('connect', () => r()));
+    s.emit('join', 'not-a-uuid', 'boom');
+    s.emit('join', ws, 'boom');
+    s.emit('join', ws, 42);
+    await sleep(200);
+    expect(await new Promise((r) => s.emit('join', ws, (a: { ok: boolean }) => r(a.ok)))).toBe(true);
+    expect((await env.api('GET', '/health')).status).toBe(200);
+  });
+
+  it('sends broadcast events to owners and admins only (#55)', async () => {
+    const ana = await login('ana@rt.com');
+    const anaRt = await listen(ana.cookie);
+    const ownerRt = await listen(await ownerCookie());
+    env.built.ctx.realtime.emit(ws, 'broadcast:update', { id: 'b1', name: 'Campaña', params: { body: ['CUPON-VIP-40'] } });
+    await sleep(200);
+    expect(ownerRt.events.map((e) => e.event)).toContain('broadcast:update');
+    expect(anaRt.events.map((e) => e.event)).not.toContain('broadcast:update');
+  });
+
+  it('tells restricted agents when a conversation they could see goes to someone else (#64)', async () => {
+    await env.api('PUT', '/api/workspace/settings', { agent_visibility: 'assigned' });
+    const ana = await login('ana@rt.com');
+    const beto = await login('beto@rt.com');
+    const anaRt = await listen(ana.cookie);
+    const betoRt = await listen(beto.cookie);
+    const revoked = (rt: { events: { event: string; data: any }[] }) => rt.events.filter((e) => e.event === 'contact:revoked').map((e) => e.data.id);
+
+    const lead = (await env.api('POST', `/api/channels/${channelId}/simulate`, { from: '5215544446666', text: 'sin dueño' })).body.message.contact_id;
+    await sleep(200);
+    expect(betoRt.events.some((e) => e.event === 'message:new' && e.data.contact_id === lead)).toBe(true);
+    await env.api('PATCH', `/api/contacts/${lead}`, { assigned_user_id: ana.id });
+    await sleep(200);
+    expect(revoked(betoRt)).toEqual([lead]);
+    expect(revoked(anaRt)).toEqual([]);
+    // later activity on it does not repeat the notice
+    await env.api('POST', `/api/channels/${channelId}/simulate`, { from: '5215544446666', text: 'otra vez' });
+    await sleep(200);
+    expect(revoked(betoRt)).toEqual([lead]);
+
+    // Beto's own conversation reassigned to Ana leaves his inbox too
+    const mine = (await env.api('POST', `/api/channels/${channelId}/simulate`, { from: '5215544447777', text: 'para Beto' })).body.message.contact_id;
+    await env.api('PATCH', `/api/contacts/${mine}`, { assigned_user_id: beto.id });
+    await sleep(200);
+    await env.api('PATCH', `/api/contacts/${mine}`, { assigned_user_id: ana.id });
+    await sleep(200);
+    expect(revoked(betoRt)).toEqual([lead, mine]);
+
+    // restricted agents never get broadcast data either
+    env.built.ctx.realtime.emit(ws, 'broadcast:update', { id: 'b2' });
+    await sleep(100);
+    expect(betoRt.events.map((e) => e.event)).not.toContain('broadcast:update');
+    await env.api('PUT', '/api/workspace/settings', { agent_visibility: 'all' });
+  });
+
   it('only sends conversations an agent may see when visibility is "assigned"', async () => {
     await env.api('PUT', '/api/workspace/settings', { agent_visibility: 'assigned' });
     const ana = await login('ana@rt.com');
     const beto = await login('beto@rt.com');
     const anaRt = await listen(ana.cookie);
     const betoRt = await listen(beto.cookie);
-    const ownerRt = await listen((await env.built.app.inject({ method: 'POST', url: '/api/auth/login', payload: { email: 'rt@test.com', password: 'secreto123' } })).cookies.map((c) => `ll_token=${c.value}`)[0]);
+    const ownerRt = await listen(await ownerCookie());
 
     // conversation assigned to Ana
     const sim = await env.api('POST', `/api/channels/${channelId}/simulate`, { from: '5215511119999', text: 'hola' });

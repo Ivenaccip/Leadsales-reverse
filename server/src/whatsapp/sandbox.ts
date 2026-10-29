@@ -64,6 +64,8 @@ export class SandboxProvider implements WhatsAppProvider {
   async send(to: string, message: WaMessage) {
     const wamid = `wamid.SANDBOX.${crypto.randomUUID()}`;
     await this.hooks.onSent(wamid, to, message);
+    // No waId: only Meta knows the real WhatsApp id, and echoing the typed number would be
+    // stored as if Meta had resolved it.
     return { wamid };
   }
 

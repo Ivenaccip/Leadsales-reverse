@@ -11,6 +11,8 @@ import { getWorkspace, sendMessage } from '../services/messages.js';
 import { listFunnels } from './crm.js';
 import { ADMIN_ROLES, noContent, parse, requireApiKey, requireWs, uuid } from './helpers.js';
 
+const MAX_WEBHOOKS = 10;
+
 const publicUrl = z
   .string()
   .url()
@@ -56,11 +58,20 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
   app.post('/api/webhooks', async (req) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const body = parse(z.object({ url: publicUrl, events: z.array(z.enum([...WEBHOOK_EVENTS, '*'])).default([]) }), req.body);
-    const { rows } = await ctx.db.query(
-      `INSERT INTO webhook_endpoints (workspace_id, url, secret, events) VALUES ($1, $2, $3, $4) RETURNING *`,
-      [a.workspaceId, body.url, `whsec_${randomToken(24)}`, body.events],
-    );
-    return { webhook: rows[0] };
+    // Every event is delivered once per endpoint: the cap bounds how much queue work one event can create.
+    const webhook = await ctx.db.tx(async (q) => {
+      await q.query(`SELECT id FROM workspaces WHERE id = $1 FOR UPDATE`, [a.workspaceId]);
+      const count = await q.query<{ n: number }>(`SELECT count(*)::int AS n FROM webhook_endpoints WHERE workspace_id = $1`, [a.workspaceId]);
+      if (count.rows[0].n >= MAX_WEBHOOKS) {
+        throw new AppError(400, 'WEBHOOK_LIMIT', `Puedes tener como máximo ${MAX_WEBHOOKS} webhooks. Elimina uno que ya no uses.`);
+      }
+      const { rows } = await q.query(
+        `INSERT INTO webhook_endpoints (workspace_id, url, secret, events) VALUES ($1, $2, $3, $4) RETURNING *`,
+        [a.workspaceId, body.url, `whsec_${randomToken(24)}`, body.events],
+      );
+      return rows[0];
+    });
+    return { webhook };
   });
 
   app.patch('/api/webhooks/:id', async (req) => {
@@ -91,7 +102,11 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
     const { id } = parse(z.object({ id: uuid }), req.params);
     const { rows } = await ctx.db.query(`SELECT id FROM webhook_endpoints WHERE id = $1 AND workspace_id = $2`, [id, a.workspaceId]);
     if (!rows[0]) throw notFound('Webhook');
-    await ctx.queue.enqueue('webhook.deliver', { endpointId: id, event: 'ping', data: { message: 'Hola desde LeadLibre 👋' }, sentAt: new Date().toISOString() }, { maxAttempts: 1 });
+    await ctx.queue.enqueue(
+      'webhook.deliver',
+      { workspaceId: a.workspaceId, endpointId: id, event: 'ping', data: { message: 'Hola desde LeadLibre 👋' }, sentAt: new Date().toISOString() },
+      { maxAttempts: 1 },
+    );
     return { queued: true };
   });
 
@@ -198,9 +213,21 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
           .object({
             name: z.string().min(1),
             language: z.string().min(2).default('es_MX'),
-            header: z.string().optional(),
+            // Text for a header variable, or the location a LOCATION header needs.
+            header: z
+              .union([
+                z.string(),
+                z.object({
+                  type: z.literal('location'),
+                  latitude: z.number().min(-90).max(90),
+                  longitude: z.number().min(-180).max(180),
+                  name: z.string().trim().max(1000).optional(),
+                  address: z.string().trim().max(1000).optional(),
+                }),
+              ])
+              .optional(),
             body: z.array(z.string()).optional(),
-            buttons: z.array(z.object({ index: z.number().int(), text: z.string() })).optional(),
+            buttons: z.array(z.object({ index: z.number().int(), text: z.string(), sub_type: z.enum(['url', 'copy_code']).optional() })).optional(),
           })
           .optional(),
       }),
@@ -210,6 +237,7 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
     let contact = await findByPhone(k.workspaceId, body.phone);
     if (!contact) contact = (await createContact(ctx, k.workspaceId, { phone: body.phone, name: body.name, source: 'api' })).contact;
     const r = (s: string) => renderPlaceholders(s, contact!);
+    const header = body.template?.header;
     const message = await sendMessage(ctx, {
       workspaceId: k.workspaceId,
       contactId: contact.id,
@@ -220,7 +248,7 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
             name: body.template.name,
             language: body.template.language,
             params: {
-              header: body.template.header ? { type: 'text', text: r(body.template.header) } : undefined,
+              header: typeof header === 'string' ? (header ? { type: 'text', text: r(header) } : undefined) : header,
               body: body.template.body?.map(r),
               buttons: body.template.buttons,
             },

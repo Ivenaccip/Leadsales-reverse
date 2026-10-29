@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { encryptJson, hmacSha256Hex, randomToken, safeEqual } from '../lib/crypto.js';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
+import { normalizePhone } from '../lib/phone.js';
 import { syncTemplates } from '../services/templates.js';
 import type { ChannelRow } from '../types.js';
 import { processInboundMessage } from '../whatsapp/inbound.js';
@@ -57,16 +58,77 @@ async function verifyOwnership(ctx: AppContext, accessToken: string, phoneNumber
   return info;
 }
 
+async function billingModeOf(ctx: AppContext, workspaceId: string): Promise<string | undefined> {
+  const { rows } = await ctx.db.query<{ billing_mode: string }>(`SELECT billing_mode FROM workspaces WHERE id = $1`, [workspaceId]);
+  return rows[0]?.billing_mode;
+}
+
 /**
  * In prepaid workspaces the instance operator pays Meta, so only the operator may
  * connect or change the official numbers (whoever holds the app secret can sign webhooks).
  */
 async function assertCanManageCloudChannels(ctx: AppContext, a: WsAuth) {
   if (a.user.is_superadmin) return;
-  const { rows } = await ctx.db.query<{ billing_mode: string }>(`SELECT billing_mode FROM workspaces WHERE id = $1`, [a.workspaceId]);
-  if (rows[0]?.billing_mode === 'prepaid') {
+  if ((await billingModeOf(ctx, a.workspaceId)) === 'prepaid') {
     throw forbidden('En modo de créditos prepagados, el administrador de la instancia conecta y edita los números oficiales');
   }
+}
+
+/**
+ * A number counts as operator-verified only with an app secret the business cannot know. A secret
+ * that is already on a number of this workspace the operator never verified (typed by the business,
+ * or typed while the business paid Meta and likely came from its own app) proves nothing.
+ */
+async function assertSecretUnknownToBusiness(ctx: AppContext, workspaceId: string, secret: string) {
+  const { rows } = await ctx.db.query<ChannelRow>(
+    `SELECT * FROM channels WHERE workspace_id = $1 AND provider = 'cloud_api' AND NOT operator_verified`,
+    [workspaceId],
+  );
+  if (rows.some((c) => channelCredentials(ctx, c).appSecret === secret)) {
+    throw badRequest(
+      'Esa clave secreta (App Secret) ya estaba en un número de este negocio y el negocio puede conocerla. Usa el token y la App Secret de tu propia app de Meta.',
+      'APP_SECRET_NOT_NEW',
+    );
+  }
+}
+
+/** One WABA belongs to one workspace: templates live per WABA at Meta, so sharing it leaks them. */
+async function assertWabaFree(ctx: AppContext, workspaceId: string, wabaId: string) {
+  const { rows } = await ctx.db.query(`SELECT 1 FROM channels WHERE waba_id = $1 AND workspace_id <> $2 LIMIT 1`, [wabaId, workspaceId]);
+  if (rows[0]) throw conflict('Esa cuenta de WhatsApp (WABA) ya está conectada en otro espacio de trabajo', 'WABA_TAKEN');
+}
+
+const PREPAID_UNVERIFIED =
+  'Desactivado en modo de créditos prepagados: el negocio puede conocer la clave secreta (App Secret) de este número. Para activarlo, el administrador de la instancia debe capturar el token y la App Secret de su propia app de Meta.';
+
+/**
+ * Switching a workspace to prepaid: numbers the operator did not verify stop working (the tenant
+ * connected them, or the operator typed them while the tenant paid Meta, usually with the tenant's
+ * own app), because the tenant may know their app secret and sign fake status webhooks (refunds).
+ */
+export async function disableUnverifiedCloudChannels(ctx: AppContext, workspaceId: string) {
+  await ctx.db.query(
+    `UPDATE channels SET status = 'disabled', last_error = $2
+     WHERE workspace_id = $1 AND provider = 'cloud_api' AND NOT operator_verified AND status <> 'disabled'`,
+    [workspaceId, PREPAID_UNVERIFIED],
+  );
+}
+
+/**
+ * The simulator writes messages as if the customer sent them and moves the contact onto the
+ * sandbox (where replies are never delivered): only new numbers or contacts already living
+ * on this sandbox channel may be used, never a real customer.
+ */
+async function assertSimulatable(ctx: AppContext, ch: ChannelRow, from: string) {
+  const { rows } = await ctx.db.query(
+    `SELECT 1 FROM contacts c
+     WHERE c.workspace_id = $1 AND (c.wa_id = $2 OR c.phone = $3)
+       AND (c.channel_id IS DISTINCT FROM $4
+         OR EXISTS (SELECT 1 FROM messages m JOIN channels mc ON mc.id = m.channel_id WHERE m.contact_id = c.id AND mc.provider <> 'sandbox'))
+     LIMIT 1`,
+    [ch.workspace_id, from, normalizePhone(`+${from}`), ch.id],
+  );
+  if (rows[0]) throw conflict('Ese número es de un contacto real de tu espacio: usa otro número para simular', 'REAL_CONTACT');
 }
 
 const cloudSchema = z.object({
@@ -106,11 +168,16 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
     await assertCanManageCloudChannels(ctx, a);
     const taken = await ctx.db.query(`SELECT 1 FROM channels WHERE phone_number_id = $1`, [body.phone_number_id]);
     if (taken.rows[0]) throw conflict('Ese número ya está conectado en esta instancia');
+    // Only the operator connects numbers in prepaid workspaces; elsewhere the business pays Meta and
+    // the credentials are probably its own, even when the operator typed them.
+    const verified = (await billingModeOf(ctx, a.workspaceId)) === 'prepaid';
+    if (verified) await assertSecretUnknownToBusiness(ctx, a.workspaceId, body.app_secret);
 
     const info = await verifyOwnership(ctx, body.access_token, body.phone_number_id, body.waba_id);
+    await assertWabaFree(ctx, a.workspaceId, body.waba_id);
     const { rows } = await ctx.db.query<ChannelRow>(
-      `INSERT INTO channels (workspace_id, provider, name, display_phone, phone_number_id, waba_id, credentials, verify_token, is_default)
-       VALUES ($1, 'cloud_api', $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      `INSERT INTO channels (workspace_id, provider, name, display_phone, phone_number_id, waba_id, credentials, verify_token, is_default, operator_verified)
+       VALUES ($1, 'cloud_api', $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
       [
         a.workspaceId,
         body.name,
@@ -120,6 +187,7 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
         encryptJson(ctx.config.encryptionKey, { accessToken: body.access_token, appSecret: body.app_secret }),
         body.verify_token ?? randomToken(12),
         isDefault,
+        verified,
       ],
     );
     const channel = rows[0];
@@ -153,29 +221,69 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
       req.body,
     );
     const ch = await getOwnChannel(ctx, a.workspaceId, id);
+    const prepaid = ch.provider === 'cloud_api' && (await billingModeOf(ctx, a.workspaceId)) === 'prepaid';
     let credentials = ch.credentials;
+    let verified = !!ch.operator_verified;
+    let status = body.status ?? null;
+    let lastError: string | null = ch.last_error;
     if (ch.provider === 'cloud_api' && (body.access_token || body.app_secret || body.waba_id || body.status)) {
       await assertCanManageCloudChannels(ctx, a);
     }
     if (body.access_token || body.app_secret || body.waba_id) {
       const creds = channelCredentials(ctx, ch);
       const accessToken = body.access_token ?? creds.accessToken;
+      // Verifying a number for prepaid billing moves it to the operator's own Meta app: a secret the
+      // business may know is refused, and the token proves the operator's app controls the number.
+      if (prepaid && a.user.is_superadmin && body.app_secret && !(ch.operator_verified && body.app_secret === creds.appSecret)) {
+        await assertSecretUnknownToBusiness(ctx, a.workspaceId, body.app_secret);
+        if (!ch.operator_verified && !body.access_token) {
+          throw badRequest(
+            'Para verificar este número en modo prepagado, captura también el token de acceso de tu propia app de Meta',
+            'OPERATOR_VERIFICATION_REQUIRED',
+          );
+        }
+      }
       if (ch.provider === 'cloud_api' && (body.access_token || body.waba_id)) {
         await verifyOwnership(ctx, accessToken ?? '', ch.phone_number_id, body.waba_id ?? ch.waba_id ?? '');
       }
+      if (ch.provider === 'cloud_api' && body.waba_id && body.waba_id !== ch.waba_id) await assertWabaFree(ctx, a.workspaceId, body.waba_id);
       credentials = encryptJson(ctx.config.encryptionKey, {
         accessToken,
         appSecret: body.app_secret ?? creds.appSecret,
       });
+      // Verified = the operator typed the app secret while the workspace was prepaid (checked above);
+      // credentials the tenant changes never are.
+      if (!a.user.is_superadmin) verified = false;
+      else if (body.app_secret) verified = prepaid;
     }
+    if (prepaid) {
+      if (body.status === 'active' && !verified) {
+        throw badRequest(
+          'En modo prepagado, captura el token y la clave secreta (App Secret) de tu propia app de Meta para verificar este número antes de activarlo',
+          'OPERATOR_VERIFICATION_REQUIRED',
+        );
+      }
+      // Re-keyed by the operator after the switch to prepaid: it may work again.
+      if (verified && !ch.operator_verified && !body.status && ch.status === 'disabled' && ch.last_error === PREPAID_UNVERIFIED) status = 'active';
+    }
+    if (status === 'active' && ch.last_error === PREPAID_UNVERIFIED) lastError = null;
     if (body.is_default) await ctx.db.query(`UPDATE channels SET is_default = false WHERE workspace_id = $1`, [a.workspaceId]);
     const { rows } = await ctx.db.query<ChannelRow>(
       `UPDATE channels SET name = COALESCE($2, name), waba_id = COALESCE($3, waba_id), credentials = $4,
-         verify_token = COALESCE($5, verify_token), is_default = COALESCE($6, is_default), status = COALESCE($7, status)
+         verify_token = COALESCE($5, verify_token), is_default = COALESCE($6, is_default), status = COALESCE($7, status),
+         operator_verified = $8, last_error = $9
        WHERE id = $1 RETURNING *`,
-      [id, body.name ?? null, body.waba_id ?? null, credentials, body.verify_token ?? null, body.is_default ?? null, body.status ?? null],
+      [id, body.name ?? null, body.waba_id ?? null, credentials, body.verify_token ?? null, body.is_default ?? null, status, verified, lastError],
     );
-    return { channel: publicChannel(ctx, rows[0]) };
+    const warnings: string[] = [];
+    // New credentials may belong to another Meta app (in prepaid, the operator's): that app must be
+    // the one subscribed to the WABA, or Meta keeps sending webhooks signed by the old one.
+    if (ch.provider === 'cloud_api' && (body.access_token || body.app_secret || body.waba_id) && (!prepaid || verified)) {
+      await providerFor(ctx, rows[0])
+        .subscribeApp()
+        .catch((err) => warnings.push(`No se pudo suscribir la app a la WABA: ${(err as Error).message}`));
+    }
+    return { channel: publicChannel(ctx, rows[0]), warnings };
   });
 
   app.delete('/api/channels/:id', async (req, reply) => {
@@ -193,10 +301,11 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
     const ch = await getOwnChannel(ctx, a.workspaceId, id);
     try {
       const info = await providerFor(ctx, ch).getPhoneInfo();
-      await ctx.db.query(`UPDATE channels SET display_phone = COALESCE($2, display_phone), status = 'active', last_error = NULL WHERE id = $1`, [
-        id,
-        info.display_phone_number ?? null,
-      ]);
+      // A test only reports: re-enabling a number is a PATCH (operator-only in prepaid workspaces).
+      await ctx.db.query(
+        `UPDATE channels SET display_phone = COALESCE($2, display_phone), last_error = CASE WHEN status = 'disabled' THEN last_error END WHERE id = $1`,
+        [id, info.display_phone_number ?? null],
+      );
       return { ok: true, info };
     } catch (err) {
       const msg = err instanceof MetaApiError ? explainMetaError(err.code, err.message) : (err as Error).message;
@@ -209,13 +318,14 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
     const ch = await getOwnChannel(ctx, a.workspaceId, id);
+    if (ch.provider === 'cloud_api') await assertCanManageCloudChannels(ctx, a);
     await providerFor(ctx, ch).subscribeApp().catch(metaError);
     return { ok: true };
   });
 
-  // Sandbox only: pretend a customer wrote to us.
+  // Sandbox only: pretend a customer wrote to us (admins only: it writes as if the customer did).
   app.post('/api/channels/:id/simulate', async (req) => {
-    const a = await requireWs(ctx, req);
+    const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
     const body = parse(
       z.object({
@@ -228,7 +338,12 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
     );
     const ch = await getOwnChannel(ctx, a.workspaceId, id);
     if (ch.provider !== 'sandbox') throw badRequest('Solo los canales sandbox pueden simular mensajes');
-    const from = body.from.replace(/\D/g, '');
+    // Meta always sends full international wa_ids: a national number typed here gets the
+    // workspace's country code, like contacts created by hand.
+    const ws = await ctx.db.query<{ default_country_code: string }>(`SELECT default_country_code FROM workspaces WHERE id = $1`, [a.workspaceId]);
+    const digits = body.from.replace(/\D/g, '');
+    const from = digits.length === 10 && !body.from.startsWith('+') ? (ws.rows[0]?.default_country_code ?? '52') + digits : digits;
+    await assertSimulatable(ctx, ch, from);
     const msg = body.reply_id
       ? { from, id: `wamid.SIM.${crypto.randomUUID()}`, timestamp: String(Math.floor(Date.now() / 1000)), type: 'interactive', interactive: { type: 'button_reply', button_reply: { id: body.reply_id, title: body.text ?? body.reply_id } } }
       : { from, id: `wamid.SIM.${crypto.randomUUID()}`, timestamp: String(Math.floor(Date.now() / 1000)), type: 'text', text: { body: body.text ?? '' } };
@@ -266,8 +381,10 @@ export async function metaWebhookRoutes(app: FastifyInstance, ctx: AppContext) {
       if (e.id) wabaIds.add(String(e.id));
       for (const ch of e.changes ?? []) if (ch.value?.metadata?.phone_number_id) phoneIds.add(String(ch.value.metadata.phone_number_id));
     }
-    const { rows } = await ctx.db.query<ChannelRow>(
-      `SELECT * FROM channels WHERE provider = 'cloud_api' AND (phone_number_id = ANY($1::text[]) OR waba_id = ANY($2::text[]))`,
+    const { rows } = await ctx.db.query<ChannelRow & { tenant_secret_ok: boolean }>(
+      `SELECT ch.*, (w.billing_mode <> 'prepaid' OR ch.operator_verified) AS tenant_secret_ok
+       FROM channels ch JOIN workspaces w ON w.id = ch.workspace_id
+       WHERE ch.provider = 'cloud_api' AND (ch.phone_number_id = ANY($1::text[]) OR ch.waba_id = ANY($2::text[]))`,
       [[...phoneIds], [...wabaIds]],
     );
     if (!rows.length && !ctx.config.metaAppSecret) return reply.code(200).send('IGNORED');
@@ -281,13 +398,29 @@ export async function metaWebhookRoutes(app: FastifyInstance, ctx: AppContext) {
       allowed = rows.map((ch) => ch.id);
     } else {
       const bySecret = new Map<string, string[]>();
-      for (const ch of rows) {
+      // In prepaid workspaces a secret the tenant typed cannot vouch for billing events.
+      for (const ch of rows.filter((c) => c.tenant_secret_ok)) {
         const secret = channelCredentials(ctx, ch).appSecret;
         if (secret) bySecret.set(secret, [...(bySecret.get(secret) ?? []), ch.id]);
       }
       const match = [...bySecret.entries()].find(([secret]) => signedWith(secret));
       if (!match) {
-        ctx.log.warn({ phoneIds: [...phoneIds] }, 'invalid webhook signature');
+        // Signed with the secret of a prepaid number the operator never verified (e.g. one connected
+        // before verification existed): stop the number visibly instead of losing its events silently.
+        const distrusted = rows.filter((c) => !c.tenant_secret_ok && c.status !== 'disabled').filter((c) => {
+          const secret = channelCredentials(ctx, c).appSecret;
+          return !!secret && signedWith(secret);
+        });
+        if (distrusted.length) {
+          await ctx.db.query(
+            `UPDATE channels ch SET status = 'disabled', last_error = $2 FROM workspaces w
+             WHERE w.id = ch.workspace_id AND ch.id = ANY($1::uuid[]) AND w.billing_mode = 'prepaid' AND NOT ch.operator_verified AND ch.status <> 'disabled'`,
+            [distrusted.map((c) => c.id), PREPAID_UNVERIFIED],
+          );
+          ctx.log.warn({ channelIds: distrusted.map((c) => c.id) }, 'webhook signed with an unverified secret in a prepaid workspace: number disabled');
+        } else {
+          ctx.log.warn({ phoneIds: [...phoneIds] }, 'invalid webhook signature');
+        }
         return reply.code(401).send('Firma inválida');
       }
       allowed = match[1];

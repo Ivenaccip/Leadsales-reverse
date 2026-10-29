@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { DEFAULT_AI_MODEL } from '../services/ai-agent.js';
 import { fakeFetch, setup, type TestEnv } from './helpers.js';
 
 const replies: any[] = [];
@@ -9,12 +10,25 @@ const claude = fakeFetch([
       return { status: 401, json: { type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } } };
     }
     const next = replies.shift();
+    if (next?.status) return { status: next.status, json: next.json, headers: next.headers };
     return { json: { id: `msg_${claude.calls.length}`, type: 'message', role: 'assistant', model: c.body.model, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 10 }, ...next } };
   },
 ]);
 
 let env: TestEnv;
 let channelId: string;
+let workspaceId: string;
+/** Runs once, during the next Claude call: lets a test act while the AI is "writing". */
+let duringClaude: (() => Promise<void>) | null = null;
+const fetchWithHook = (async (input: any, init?: any) => {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+  if (duringClaude && url.startsWith('https://api.anthropic.com/')) {
+    const hook = duringClaude;
+    duringClaude = null;
+    await hook();
+  }
+  return claude.fetch(input, init);
+}) as typeof fetch;
 
 async function runDueJobs() {
   await env.built.ctx.db.query(`UPDATE jobs SET run_at = now() WHERE status = 'queued'`);
@@ -29,8 +43,8 @@ async function say(from: string, text: string) {
 }
 
 beforeAll(async () => {
-  env = await setup({ fetch: claude.fetch });
-  await env.register('ia@test.com', 'Inmobiliaria');
+  env = await setup({ fetch: fetchWithHook });
+  workspaceId = (await env.register('ia@test.com', 'Inmobiliaria')).workspaceId;
   channelId = (await env.api('POST', '/api/channels', { provider: 'sandbox', name: 'S' })).body.channel.id;
 });
 afterAll(() => env.close());
@@ -142,5 +156,87 @@ describe('AI agent (Lead Agent)', () => {
     expect(last.body.fallbacks).toBeUndefined(); // Haiku: no server-side fallback
     const msgs = (await env.api('GET', `/api/contacts/${id}/messages`)).body.messages;
     expect(msgs.some((m: any) => m.type === 'note' && m.body.includes('inválida'))).toBe(true);
+  });
+});
+
+describe('AI agent fixes', () => {
+  const aiSettings = {
+    model: DEFAULT_AI_MODEL,
+    api_key: 'sk-ant-test',
+    instructions: 'Vende departamentos.',
+    knowledge: 'Depa de 2 recámaras: $1,000,000 MXN, con un cajón de estacionamiento.',
+    handoff_message: 'Te paso con un asesor.',
+    only_unassigned: false,
+    max_replies: 10,
+  };
+  const claudeCalls = () => claude.calls.filter((c) => c.url.includes('api.anthropic.com'));
+  const messagesOf = async (id: string) => (await env.api('GET', `/api/contacts/${id}/messages`)).body.messages;
+
+  beforeAll(async () => {
+    const r = await env.api('PUT', '/api/workspace/settings', { automation_mode: 'ai', ai: aiSettings });
+    expect(r.status).toBe(200);
+  });
+
+  it('answers a message that arrives while the AI is still writing the previous reply', async () => {
+    const from = '5215577770001';
+    duringClaude = async () => {
+      await env.api('POST', `/api/channels/${channelId}/simulate`, { from, text: '¿Tiene estacionamiento?', name: 'Ana' });
+    };
+    replies.push(
+      { content: [{ type: 'text', text: 'Cuesta $1,000,000 MXN.' }], stop_reason: 'end_turn' },
+      { content: [{ type: 'text', text: 'Sí, incluye un cajón.' }], stop_reason: 'end_turn' },
+    );
+    const before = claudeCalls().length;
+    const id = await say(from, '¿Precio del depa?');
+    await runDueJobs();
+    const calls = claudeCalls().slice(before);
+    expect(calls).toHaveLength(2);
+    // The follow-up is shown after the reply that did not see it, so it gets its own answer.
+    expect(calls[1].body.messages).toEqual([
+      { role: 'user', content: '¿Precio del depa?' },
+      { role: 'assistant', content: 'Cuesta $1,000,000 MXN.' },
+      { role: 'user', content: '¿Tiene estacionamiento?' },
+    ]);
+    const msgs = await messagesOf(id);
+    const out = msgs.filter((m: any) => m.direction === 'out');
+    expect(out.map((m: any) => m.body)).toEqual(['Cuesta $1,000,000 MXN.', 'Sí, incluye un cajón.']);
+    const firstIn = msgs.find((m: any) => m.body === '¿Precio del depa?');
+    const row = (await env.built.ctx.db.query(`SELECT payload FROM messages WHERE id = $1`, [out[0].id])).rows[0];
+    expect(row.payload.ai_last_in).toBe(firstIn.id);
+    // Nothing left to answer: no third call.
+    await runDueJobs();
+    expect(claudeCalls().length - before).toBe(2);
+  });
+
+  it('keeps a handoff the AI decided even if the next Claude call fails', async () => {
+    replies.push(
+      {
+        content: [
+          { type: 'text', text: 'Claro, te comunico con un asesor.' },
+          { type: 'tool_use', id: 'tu_p', name: 'handoff_to_human', input: { reason: 'Pidió hablar con una persona' } },
+        ],
+        stop_reason: 'tool_use',
+      },
+      { status: 500, json: { type: 'error', error: { type: 'api_error', message: 'Overloaded' } }, headers: { 'x-should-retry': 'false' } },
+    );
+    const id = await say('5215577770002', 'Quiero hablar con una persona');
+    const c = (await env.api('GET', `/api/contacts/${id}`)).body.contact;
+    expect(c.ai_paused).toBe(true);
+    expect(c.assigned_user_id).toBeTruthy();
+    const msgs = await messagesOf(id);
+    expect(msgs.filter((m: any) => m.direction === 'out').map((m: any) => m.body)).toEqual(['Claro, te comunico con un asesor.']);
+    expect(msgs.some((m: any) => m.type === 'note' && m.body.includes('Pidió hablar con una persona'))).toBe(true);
+    const jobs = await env.built.ctx.db.query(`SELECT status FROM jobs WHERE type = 'ai.reply' AND payload->>'contactId' = $1`, [id]);
+    expect(jobs.rows.map((j: any) => j.status)).toEqual(['done']);
+  });
+
+  it('does not answer contacts who opted out', async () => {
+    const before = claudeCalls().length;
+    const id = await say('5215577770003', 'BAJA');
+    await say('5215577770003', 'hola');
+    await env.built.ctx.queue.enqueue('ai.reply', { workspaceId, contactId: id });
+    await env.drain();
+    expect(claudeCalls().length).toBe(before);
+    expect((await messagesOf(id)).filter((m: any) => m.direction === 'out')).toHaveLength(0);
   });
 });

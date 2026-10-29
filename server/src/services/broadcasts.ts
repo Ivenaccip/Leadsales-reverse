@@ -5,10 +5,10 @@ import { marketFromPhone } from '../lib/phone.js';
 import type { ContactRow } from '../types.js';
 import { getChannel } from '../whatsapp/provider.js';
 import type { TemplateParams } from '../whatsapp/types.js';
-import { normalizeCategory } from './credits.js';
+import { normalizeCategory, roundMoney } from './credits.js';
 import { dispatchWebhook } from './events.js';
 import { sendMessage } from './messages.js';
-import { findTemplate } from './templates.js';
+import { checkTemplateParams, findTemplate } from './templates.js';
 
 export interface Audience {
   funnel_id?: string | null;
@@ -23,10 +23,14 @@ export interface Audience {
 
 /** Values may contain placeholders: {nombre} {primer_nombre} {telefono} {correo} {empresa} {campo.clave} and a default: {primer_nombre|amigo}. */
 export interface BroadcastParams {
-  header?: { type: 'text'; value: string } | { type: 'image' | 'video' | 'document'; link: string; filename?: string };
+  header?:
+    | { type: 'text'; value: string }
+    | { type: 'image' | 'video' | 'document'; link: string; filename?: string }
+    | { type: 'location'; latitude: number; longitude: number; name?: string; address?: string };
   body?: string[];
   bodyNamed?: Record<string, string>;
-  buttons?: { index: number; value: string }[];
+  /** sub_type only matters for a template that is not synced: otherwise its stored components decide. */
+  buttons?: { index: number; value: string; sub_type?: 'url' | 'copy_code' }[];
 }
 
 export interface BroadcastRow {
@@ -75,7 +79,38 @@ export function renderPlaceholders(
   return out.replace(/[\n\t]+/g, ' ').replace(/ {4,}/g, '   ').trim() || '-';
 }
 
-export function resolveParams(p: BroadcastParams, c: ContactRow): TemplateParams {
+/** Renders contact placeholders in template params typed for one contact (inbox, scheduled sends). */
+export function renderTemplateParams(
+  p: TemplateParams | undefined,
+  c: Pick<ContactRow, 'name' | 'phone' | 'email' | 'company' | 'custom_fields'>,
+): TemplateParams | undefined {
+  if (!p) return p;
+  const r = (v: string) => renderPlaceholders(v, c);
+  return {
+    ...p,
+    header: p.header?.type === 'text' ? { type: 'text', text: r(p.header.text) } : p.header,
+    body: p.body?.map(r),
+    bodyNamed: p.bodyNamed ? Object.fromEntries(Object.entries(p.bodyNamed).map(([k, v]) => [k, r(v)])) : undefined,
+    buttons: p.buttons?.map((b) => ({ ...b, text: r(b.text) })),
+  };
+}
+
+// Meta throughput limits: temporary, so the send is retried later instead of failing the recipient.
+const META_THROTTLE_CODES = new Set([4, 80007, 130429, 131056]);
+// Account, number or template problems: every remaining recipient would fail the same way.
+const META_ACCOUNT_CODES = new Set([0, 3, 10, 190, 368, 131005, 131031, 131042, 131045, 131048, 131057, 132000, 132001, 132012, 132015, 132016, 133010]);
+
+export function isMetaThrottle(code: number | null | undefined): boolean {
+  return code != null && META_THROTTLE_CODES.has(code);
+}
+
+export function isMetaAccountError(code: number | null | undefined): boolean {
+  return code != null && (META_ACCOUNT_CODES.has(code) || (code >= 200 && code <= 299));
+}
+
+type PlaceholderContact = Parameters<typeof renderPlaceholders>[1];
+
+export function resolveParams(p: BroadcastParams, c: PlaceholderContact): TemplateParams {
   const out: TemplateParams = {};
   if (p.header) {
     out.header = p.header.type === 'text' ? { type: 'text', text: renderPlaceholders(p.header.value, c) } : { ...p.header };
@@ -85,8 +120,22 @@ export function resolveParams(p: BroadcastParams, c: ContactRow): TemplateParams
   } else if (p.body?.length) {
     out.body = p.body.map((v) => renderPlaceholders(v, c));
   }
-  if (p.buttons?.length) out.buttons = p.buttons.map((b) => ({ index: b.index, text: renderPlaceholders(b.value, c) }));
+  if (p.buttons?.length) {
+    out.buttons = p.buttons.map((b) => ({ index: b.index, text: renderPlaceholders(b.value, c), ...(b.sub_type ? { sub_type: b.sub_type } : {}) }));
+  }
   return out;
+}
+
+// Placeholders always render to non-empty text, so any contact tells whether the params are complete.
+const SAMPLE_CONTACT: PlaceholderContact = { name: 'Cliente', phone: '0', email: null, company: null, custom_fields: {} };
+
+/**
+ * Refuses up front a broadcast whose template LeadLibre cannot send (carousel, catalog...) or
+ * whose params lack something Meta requires (variables, header media or location, coupon code),
+ * instead of failing every recipient at send time. Throws checkTemplateParams' Spanish errors.
+ */
+export function checkBroadcastParams(components: any[], params: BroadcastParams | null | undefined): void {
+  checkTemplateParams(components, resolveParams(params ?? {}, SAMPLE_CONTACT));
 }
 
 /** WHERE clause for an audience; returns SQL using parameters starting at $2 ($1 = workspace id). */
@@ -143,9 +192,9 @@ export async function estimateAudience(
   const prices = await ctx.db.query<{ market: string; price: number }>(`SELECT market, price FROM rate_card WHERE category = $1`, [category]);
   const priceOf = (m: string) => Number(prices.rows.find((r) => r.market === m)?.price ?? prices.rows.find((r) => r.market === 'OTHER')?.price ?? 0);
   const by_market = [...counts.entries()]
-    .map(([market, count]) => ({ market, count, unit_price: priceOf(market), cost: Math.round(priceOf(market) * count * 10000) / 10000 }))
+    .map(([market, count]) => ({ market, count, unit_price: roundMoney(priceOf(market)), cost: roundMoney(priceOf(market) * count) }))
     .sort((a, b) => b.count - a.count);
-  const cost = Math.round(by_market.reduce((s, m) => s + m.cost, 0) * 10000) / 10000;
+  const cost = roundMoney(by_market.reduce((s, m) => s + m.cost, 0));
   const ws = await ctx.db.query<{ billing_mode: string; credit_balance: number }>(`SELECT billing_mode, credit_balance FROM workspaces WHERE id = $1`, [
     workspaceId,
   ]);
@@ -168,6 +217,8 @@ export async function launchBroadcast(ctx: AppContext, workspaceId: string, id: 
   const tpl = await findTemplate(ctx.db, channel.id, b.template_name, b.template_language);
   if (!tpl) throw badRequest('La plantilla no existe en este canal. Sincroniza las plantillas.', 'TEMPLATE_NOT_FOUND');
   if (tpl.status !== 'APPROVED') throw badRequest(`La plantilla no está aprobada (estado: ${tpl.status})`, 'TEMPLATE_NOT_APPROVED');
+  // Also on resume: a sync may have changed the template since the draft was saved.
+  checkBroadcastParams(tpl.components, b.params);
 
   let est: Estimate | null = null;
   if (b.status === 'draft') {
@@ -208,12 +259,26 @@ export async function launchBroadcast(ctx: AppContext, workspaceId: string, id: 
     return true;
   });
   if (!launched) throw badRequest('La difusión cambió de estado mientras la lanzabas. Recarga la página.', 'BROADCAST_CHANGED');
+  if (!future) ctx.queue.notify(); // the job was queued inside the transaction: start it now
   const updated = await getBroadcast(ctx.db, workspaceId, id);
   ctx.realtime.emit(workspaceId, 'broadcast:update', updated);
   return updated;
 }
 
+// Errors that would hit every remaining recipient alike: pause instead of failing them all. The
+// template ones come from a sync that changed the template under a running broadcast.
+// TEMPLATE_PARAMS_INVALID is left out: a coupon filled from a contact field can be too long for
+// that contact only, and pausing would stop on the same contact at every resume.
+const PAUSING_CODES = new Set([
+  'INSUFFICIENT_CREDITS',
+  'NO_CHANNEL',
+  'TEMPLATE_NOT_APPROVED',
+  'WORKSPACE_SUSPENDED',
+  'TEMPLATE_UNSUPPORTED',
+  'TEMPLATE_PARAMS_MISSING',
+]);
 const BATCH = 20;
+const THROTTLE_RETRY_MS = 60_000;
 
 async function pauseBroadcast(ctx: AppContext, b: BroadcastRow, reason: string) {
   await ctx.db.query(`UPDATE broadcasts SET status = 'paused', last_error = $2 WHERE id = $1 AND status = 'running'`, [b.id, reason]);
@@ -261,6 +326,15 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
       [[...pending], st.rows[0]?.status === 'cancelled' ? 'skipped' : 'queued'],
     );
   };
+  const requeue = (rid: string, error: string | null) => {
+    pending.delete(rid);
+    return ctx.db.query(
+      `UPDATE broadcast_recipients SET claimed_at = NULL, message_id = NULL, error = $2,
+         status = CASE WHEN (SELECT status FROM broadcasts WHERE id = $3) = 'cancelled' THEN 'skipped' ELSE 'queued' END
+       WHERE id = $1`,
+      [rid, error, b.id],
+    );
+  };
   const finish = (rid: string, status: string, messageId: string | null, error: string | null) => {
     pending.delete(rid);
     return ctx.db.query(`UPDATE broadcast_recipients SET status = $2, message_id = $3, error = $4, processed_at = now() WHERE id = $1`, [
@@ -272,6 +346,7 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
   };
 
   const gapMs = Math.ceil(1000 / ctx.config.broadcastRatePerSecond);
+  let throttled = false;
   for (const r of claimed.rows) {
     const current = await ctx.db.query<{ status: string }>(`SELECT status FROM broadcasts WHERE id = $1`, [b.id]);
     if (current.rows[0]?.status !== 'running') {
@@ -279,8 +354,10 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
       return;
     }
     // A previous run may have sent this one and died before recording it: never send twice.
+    // A send Meta refused outright (failed, no wamid) never went out, so it may be retried.
     const already = await ctx.db.query<{ id: string; status: string }>(
-      `SELECT id, status FROM messages WHERE broadcast_id = $1 AND contact_id = $2 LIMIT 1`,
+      `SELECT id, status FROM messages WHERE broadcast_id = $1 AND contact_id = $2 AND NOT (status = 'failed' AND wamid IS NULL)
+       ORDER BY created_at DESC LIMIT 1`,
       [b.id, r.contact_id],
     );
     if (already.rows[0]) {
@@ -304,9 +381,28 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
         broadcastId: b.id,
         content: { type: 'template', name: b.template_name, language: b.template_language, params: resolveParams(b.params ?? {}, contact) },
       });
+      const code = msg.error?.code ?? null;
+      if (msg.status === 'failed' && isMetaThrottle(code)) {
+        await requeue(r.id, msg.error?.message ?? null);
+        throttled = true;
+        break;
+      }
+      if (msg.status === 'failed' && isMetaAccountError(code)) {
+        // The recipient stays claimed, so release() puts it back in the queue for the resume.
+        await pauseBroadcast(ctx, b, `Meta rechazó el envío (código ${code}): ${msg.error?.message ?? 'error desconocido'} Corrige el problema y reanuda la difusión.`);
+        await release();
+        return;
+      }
+      if (msg.status === 'unknown') {
+        // Meta may have delivered it: never resend this one, and stop before a Meta outage burns the audience.
+        await finish(r.id, 'sent', msg.id, msg.error?.message ?? null);
+        await pauseBroadcast(ctx, b, 'No pudimos confirmar un envío con Meta (falla de red o de Meta). Revisa que todo funcione y reanuda la difusión.');
+        await release();
+        return;
+      }
       await finish(r.id, msg.status === 'failed' ? 'failed' : 'sent', msg.id, msg.error?.message ?? null);
     } catch (err: any) {
-      if (err instanceof AppError && ['INSUFFICIENT_CREDITS', 'NO_CHANNEL', 'TEMPLATE_NOT_APPROVED', 'WORKSPACE_SUSPENDED'].includes(err.code)) {
+      if (err instanceof AppError && PAUSING_CODES.has(err.code)) {
         await pauseBroadcast(ctx, b, err.message);
         await release();
         return;
@@ -315,6 +411,14 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
     }
     const wait = gapMs - (Date.now() - started);
     if (wait > 0) await new Promise((res) => setTimeout(res, wait));
+  }
+
+  if (throttled) {
+    // Meta asked us to slow down: hand the rest of the batch back and continue in a while.
+    await release();
+    await ctx.queue.enqueue('broadcast.process', { broadcastId: b.id }, { delayMs: THROTTLE_RETRY_MS, dedupeKey: `broadcast:${b.id}` });
+    ctx.realtime.emit(b.workspace_id, 'broadcast:update', await getBroadcast(ctx.db, b.workspace_id, b.id));
+    return;
   }
 
   const left = await ctx.db.query<{ queued: number; sending: number }>(

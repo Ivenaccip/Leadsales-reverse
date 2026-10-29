@@ -1,7 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
-import { badRequest, notFound } from '../lib/errors.js';
+import { badRequest, conflict, notFound } from '../lib/errors.js';
+import { assertSendableMedia, type MediaFile } from '../services/media.js';
 import { ADMIN_ROLES, noContent, parse, requireWs, uuid } from './helpers.js';
 
 const color = z.string().regex(/^#[0-9a-fA-F]{6}$/, 'Color inválido (usa #RRGGBB)');
@@ -233,22 +234,33 @@ export async function crmRoutes(app: FastifyInstance, ctx: AppContext) {
     return { quick_replies: rows };
   });
 
-  async function assertOwnMedia(workspaceId: string, mediaId: string | null | undefined) {
+  // The attachment must be one WhatsApp accepts (type and size per kind): otherwise every use
+  // of the quick reply would fail. Text that the media cannot carry as a caption (audio,
+  // stickers, more than 1024 characters) is sent as a separate message by the send route.
+  async function assertQuickReplyMedia(workspaceId: string, mediaId: string | null | undefined) {
     if (!mediaId) return;
-    const { rows } = await ctx.db.query(`SELECT 1 FROM media_files WHERE id = $1 AND workspace_id = $2`, [mediaId, workspaceId]);
+    const { rows } = await ctx.db.query<MediaFile>(`SELECT * FROM media_files WHERE id = $1 AND workspace_id = $2`, [mediaId, workspaceId]);
     if (!rows[0]) throw notFound('Archivo');
+    await assertSendableMedia(ctx, rows[0]);
   }
+
+  const shortcutTaken = (shortcut: string) => conflict(`Ya existe una respuesta rápida con el atajo /${shortcut}`, 'SHORTCUT_TAKEN');
+  const isUniqueViolation = (err: unknown) => (err as { code?: string })?.code === '23505';
 
   app.post('/api/quick-replies', async (req) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const body = parse(qrSchema, req.body);
-    await assertOwnMedia(a.workspaceId, body.media_file_id);
-    const { rows } = await ctx.db.query(
-      `INSERT INTO quick_replies (workspace_id, shortcut, title, body, media_file_id) VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (workspace_id, shortcut) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, media_file_id = EXCLUDED.media_file_id
-       RETURNING *`,
-      [a.workspaceId, body.shortcut.toLowerCase(), body.title ?? null, body.body, body.media_file_id ?? null],
-    );
+    await assertQuickReplyMedia(a.workspaceId, body.media_file_id);
+    const shortcut = body.shortcut.toLowerCase();
+    // Creating never overwrites an existing quick reply: editing goes through PATCH.
+    const { rows } = await ctx.db
+      .query(
+        `INSERT INTO quick_replies (workspace_id, shortcut, title, body, media_file_id) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+        [a.workspaceId, shortcut, body.title || null, body.body, body.media_file_id ?? null],
+      )
+      .catch((err) => {
+        throw isUniqueViolation(err) ? shortcutTaken(shortcut) : err;
+      });
     return { quick_reply: rows[0] };
   });
 
@@ -256,13 +268,28 @@ export async function crmRoutes(app: FastifyInstance, ctx: AppContext) {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
     const body = parse(qrSchema.partial(), req.body);
-    await assertOwnMedia(a.workspaceId, body.media_file_id);
-    const { rows } = await ctx.db.query(
-      `UPDATE quick_replies SET shortcut = COALESCE($3, shortcut), title = COALESCE($4, title), body = COALESCE($5, body),
-         media_file_id = CASE WHEN $6 THEN $7::uuid ELSE media_file_id END
-       WHERE id = $1 AND workspace_id = $2 RETURNING *`,
-      [id, a.workspaceId, body.shortcut?.toLowerCase() ?? null, body.title ?? null, body.body ?? null, body.media_file_id !== undefined, body.media_file_id ?? null],
-    );
+    await assertQuickReplyMedia(a.workspaceId, body.media_file_id);
+    const shortcut = body.shortcut?.toLowerCase() ?? null;
+    // title and media_file_id are optional: an explicit null (or empty title) clears them.
+    const { rows } = await ctx.db
+      .query(
+        `UPDATE quick_replies SET shortcut = COALESCE($3, shortcut), title = CASE WHEN $8 THEN $4 ELSE title END, body = COALESCE($5, body),
+           media_file_id = CASE WHEN $6 THEN $7::uuid ELSE media_file_id END
+         WHERE id = $1 AND workspace_id = $2 RETURNING *`,
+        [
+          id,
+          a.workspaceId,
+          shortcut,
+          body.title || null,
+          body.body ?? null,
+          body.media_file_id !== undefined,
+          body.media_file_id ?? null,
+          body.title !== undefined,
+        ],
+      )
+      .catch((err) => {
+        throw isUniqueViolation(err) && shortcut ? shortcutTaken(shortcut) : err;
+      });
     if (!rows[0]) throw notFound('Respuesta rápida');
     return { quick_reply: rows[0] };
   });

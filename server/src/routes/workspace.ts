@@ -3,12 +3,14 @@ import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { hashPassword } from '../lib/auth.js';
 import { encrypt } from '../lib/crypto.js';
-import { badRequest, conflict, notFound } from '../lib/errors.js';
+import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { AI_MODELS, DEFAULT_AI_SETTINGS } from '../services/ai-agent.js';
 import { settingsWithDefaults } from '../services/automation.js';
 import { getWorkspace } from '../services/messages.js';
 import type { BotMenu, WorkspaceRow, WorkspaceSettings } from '../types.js';
-import { ADMIN_ROLES, noContent, parse, requireWs, uuid } from './helpers.js';
+import { emailSchema, lockSignups, newPasswordSchema } from './auth.js';
+import { ADMIN_ROLES, noContent, parse, requireWs, uuid, type WsAuth } from './helpers.js';
+import { createInvitation } from './invitations.js';
 
 const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Usa formato HH:MM');
 
@@ -24,10 +26,23 @@ const optionSchema: z.ZodType<any> = z.lazy(() =>
     submenu: menuSchema.nullable().optional(),
   }),
 );
-const menuSchema: z.ZodType<any> = z.object({
-  prompt: z.string().trim().min(1).max(1024),
-  options: z.array(optionSchema).min(1).max(10),
-});
+// Typed answers and the saved bot state find an option by its key: of two options with the same
+// key in one menu, the second could never be reached.
+const menuSchema: z.ZodType<any> = z
+  .object({
+    prompt: z.string().trim().min(1).max(1024),
+    options: z.array(optionSchema).min(1).max(10),
+  })
+  .superRefine((menu, issues) => {
+    const seen = new Set<string>();
+    menu.options?.forEach((o: { key: string }, i: number) => {
+      if (typeof o?.key !== 'string') return;
+      if (seen.has(o.key)) {
+        issues.addIssue({ code: 'custom', path: ['options', i, 'key'], message: `La clave "${o.key}" está repetida en este menú: cada opción necesita una distinta` });
+      }
+      seen.add(o.key);
+    });
+  });
 
 function menuDepth(m: BotMenu | null | undefined): number {
   if (!m?.options?.length) return 0;
@@ -144,34 +159,43 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
     return { members: rows };
   });
 
+  // Adds a teammate. Accounts are global and emails unverified, so an existing account is never
+  // attached and a workspace admin never sets someone's password: everyone gets an invitation link.
+  // Only the instance operator may still create a brand-new account directly with a password.
   app.post('/api/workspace/members', async (req) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const body = parse(
       z.object({
-        email: z.string().trim().toLowerCase().email('Correo inválido'),
-        name: z.string().trim().min(2, 'Escribe el nombre'),
-        password: z.string().min(8, 'La contraseña debe tener al menos 8 caracteres').optional(),
+        email: emailSchema,
+        name: z.string().trim().min(2, 'Escribe el nombre').max(120).optional(),
+        password: newPasswordSchema.optional(),
         role: z.enum(['admin', 'agent']).default('agent'),
       }),
       req.body,
     );
-    const existing = await ctx.db.query<{ id: string }>(`SELECT id FROM users WHERE email = $1`, [body.email]);
-    let userId = existing.rows[0]?.id;
-    if (!userId) {
-      if (!body.password) throw badRequest('Define una contraseña inicial para el nuevo usuario');
-      const u = await ctx.db.query<{ id: string }>(`INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id`, [
-        body.email,
-        await hashPassword(body.password),
-        body.name,
-      ]);
-      userId = u.rows[0].id;
-    }
-    const ins = await ctx.db.query(
-      `INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING user_id`,
-      [a.workspaceId, userId, body.role],
+    const member = await ctx.db.query<{ is_active: boolean }>(
+      `SELECT m.is_active FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.workspace_id = $1 AND u.email = $2`,
+      [a.workspaceId, body.email],
     );
-    if (!ins.rows[0]) throw conflict('Ese usuario ya es parte del equipo');
-    return { id: userId, existing_user: !!existing.rows[0] };
+    if (member.rows[0]) {
+      throw conflict(member.rows[0].is_active ? 'Ese usuario ya es parte del equipo' : 'Ese usuario ya es parte del equipo, pero está desactivado: reactívalo desde la lista');
+    }
+    if (a.user.is_superadmin && body.password) {
+      const hash = await hashPassword(body.password);
+      const userId = await ctx.db.tx(async (q) => {
+        await lockSignups(q);
+        if ((await q.query(`SELECT 1 FROM users WHERE email = $1`, [body.email])).rows[0]) return null;
+        const u = await q.query<{ id: string }>(`INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id`, [
+          body.email,
+          hash,
+          body.name ?? body.email.split('@')[0],
+        ]);
+        await q.query(`INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, $3)`, [a.workspaceId, u.rows[0].id, body.role]);
+        return u.rows[0].id;
+      });
+      if (userId) return { id: userId, existing_user: false };
+    }
+    return createInvitation(ctx, a, { email: body.email, name: body.name, role: body.role });
   });
 
   app.patch('/api/workspace/members/:id', async (req) => {
@@ -181,12 +205,11 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
       z.object({ role: z.enum(['owner', 'admin', 'agent']).optional(), is_active: z.boolean().optional(), receives_leads: z.boolean().optional() }),
       req.body,
     );
-    const target = await ctx.db.query<{ role: string }>(`SELECT role FROM memberships WHERE workspace_id = $1 AND user_id = $2`, [a.workspaceId, id]);
-    if (!target.rows[0]) throw notFound('Miembro');
-    if ((body.role === 'owner' || target.rows[0].role === 'owner') && a.role !== 'owner') {
+    const target = await memberOf(ctx, a, id);
+    if ((body.role === 'owner' || target.role === 'owner') && a.role !== 'owner') {
       throw badRequest('Solo un propietario puede cambiar a otro propietario');
     }
-    if (target.rows[0].role === 'owner' && (body.role && body.role !== 'owner' || body.is_active === false)) {
+    if (target.role === 'owner' && (body.role && body.role !== 'owner' || body.is_active === false)) {
       const owners = await ctx.db.query<{ n: number }>(
         `SELECT count(*)::int AS n FROM memberships WHERE workspace_id = $1 AND role = 'owner' AND is_active`,
         [a.workspaceId],
@@ -199,15 +222,15 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
       [a.workspaceId, id, body.role ?? null, body.is_active ?? null, body.receives_leads ?? null],
     );
     if (body.role || body.is_active !== undefined) await ctx.realtime.evict(a.workspaceId, id);
+    if (body.is_active === false) await endSessionsWithoutWorkspace(ctx, id);
     return { ok: true };
   });
 
   app.delete('/api/workspace/members/:id', async (req, reply) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
-    const target = await ctx.db.query<{ role: string }>(`SELECT role FROM memberships WHERE workspace_id = $1 AND user_id = $2`, [a.workspaceId, id]);
-    if (!target.rows[0]) throw notFound('Miembro');
-    if (target.rows[0].role === 'owner') {
+    const target = await memberOf(ctx, a, id);
+    if (target.role === 'owner') {
       if (a.role !== 'owner') throw badRequest('Solo un propietario puede quitar a otro propietario');
       const owners = await ctx.db.query<{ n: number }>(`SELECT count(*)::int AS n FROM memberships WHERE workspace_id = $1 AND role = 'owner'`, [
         a.workspaceId,
@@ -217,6 +240,34 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
     await ctx.db.query(`UPDATE contacts SET assigned_user_id = NULL WHERE workspace_id = $1 AND assigned_user_id = $2`, [a.workspaceId, id]);
     await ctx.db.query(`DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2`, [a.workspaceId, id]);
     await ctx.realtime.evict(a.workspaceId, id);
+    await endSessionsWithoutWorkspace(ctx, id);
     return noContent(reply);
   });
+}
+
+/** A member of the caller's workspace; the instance operator's membership is only theirs to change. */
+async function memberOf(ctx: AppContext, a: WsAuth, userId: string) {
+  const { rows } = await ctx.db.query<{ role: string; is_superadmin: boolean }>(
+    `SELECT m.role, u.is_superadmin FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.workspace_id = $1 AND m.user_id = $2`,
+    [a.workspaceId, userId],
+  );
+  if (!rows[0]) throw notFound('Miembro');
+  if (rows[0].is_superadmin && !a.user.is_superadmin) throw forbidden('Solo el administrador de la instancia puede cambiar su propio acceso');
+  return rows[0];
+}
+
+/**
+ * Someone deactivated or removed from their last workspace has no reason to stay signed in:
+ * their sessions end and their open tabs are sent to the login ('session:revoked').
+ * Members of other workspaces keep their session (one tenant cannot log them out elsewhere).
+ */
+async function endSessionsWithoutWorkspace(ctx: AppContext, userId: string) {
+  const { rows } = await ctx.db.query<{ is_superadmin: boolean; has_workspace: boolean }>(
+    `SELECT u.is_superadmin, EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = u.id AND m.is_active) AS has_workspace
+     FROM users u WHERE u.id = $1`,
+    [userId],
+  );
+  if (!rows[0] || rows[0].is_superadmin || rows[0].has_workspace) return;
+  await ctx.db.query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
+  await ctx.realtime.endSessions({ userId });
 }

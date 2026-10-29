@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { badRequest } from '../lib/errors.js';
 import { topup } from '../services/credits.js';
+import { disableUnverifiedCloudChannels } from './channels.js';
 import { parse, requireSuperadmin, uuid } from './helpers.js';
 
 const MARKETS = ['MX', 'CO', 'BR', 'AR', 'CL', 'PE', 'ES', 'NA', 'LATAM', 'OTHER'];
@@ -47,6 +48,7 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
       [id, body.billing_mode ?? null, body.is_active ?? null],
     );
     if (!rows[0]) throw badRequest('Espacio no encontrado');
+    if (body.billing_mode === 'prepaid') await disableUnverifiedCloudChannels(ctx, id);
     if (body.is_active === false) await ctx.realtime.evict(id);
     return { workspace: rows[0] };
   });
@@ -115,6 +117,8 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
     const body = parse(z.object({ is_superadmin: z.boolean() }), req.body);
     if (id === me.id && !body.is_superadmin) throw badRequest('No puedes quitarte a ti mismo el rol de administrador');
     await ctx.db.query(`UPDATE users SET is_superadmin = $2 WHERE id = $1`, [id, body.is_superadmin]);
+    // Open sockets joined foreign workspaces as superadmin: make them re-join with the new rights.
+    if (!body.is_superadmin) await ctx.realtime.evictUser(id);
     return { ok: true };
   });
 }

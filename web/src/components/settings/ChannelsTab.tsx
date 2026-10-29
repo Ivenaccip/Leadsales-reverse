@@ -2,9 +2,9 @@ import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, FlaskConical, MessageCircle, PlugZap, Plus, Send, Star, Trash2 } from 'lucide-react';
 import { api, errorMessage } from '../../lib/api';
-import { useChannels } from '../../lib/queries';
+import { useChannels, useWorkspace } from '../../lib/queries';
 import { useSession } from '../../lib/session';
-import type { Channel } from '../../lib/types';
+import type { BillingMode, Channel } from '../../lib/types';
 import { Alert, Badge, Button, Card, CopyField, EmptyState, Field, Input, Modal, PageLoader, useConfirm, useToast } from '../ui';
 
 const STEPS = [
@@ -169,61 +169,194 @@ function SimulateBox({ channel }: { channel: Channel }) {
   );
 }
 
-function EditChannelModal({ channel, onClose }: { channel: Channel; onClose: () => void }) {
+export interface ChannelEditForm {
+  name: string;
+  waba_id: string;
+  access_token: string;
+  app_secret: string;
+}
+
+/**
+ * Only what the user changed: the server treats any waba_id as a credential change (Meta
+ * verification, and refused to tenants in prepaid workspaces), so an unchanged one is not resent.
+ */
+export function channelPatch(channel: Channel, form: ChannelEditForm): Record<string, string> {
+  const out: Record<string, string> = {};
+  const name = form.name.trim();
+  if (name && name !== channel.name) out.name = name;
+  if (channel.provider === 'cloud_api') {
+    const waba = form.waba_id.trim();
+    if (waba && waba !== (channel.waba_id ?? '')) out.waba_id = waba;
+    if (form.access_token.trim()) out.access_token = form.access_token.trim();
+    if (form.app_secret.trim()) out.app_secret = form.app_secret.trim();
+  }
+  return out;
+}
+
+/** In prepaid workspaces only the instance operator connects and edits official numbers (the server enforces it). */
+export function canManageCloudChannels(billingMode: BillingMode | undefined, isSuperadmin: boolean): boolean {
+  return isSuperadmin || billingMode !== 'prepaid';
+}
+
+/**
+ * A cloud number whose credentials the business may know cannot work in a prepaid workspace (the
+ * switch to prepaid disabled it): the operator must re-key it with their own Meta app.
+ */
+export function needsOperatorVerification(channel: Channel, billingMode: BillingMode | undefined): boolean {
+  return channel.provider === 'cloud_api' && billingMode === 'prepaid' && !channel.operator_verified;
+}
+
+/**
+ * Why an edit would leave such a number unverified, or null. The server verifies it only with both
+ * a token and a new App Secret: a secret alone is refused, a token alone is saved but the number
+ * stays disabled, so neither is sent.
+ */
+export function verificationGap(channel: Channel, billingMode: BillingMode | undefined, form: ChannelEditForm): string | null {
+  if (!needsOperatorVerification(channel, billingMode)) return null;
+  const token = !!form.access_token.trim();
+  const secret = !!form.app_secret.trim();
+  if (token === secret) return null;
+  return token
+    ? 'Captura también una clave secreta (App Secret) nueva de tu propia app de Meta: sin ella el número sigue desactivado.'
+    : 'Captura también el token de acceso de tu propia app de Meta: sin él no se puede verificar el número.';
+}
+
+/** What the operator must do to bring back a number disabled by the switch to prepaid. */
+export function PrepaidVerificationNote() {
+  return (
+    <Alert tone="warning" title="Verificación del operador pendiente">
+      Para reactivar este número en modo prepagado, abre <b>Editar</b> y captura los dos datos de <b>tu propia app de Meta</b>: el token de acceso
+      y una clave secreta (App Secret) <b>nueva</b>. La App Secret que el negocio ya conoce no sirve. Después configura el webhook de esa app.
+    </Alert>
+  );
+}
+
+export interface ChannelSaveNotice {
+  channel: Channel;
+  warnings: string[];
+  verified: boolean;
+}
+
+/**
+ * What to show after a PATCH before closing, or null: Meta subscription warnings (like on
+ * connect), and for a number the operator just verified, the webhook its new app needs.
+ */
+export function channelSaveNotice(before: Channel, r: { channel: Channel; warnings?: string[] }): ChannelSaveNotice | null {
+  const warnings = r.warnings ?? [];
+  const verified = !before.operator_verified && !!r.channel.operator_verified;
+  return warnings.length || verified ? { channel: r.channel, warnings, verified } : null;
+}
+
+export function ChannelSavedNotice({ notice }: { notice: ChannelSaveNotice }) {
+  return (
+    <div className="space-y-4">
+      {notice.verified && (
+        <Alert tone="success">
+          {notice.channel.status === 'active' ? 'Número verificado y activado.' : 'Número verificado.'} Para recibir mensajes, configura el webhook de tu
+          app de Meta con estos datos.
+        </Alert>
+      )}
+      {notice.warnings.map((w) => (
+        <Alert key={w} tone="warning">
+          {w}
+        </Alert>
+      ))}
+      {notice.verified && <WebhookBox channel={notice.channel} />}
+    </div>
+  );
+}
+
+function EditChannelModal({
+  channel,
+  credentialsLocked,
+  billingMode,
+  onClose,
+}: {
+  channel: Channel;
+  credentialsLocked: boolean;
+  billingMode: BillingMode | undefined;
+  onClose: () => void;
+}) {
   const toast = useToast();
   const qc = useQueryClient();
-  const [form, setForm] = useState({ name: channel.name, waba_id: channel.waba_id ?? '', access_token: '', app_secret: '' });
+  const [form, setForm] = useState<ChannelEditForm>({ name: channel.name, waba_id: channel.waba_id ?? '', access_token: '', app_secret: '' });
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState<ChannelSaveNotice | null>(null);
+  const changes = channelPatch(channel, form);
+  const gap = credentialsLocked ? null : verificationGap(channel, billingMode, form);
+  const reverify = !credentialsLocked && needsOperatorVerification(channel, billingMode);
   const save = useMutation({
-    mutationFn: () =>
-      api.patch(`/api/channels/${channel.id}`, {
-        name: form.name,
-        ...(form.waba_id && channel.provider === 'cloud_api' ? { waba_id: form.waba_id } : {}),
-        ...(form.access_token ? { access_token: form.access_token } : {}),
-        ...(form.app_secret ? { app_secret: form.app_secret } : {}),
-      }),
-    onSuccess: () => {
-      toast.success('Canal actualizado');
+    mutationFn: () => api.patch<{ channel: Channel; warnings?: string[] }>(`/api/channels/${channel.id}`, changes),
+    onMutate: () => setError(null),
+    onSuccess: (r) => {
       void qc.invalidateQueries({ queryKey: ['channels'] });
+      const notice = channelSaveNotice(channel, r);
+      if (notice) {
+        setSaved(notice);
+        return;
+      }
+      toast.success('Canal actualizado');
       onClose();
     },
-    onError: (e) => toast.error(errorMessage(e)),
+    // APP_SECRET_NOT_NEW, OPERATOR_VERIFICATION_REQUIRED and Meta errors come in Spanish: show them by the fields.
+    onError: (e) => setError(errorMessage(e)),
   });
+  if (saved) {
+    return (
+      <Modal open onClose={onClose} title="Canal actualizado" size="lg" footer={<Button onClick={onClose}>Listo</Button>}>
+        <ChannelSavedNotice notice={saved} />
+      </Modal>
+    );
+  }
   return (
     <Modal
       open
       onClose={onClose}
       title="Editar canal"
       footer={
-        <Button onClick={() => save.mutate()} loading={save.isPending}>
+        <Button onClick={() => save.mutate()} loading={save.isPending} disabled={!Object.keys(changes).length || !!gap}>
           Guardar
         </Button>
       }
     >
       <div className="space-y-4">
+        {error && <Alert tone="error">{error}</Alert>}
         <Field label="Nombre">
           <Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
         </Field>
-        {channel.provider === 'cloud_api' && (
-          <>
-            <Field label="WABA ID">
-              <Input value={form.waba_id} onChange={(e) => setForm({ ...form, waba_id: e.target.value })} />
-            </Field>
-            <Field label="Nuevo token de acceso" hint="Déjalo vacío para conservar el actual.">
-              <Input type="password" value={form.access_token} onChange={(e) => setForm({ ...form, access_token: e.target.value })} />
-            </Field>
-            <Field label="Nueva clave secreta de la app" hint="Déjalo vacío para conservar la actual.">
-              <Input type="password" value={form.app_secret} onChange={(e) => setForm({ ...form, app_secret: e.target.value })} />
-            </Field>
-          </>
-        )}
+        {channel.provider === 'cloud_api' &&
+          (credentialsLocked ? (
+            <Alert tone="info">El administrador de la instancia gestiona la cuenta de WhatsApp, el token y la clave secreta de este número.</Alert>
+          ) : (
+            <>
+              {reverify && (
+                <Alert tone="info" title="Verifica este número con tu propia app de Meta">
+                  En modo prepagado el número solo funciona con credenciales que el negocio no conozca: captura el token de acceso y una clave secreta
+                  (App Secret) nueva, ambos de tu propia app de Meta. Al guardarlos se verifica y se reactiva.
+                </Alert>
+              )}
+              <Field label="WABA ID">
+                <Input value={form.waba_id} onChange={(e) => setForm({ ...form, waba_id: e.target.value })} />
+              </Field>
+              <Field label="Nuevo token de acceso" hint="Déjalo vacío para conservar el actual.">
+                <Input type="password" value={form.access_token} onChange={(e) => setForm({ ...form, access_token: e.target.value })} />
+              </Field>
+              <Field label="Nueva clave secreta de la app" hint="Déjalo vacío para conservar la actual." error={gap}>
+                <Input type="password" value={form.app_secret} onChange={(e) => setForm({ ...form, app_secret: e.target.value })} />
+              </Field>
+            </>
+          ))}
       </div>
     </Modal>
   );
 }
 
 export function ChannelsTab() {
-  const { isAdmin } = useSession();
+  const { isAdmin, user, workspace } = useSession();
   const channels = useChannels();
+  const ws = useWorkspace();
+  const billingMode = ws.data?.workspace.billing_mode ?? workspace?.billing_mode;
+  const manageCloud = canManageCloudChannels(billingMode, !!user?.is_superadmin);
   const qc = useQueryClient();
   const toast = useToast();
   const confirm = useConfirm();
@@ -286,11 +419,22 @@ export function ChannelsTab() {
     <div className="space-y-6">
       {isAdmin && (
         <div className="grid gap-4 md:grid-cols-2">
-          <button onClick={() => setConnecting(true)} className="rounded-xl border-2 border-dashed border-brand-300 bg-brand-50/50 p-5 text-left transition hover:border-brand-500 hover:bg-brand-50">
-            <MessageCircle className="h-6 w-6 text-brand-600" />
-            <p className="mt-2 font-semibold text-slate-900">Conectar WhatsApp API oficial</p>
-            <p className="mt-1 text-sm text-slate-600">Tu propio número con la Cloud API de Meta. Sin mensualidad: pagas a Meta solo lo que envías.</p>
-          </button>
+          {manageCloud ? (
+            <button onClick={() => setConnecting(true)} className="rounded-xl border-2 border-dashed border-brand-300 bg-brand-50/50 p-5 text-left transition hover:border-brand-500 hover:bg-brand-50">
+              <MessageCircle className="h-6 w-6 text-brand-600" />
+              <p className="mt-2 font-semibold text-slate-900">Conectar WhatsApp API oficial</p>
+              <p className="mt-1 text-sm text-slate-600">Tu propio número con la Cloud API de Meta. Sin mensualidad: pagas a Meta solo lo que envías.</p>
+            </button>
+          ) : (
+            <div className="rounded-xl border border-brand-200 bg-brand-50/50 p-5 text-left">
+              <MessageCircle className="h-6 w-6 text-brand-600" />
+              <p className="mt-2 font-semibold text-slate-900">Números oficiales de WhatsApp</p>
+              <p className="mt-1 text-sm text-slate-600">
+                Este espacio usa créditos prepagados: el administrador de la instancia conecta y edita los números oficiales. Pídele que conecte el
+                tuyo; aparecerá aquí en cuanto lo haga.
+              </p>
+            </div>
+          )}
           <button
             onClick={() => sandbox.mutate()}
             disabled={sandbox.isPending}
@@ -334,9 +478,11 @@ export function ChannelsTab() {
                     <Button size="sm" variant="outline" onClick={() => test(c)} icon={<CheckCircle2 className="h-4 w-4" />}>
                       Probar conexión
                     </Button>
-                    <Button size="sm" variant="outline" onClick={() => subscribe(c)}>
-                      Re-suscribir webhook
-                    </Button>
+                    {manageCloud && (
+                      <Button size="sm" variant="outline" onClick={() => subscribe(c)}>
+                        Re-suscribir webhook
+                      </Button>
+                    )}
                   </>
                 )}
                 {!c.is_default && (
@@ -347,14 +493,18 @@ export function ChannelsTab() {
                 <Button size="sm" variant="ghost" onClick={() => setEditing(c)}>
                   Editar
                 </Button>
-                <Button size="sm" variant="ghost" onClick={() => remove(c)} icon={<Trash2 className="h-4 w-4 text-red-500" />} />
+                {(c.provider !== 'cloud_api' || manageCloud) && (
+                  <Button size="sm" variant="ghost" onClick={() => remove(c)} icon={<Trash2 className="h-4 w-4 text-red-500" />} />
+                )}
               </>
             )
           }
         >
           <div className="space-y-4">
             {c.last_error && <Alert tone="error" title="Último error">{c.last_error}</Alert>}
-            {c.provider === 'cloud_api' ? <WebhookBox channel={c} /> : <SimulateBox channel={c} />}
+            {isAdmin && manageCloud && c.status === 'disabled' && needsOperatorVerification(c, billingMode) && <PrepaidVerificationNote />}
+            {/* The simulator writes as if a customer did: owners and admins only (the server refuses agents). */}
+            {c.provider === 'cloud_api' ? <WebhookBox channel={c} /> : isAdmin && <SimulateBox channel={c} />}
           </div>
         </Card>
       ))}
@@ -384,7 +534,7 @@ export function ChannelsTab() {
           </div>
         )}
       </Modal>
-      {editing && <EditChannelModal channel={editing} onClose={() => setEditing(null)} />}
+      {editing && <EditChannelModal channel={editing} credentialsLocked={!manageCloud} billingMode={billingMode} onClose={() => setEditing(null)} />}
     </div>
   );
 }

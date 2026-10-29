@@ -4,6 +4,7 @@ import type { AppContext } from '../context.js';
 import { badRequest } from '../lib/errors.js';
 import {
   broadcastStats,
+  checkBroadcastParams,
   estimateAudience,
   getBroadcast,
   launchBroadcast,
@@ -29,11 +30,20 @@ const paramsSchema = z.object({
     .union([
       z.object({ type: z.literal('text'), value: z.string().min(1).max(200) }),
       z.object({ type: z.enum(['image', 'video', 'document']), link: z.string().url(), filename: z.string().optional() }),
+      z.object({
+        type: z.literal('location'),
+        latitude: z.number().min(-90).max(90),
+        longitude: z.number().min(-180).max(180),
+        name: z.string().trim().max(1000).optional(),
+        address: z.string().trim().max(1000).optional(),
+      }),
     ])
     .optional(),
   body: z.array(z.string().min(1).max(1024)).max(30).optional(),
   bodyNamed: z.record(z.string(), z.string().min(1).max(1024)).optional(),
-  buttons: z.array(z.object({ index: z.number().int().min(0).max(9), value: z.string().min(1).max(200) })).optional(),
+  buttons: z
+    .array(z.object({ index: z.number().int().min(0).max(9), value: z.string().min(1).max(200), sub_type: z.enum(['url', 'copy_code']).optional() }))
+    .optional(),
 });
 
 const createSchema = z.object({
@@ -45,6 +55,10 @@ const createSchema = z.object({
   audience: audienceSchema.default({}),
   scheduled_at: z.string().datetime({ offset: true }).nullable().optional(),
 });
+
+// .partial() keeps .default({}): a PATCH that omits params/audience would reset them to {}
+// (an empty audience means every contact).
+const patchSchema = createSchema.extend({ params: paramsSchema.optional(), audience: audienceSchema.optional() }).partial();
 
 async function withStats(ctx: AppContext, b: BroadcastRow) {
   return { ...b, stats: await broadcastStats(ctx.db, b.id) };
@@ -77,9 +91,13 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
     const channel = await getChannel(ctx.db, a.workspaceId, body.channel_id);
     const tpl = await findTemplate(ctx.db, channel.id, body.template_name, body.template_language);
     if (!tpl) throw badRequest('Esa plantilla no existe en el canal elegido');
+    checkBroadcastParams(tpl.components, body.params);
+    // Drafts show this estimate in the list and detail; launch recomputes it before charging.
+    const est = await estimateAudience(ctx, a.workspaceId, body.audience, tpl.category);
     const { rows } = await ctx.db.query<BroadcastRow>(
-      `INSERT INTO broadcasts (workspace_id, channel_id, name, template_name, template_language, template_category, params, audience, scheduled_at, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      `INSERT INTO broadcasts (workspace_id, channel_id, name, template_name, template_language, template_category, params, audience, scheduled_at,
+         created_by, total_recipients, estimated_cost)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
       [
         a.workspaceId,
         channel.id,
@@ -91,6 +109,8 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
         JSON.stringify(body.audience),
         body.scheduled_at ?? null,
         a.user.id,
+        est.recipients,
+        est.cost,
       ],
     );
     return { broadcast: await withStats(ctx, rows[0]) };
@@ -105,14 +125,22 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
   app.patch('/api/broadcasts/:id', async (req) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
-    const body = parse(createSchema.partial(), req.body);
+    const body = parse(patchSchema, req.body);
     const b = await getBroadcast(ctx.db, a.workspaceId, id);
     if (b.status !== 'draft') throw badRequest('Solo puedes editar difusiones en borrador');
+    // Resolve the channel inside this workspace (a foreign or unknown id is a 400, never stored)
+    // and check the template exists there, like POST does.
+    const channel = await getChannel(ctx.db, a.workspaceId, body.channel_id ?? b.channel_id);
+    const tpl = await findTemplate(ctx.db, channel.id, body.template_name ?? b.template_name, body.template_language ?? b.template_language);
+    if (!tpl) throw badRequest('Esa plantilla no existe en el canal elegido');
+    // The stored params must fit a newly chosen template (or channel) too; a rename alone checks nothing.
+    if (body.template_name || body.template_language || body.channel_id || body.params) checkBroadcastParams(tpl.components, body.params ?? b.params);
+    const est = await estimateAudience(ctx, a.workspaceId, body.audience ?? b.audience, tpl.category);
     const { rows } = await ctx.db.query<BroadcastRow>(
       `UPDATE broadcasts SET name = COALESCE($2, name), template_name = COALESCE($3, template_name), template_language = COALESCE($4, template_language),
          params = COALESCE($5, params), audience = COALESCE($6, audience), scheduled_at = CASE WHEN $7 THEN $8::timestamptz ELSE scheduled_at END,
-         channel_id = COALESCE($9, channel_id)
-       WHERE id = $1 RETURNING *`,
+         channel_id = $9, template_category = $10, total_recipients = $11, estimated_cost = $12
+       WHERE id = $1 AND status = 'draft' RETURNING *`,
       [
         id,
         body.name ?? null,
@@ -122,9 +150,13 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
         body.audience ? JSON.stringify(body.audience) : null,
         body.scheduled_at !== undefined,
         body.scheduled_at ?? null,
-        body.channel_id ?? null,
+        channel.id,
+        tpl.category,
+        est.recipients,
+        est.cost,
       ],
     );
+    if (!rows[0]) throw badRequest('Solo puedes editar difusiones en borrador');
     return { broadcast: await withStats(ctx, rows[0]) };
   });
 

@@ -8,7 +8,7 @@ import { stageMap, useChannels, useFunnels, useMembers, useTags } from '../../li
 import type { Contact, Paged } from '../../lib/types';
 import { StageSelect } from '../pickers';
 import { Avatar, Button, cx, EmptyState, Select, Spinner } from '../ui';
-import type { ConversationFilters, InboxTab } from './helpers';
+import { LIVE_QUERY, type ConversationFilters, type InboxTab } from './helpers';
 
 const PAGE_SIZE = 30;
 
@@ -46,7 +46,7 @@ export function ConversationList({ selectedId, onSelect, className }: { selected
   const stages = useMemo(() => stageMap(funnels.data), [funnels.data]);
   const memberName = useMemo(() => new Map((members.data ?? []).map((m) => [m.id, m.name])), [members.data]);
 
-  const counts = useQuery({ queryKey: ['contact-counts'], queryFn: () => api.get<Counts>('/api/contacts/counts') });
+  const counts = useQuery({ queryKey: ['contact-counts'], queryFn: () => api.get<Counts>('/api/contacts/counts'), ...LIVE_QUERY });
 
   const list = useInfiniteQuery({
     queryKey: ['conversations', filters],
@@ -66,6 +66,7 @@ export function ConversationList({ selectedId, onSelect, className }: { selected
         })}`,
       ),
     getNextPageParam: (last) => (last.page * last.limit < last.total ? last.page + 1 : undefined),
+    ...LIVE_QUERY,
   });
 
   const items = list.data?.pages.flatMap((p) => p.items) ?? [];

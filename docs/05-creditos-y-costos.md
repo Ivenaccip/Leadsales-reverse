@@ -28,7 +28,17 @@ Mensaje fallido ─────────────────────�
 - **Conciliación**: con el primer webhook que trae `pricing`, LeadLibre ajusta el cargo
   al costo real (por ejemplo, una plantilla de utilidad enviada dentro de la ventana de
   servicio es gratis → se reembolsa). Se procesa una sola vez por mensaje.
-- **Fallos**: si Meta rechaza o no entrega el mensaje, se reembolsa.
+- **Fallos**: si Meta rechaza o no entrega el mensaje, se reembolsa. Meta solo cobra lo
+  entregado: un mensaje que ya se había conciliado como cobrable al pasar a "enviado" y
+  después falla sin entregarse también recupera su cargo.
+- **Sin confirmar**: si la respuesta de Meta a un envío se pierde (falla de red, tiempo
+  agotado o error 5xx de Meta), el mensaje queda "Sin confirmar" (`unknown`). Meta pudo
+  haberlo entregado y cobrado, así que el cargo se conserva y LeadLibre no lo reenvía
+  solo. Cuando llegan los webhooks de estado de Meta (las plantillas llevan el id del
+  mensaje para reconocerlo), se concilia o se reembolsa como cualquier otro.
+- **Cada cargo recuerda su modo**: los reembolsos y ajustes de un mensaje van a donde fue
+  su cargo (el saldo prepagado o el gasto medido de `meta_direct`), según el modo del
+  espacio al enviarlo. Cambiar de modo con mensajes en camino no crea ni pierde créditos.
 - Todo queda en **Créditos → Movimientos** (libro contable por espacio).
 
 ## Dos modos (por espacio de trabajo)
@@ -50,6 +60,11 @@ Latinoamérica y resto del mundo. **Meta las actualiza cada trimestre**: el
 administrador debe revisarlas en la tabla oficial de precios de la WhatsApp Business
 Platform y editarlas en **Administración → Tarifas de Meta**. La conciliación con el
 webhook corrige la categoría y si fue cobrable, pero el monto sale de esta tabla.
+
+El mercado sale de la lada del contacto. La lada +1 no es solo Norteamérica: EE. UU. y
+Canadá usan la tarifa de EE. UU./Canadá; República Dominicana, Puerto Rico y Jamaica, la
+de resto de Latinoamérica; y el resto del Caribe y territorios con +1 (Bahamas, Trinidad
+y Tobago, Barbados…), la de resto del mundo.
 
 ## Estimar una campaña
 

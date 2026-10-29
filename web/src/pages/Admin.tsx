@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Navigate } from 'react-router-dom';
+import { Navigate, useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Building2, Coins, MessageCircle, Users } from 'lucide-react';
+import { AlertTriangle, Building2, Coins, LogIn, MessageCircle, Users } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
 import { CATEGORY_LABEL, credits, dateTime, MARKET_LABEL, number } from '../lib/format';
 import { useSession } from '../lib/session';
@@ -147,7 +147,8 @@ function RatesEditor() {
 }
 
 export default function AdminPage() {
-  const { user } = useSession();
+  const { user, switchWorkspace } = useSession();
+  const navigate = useNavigate();
   const toast = useToast();
   const qc = useQueryClient();
   const [tab, setTab] = useState<'workspaces' | 'rates' | 'users'>('workspaces');
@@ -180,6 +181,12 @@ export default function AdminPage() {
     } catch (e) {
       toast.error(errorMessage(e));
     }
+  }
+
+  // The operator works inside any workspace as owner (e.g. to connect its numbers in prepaid mode).
+  function openWorkspace(w: AdminWorkspace) {
+    switchWorkspace(w.id, { id: w.id, name: w.name, role: 'owner', billing_mode: w.billing_mode, is_active: w.is_active });
+    navigate('/ajustes/canales');
   }
 
   async function toggleSuper(u: AdminUser) {
@@ -264,9 +271,14 @@ export default function AdminPage() {
                           <Toggle checked={w.is_active} onChange={(v) => patchWs(w, { is_active: v })} />
                         </td>
                         <td className="px-4 py-3 text-right">
-                          <Button size="sm" variant="outline" onClick={() => setTopup(w)}>
-                            Créditos
-                          </Button>
+                          <div className="flex justify-end gap-2">
+                            <Button size="sm" variant="outline" onClick={() => openWorkspace(w)} icon={<LogIn className="h-4 w-4" />}>
+                              Abrir
+                            </Button>
+                            <Button size="sm" variant="outline" onClick={() => setTopup(w)}>
+                              Créditos
+                            </Button>
+                          </div>
                         </td>
                       </tr>
                     ))}

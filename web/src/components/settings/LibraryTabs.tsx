@@ -6,6 +6,7 @@ import { useQuickReplies, useTags } from '../../lib/queries';
 import { useSession } from '../../lib/session';
 import type { QuickReply, Tag } from '../../lib/types';
 import { PLACEHOLDERS } from '../TemplateForm';
+import { WA_MEDIA_ACCEPT } from '../inbox/helpers';
 import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageLoader, TagChip, Textarea, useConfirm, useToast } from '../ui';
 
 const COLORS = ['#ef4444', '#f97316', '#f59e0b', '#22c55e', '#10b981', '#0ea5e9', '#3b82f6', '#8b5cf6', '#ec4899', '#64748b'];
@@ -180,7 +181,17 @@ function QuickReplyModal({ reply, onClose }: { reply: Partial<QuickReply> | null
           ))}
         </div>
         <div className="flex items-center gap-3">
-          <input ref={fileRef} type="file" className="hidden" onChange={(e) => e.target.files?.[0] && upload(e.target.files[0])} />
+          <input
+            ref={fileRef}
+            type="file"
+            className="hidden"
+            accept={WA_MEDIA_ACCEPT}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = '';
+              if (file) void upload(file);
+            }}
+          />
           <Button type="button" variant="outline" size="sm" loading={uploading} onClick={() => fileRef.current?.click()} icon={<Paperclip className="h-4 w-4" />}>
             {form.media_file_id ? 'Cambiar adjunto' : 'Adjuntar archivo'}
           </Button>

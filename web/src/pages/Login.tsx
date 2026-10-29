@@ -13,7 +13,7 @@ interface Instance {
   defaultBillingMode: string;
 }
 
-function AuthShell({ children }: { children: React.ReactNode }) {
+export function AuthShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex min-h-full flex-col lg:flex-row">
       <div className="flex flex-col justify-between bg-brand-800 px-8 py-10 text-white lg:w-[44%] lg:px-14">
@@ -50,7 +50,8 @@ export function LoginPage() {
   const { setSession, user } = useSession();
   const location = useLocation();
   const instance = useQuery({ queryKey: ['instance'], queryFn: () => api.get<Instance>('/api/instance') });
-  const [email, setEmail] = useState('');
+  // An invitation link sends here with the invited email filled in.
+  const [email, setEmail] = useState((location.state as { email?: string } | null)?.email ?? '');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);

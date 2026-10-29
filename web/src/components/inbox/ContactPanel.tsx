@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import {
+  AlertTriangle,
   Archive,
   ArchiveRestore,
   Ban,
@@ -99,6 +100,38 @@ function EditableText({
   );
 }
 
+/** Pending messages (cancel) and recent failures (with the reason, to dismiss once seen). */
+export function ScheduledList({ items, onCancel, onDismiss }: { items: ScheduledMessage[]; onCancel: (id: string) => void; onDismiss: (id: string) => void }) {
+  return (
+    <ul className="space-y-2">
+      {items.map((s) => {
+        const failed = s.status === 'failed';
+        return (
+          <li key={s.id} className={cx('flex items-start gap-2 rounded-lg p-2 text-sm', failed ? 'bg-red-50' : 'bg-slate-50')}>
+            <div className="min-w-0 flex-1">
+              <p className={cx('flex items-center gap-1 text-xs font-medium', failed ? 'text-red-700' : 'text-slate-700')}>
+                {failed && <AlertTriangle className="h-3.5 w-3.5 shrink-0" />}
+                {failed ? `No se envió · ${dateTime(s.send_at)}` : dateTime(s.send_at)}
+              </p>
+              <p className="truncate text-xs text-slate-500">{s.content.type === 'text' ? s.content.text : `Plantilla ${s.content.name}`}</p>
+              {failed && <p className="mt-1 text-xs text-red-700">{s.error ?? 'Error desconocido'}</p>}
+            </div>
+            {failed ? (
+              <IconButton title="Descartar aviso" className="h-7 w-7" onClick={() => onDismiss(s.id)}>
+                <X className="h-4 w-4" />
+              </IconButton>
+            ) : (
+              <IconButton title="Cancelar envío" className="h-7 w-7" onClick={() => onCancel(s.id)}>
+                <X className="h-4 w-4" />
+              </IconButton>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="grid grid-cols-[88px_1fr] items-center gap-2 text-sm">
@@ -108,7 +141,7 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function eventText(e: ContactEvent, memberName: (id: string | null | undefined) => string): string {
+export function eventText(e: ContactEvent, memberName: (id: string | null | undefined) => string): string {
   const d = e.data ?? {};
   switch (e.type) {
     case 'created':
@@ -119,6 +152,11 @@ function eventText(e: ContactEvent, memberName: (id: string | null | undefined) 
       return d.to ? `Asignado a ${memberName(d.to)}${d.auto ? ' (automático)' : ''}` : 'Quedó sin asignar';
     case 'opted_out':
       return `Se dio de baja de difusiones${d.keyword ? ` (escribió “${d.keyword}”)` : ''}`;
+    case 'number_changed':
+      // WhatsApp's "changed number" notice: the contact moved, unless another contact already had the new number.
+      return d.moved
+        ? `Cambió su número de WhatsApp: ${formatPhone(d.old_phone ?? d.old_wa_id)} → ${formatPhone(d.new_phone ?? d.new_wa_id)}`
+        : `Avisó que su nuevo número es ${formatPhone(d.new_phone ?? d.new_wa_id)} (ya existe otro contacto con ese número)`;
     default:
       return e.type;
   }
@@ -221,6 +259,16 @@ export function ContactPanel({ detail, myId, onClose, className }: { detail: Con
       await api.delete(`/api/scheduled/${id}`);
       void qc.invalidateQueries({ queryKey: ['contact', contact.id] });
       toast.success('Mensaje programado cancelado');
+    } catch (err) {
+      toast.error(errorMessage(err));
+    }
+  }
+
+  // DELETE also archives a failed row, so its warning stops showing.
+  async function dismissScheduled(id: string) {
+    try {
+      await api.delete(`/api/scheduled/${id}`);
+      void qc.invalidateQueries({ queryKey: ['contact', contact.id] });
     } catch (err) {
       toast.error(errorMessage(err));
     }
@@ -346,19 +394,7 @@ export function ContactPanel({ detail, myId, onClose, className }: { detail: Con
 
         {scheduled.length > 0 && (
           <Section title="Programados" icon={<CalendarClock className="h-3.5 w-3.5" />}>
-            <ul className="space-y-2">
-              {scheduled.map((s) => (
-                <li key={s.id} className="flex items-start gap-2 rounded-lg bg-slate-50 p-2 text-sm">
-                  <div className="min-w-0 flex-1">
-                    <p className="text-xs font-medium text-slate-700">{dateTime(s.send_at)}</p>
-                    <p className="truncate text-xs text-slate-500">{s.content.type === 'text' ? s.content.text : `Plantilla ${s.content.name}`}</p>
-                  </div>
-                  <IconButton title="Cancelar envío" className="h-7 w-7" onClick={() => void cancelScheduled(s.id)}>
-                    <X className="h-4 w-4" />
-                  </IconButton>
-                </li>
-              ))}
-            </ul>
+            <ScheduledList items={scheduled} onCancel={(id) => void cancelScheduled(id)} onDismiss={(id) => void dismissScheduled(id)} />
           </Section>
         )}
 

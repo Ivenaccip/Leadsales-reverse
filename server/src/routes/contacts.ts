@@ -3,11 +3,13 @@ import { parse as parseCsv } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
-import { badRequest } from '../lib/errors.js';
-import { renderPlaceholders } from '../services/broadcasts.js';
+import { badRequest, conflict } from '../lib/errors.js';
+import { renderPlaceholders, renderTemplateParams } from '../services/broadcasts.js';
 import { CONTACT_COLUMNS, createContact, getContact, updateContact } from '../services/contacts.js';
+import { waTypeForMime } from '../services/media.js';
 import { addNote, isWindowOpen, sendMessage, type SendContent } from '../services/messages.js';
 import { cancelScheduled, scheduleMessage } from '../services/scheduled.js';
+import { checkTemplateParams, findTemplate } from '../services/templates.js';
 import type { MessageRow } from '../types.js';
 import { getChannel, providerFor } from '../whatsapp/provider.js';
 import type { TemplateParams } from '../whatsapp/types.js';
@@ -77,30 +79,31 @@ const templateParamsSchema = z.object({
     .union([
       z.object({ type: z.literal('text'), text: z.string().min(1).max(60) }),
       z.object({ type: z.enum(['image', 'video', 'document']), link: z.string().url(), filename: z.string().optional() }),
+      z.object({
+        type: z.literal('location'),
+        latitude: z.number().min(-90).max(90),
+        longitude: z.number().min(-180).max(180),
+        name: z.string().trim().max(1000).optional(),
+        address: z.string().trim().max(1000).optional(),
+      }),
     ])
     .optional(),
   body: z.array(z.string().max(1024)).max(30).optional(),
   bodyNamed: z.record(z.string(), z.string().max(1024)).optional(),
-  buttons: z.array(z.object({ index: z.number().int().min(0).max(9), text: z.string().min(1).max(200) })).optional(),
+  buttons: z
+    .array(z.object({ index: z.number().int().min(0).max(9), text: z.string().min(1).max(200), sub_type: z.enum(['url', 'copy_code']).optional() }))
+    .optional(),
 });
+
+/** WhatsApp's limit for image, video and document captions. */
+const MAX_CAPTION = 1024;
 
 const sendSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string().min(1).max(4096), reply_to_wamid: z.string().optional() }),
-  z.object({ type: z.literal('media'), media_file_id: uuid, caption: z.string().max(1024).optional() }),
+  z.object({ type: z.literal('media'), media_file_id: uuid, caption: z.string().max(MAX_CAPTION).optional() }),
   z.object({ type: z.literal('template'), name: z.string().min(1), language: z.string().min(2), params: templateParamsSchema.optional() }),
   z.object({ type: z.literal('quick_reply'), quick_reply_id: uuid }),
 ]);
-
-function renderTemplateParams(p: TemplateParams | undefined, contact: Parameters<typeof renderPlaceholders>[1]): TemplateParams | undefined {
-  if (!p) return p;
-  const r = (s: string) => renderPlaceholders(s, contact);
-  return {
-    header: p.header?.type === 'text' ? { type: 'text', text: r(p.header.text) } : p.header,
-    body: p.body?.map(r),
-    bodyNamed: p.bodyNamed ? Object.fromEntries(Object.entries(p.bodyNamed).map(([k, v]) => [k, r(v)])) : undefined,
-    buttons: p.buttons?.map((b) => ({ index: b.index, text: r(b.text) })),
-  };
-}
 
 const HEADER_ALIASES: Record<string, string> = {
   telefono: 'phone', phone: 'phone', celular: 'phone', whatsapp: 'phone', numero: 'phone', movil: 'phone', tel: 'phone',
@@ -111,6 +114,52 @@ const HEADER_ALIASES: Record<string, string> = {
   valor: 'deal_value', monto: 'deal_value', deal_value: 'deal_value', 'valor de venta': 'deal_value',
 };
 const normHeader = (h: string) => h.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+
+/**
+ * Neutralizes spreadsheet formulas (cells starting with = + - @, tab or CR; names, tags and API
+ * fields are user-controlled). Excel splits a .csv on the system list separator (';' in es-ES,
+ * es-AR, es-CO, es-CL, pt-BR) without honouring quotes that do not open the field, and other apps
+ * guess the separator: so every segment that could become a cell after a ; , tab or line break is
+ * neutralized too, not only the start of the value.
+ */
+export function csvCell(v: unknown): string {
+  const t = v == null ? '' : String(v);
+  const safe = t.replace(/(^|[;,\t\r\n])([\s"]*)(?=[=+\-@])/g, "$1$2'");
+  return /^[\t\r]/.test(safe) ? `'${safe}` : safe;
+}
+
+/** Delimiter of a CSV from its header line: Excel saves ';' (or tab) in locales with a decimal comma. */
+export function detectCsvDelimiter(text: string): string {
+  let inQuotes = false;
+  const counts: Record<string, number> = { ',': 0, ';': 0, '\t': 0 };
+  for (const ch of text) {
+    if (ch === '"') inQuotes = !inQuotes;
+    else if (!inQuotes && (ch === '\n' || ch === '\r')) break;
+    else if (!inQuotes && ch in counts) counts[ch]++;
+  }
+  return [';', '\t'].reduce((best, d) => (counts[d] > counts[best] ? d : best), ',');
+}
+
+/** Amount typed as 1500, 1,500.50, 1.500,50, 150.000 or 1500,5 (decimal comma), ignoring currency signs. */
+export function parseAmount(raw: string): number {
+  let s = String(raw).replace(/[^\d.,-]/g, '');
+  const lastDot = s.lastIndexOf('.');
+  const lastComma = s.lastIndexOf(',');
+  if (lastComma > lastDot) {
+    // A comma followed by exactly 3 digits and no dot is a thousands separator (1,500).
+    s = lastDot < 0 && /,\d{3}$/.test(s) ? s.replace(/,/g, '') : s.replace(/\./g, '').replace(',', '.').replace(/,/g, '');
+  } else if (lastComma < 0 && /^-?[1-9]\d{0,2}(\.\d{3})+$/.test(s)) {
+    // Dot-grouped thousands (es-CO, es-AR, es-CL, es-ES: "$ 150.000"), also with a single group:
+    // deal values are stored with 2 decimals, so "150.000" is never meant as 150 with 3 decimals.
+    s = s.replace(/\./g, '');
+  } else if ((s.match(/\./g) ?? []).length > 1) {
+    s = s.replace(/[.,]/g, ''); // 1.500.000
+  } else {
+    s = s.replace(/,/g, '');
+  }
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
 
 export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
   async function ensureVisible(a: WsAuth, contactId: string) {
@@ -183,6 +232,11 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
       },
       { userId: a.user.id },
     );
+    // The phone already exists: a restricted agent gets neither the row nor an assignment change
+    // when that conversation belongs to someone else (same rule as GET /api/contacts/:id).
+    if (!created && contact.assigned_user_id && contact.assigned_user_id !== a.user.id && (await visibilityFilter(ctx, a))) {
+      throw conflict('Ya existe un contacto con ese teléfono y no tienes acceso a él.', 'CONTACT_EXISTS');
+    }
     return { contact, created };
   });
 
@@ -198,28 +252,25 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
        WHERE ${where} ORDER BY c.created_at`,
       params,
     );
-    // Spreadsheet apps execute cells starting with = + - @: WhatsApp names are user-controlled.
-    const cell = (v: unknown) => {
-      const t = v == null ? '' : String(v);
-      return /^[=+\-@\t\r]/.test(t) ? `'${t}` : t;
-    };
     const csv = stringify(
       rows.map((r: any) => ({
-        telefono: `+${r.phone}`,
-        nombre: cell(r.name ?? ''),
-        correo: cell(r.email ?? ''),
-        empresa: cell(r.company ?? ''),
-        embudo: cell(r.funnel ?? ''),
-        etapa: cell(r.stage ?? ''),
-        asignado_a: cell(r.assigned_to ?? ''),
-        etiquetas: cell(r.tags ?? ''),
+        // Also neutralized: a reader splitting on another separator can glue the next value onto it.
+        telefono: csvCell(`+${r.phone}`),
+        nombre: csvCell(r.name),
+        correo: csvCell(r.email),
+        empresa: csvCell(r.company),
+        embudo: csvCell(r.funnel),
+        etapa: csvCell(r.stage),
+        asignado_a: csvCell(r.assigned_to),
+        etiquetas: csvCell(r.tags),
         valor: r.deal_value,
-        origen: r.source,
+        origen: csvCell(r.source),
         creado: new Date(r.created_at).toISOString(),
         ultimo_mensaje: r.last_message_at ? new Date(r.last_message_at).toISOString() : '',
-        campos: cell(JSON.stringify(r.custom_fields ?? {})),
+        campos: csvCell(JSON.stringify(r.custom_fields ?? {})),
       })),
-      { header: true },
+      // Every cell is quoted, so a ';' or ',' inside a value never splits it in a standard reader.
+      { header: true, quoted: true },
     );
     reply.header('Content-Type', 'text/csv; charset=utf-8');
     reply.header('Content-Disposition', `attachment; filename="contactos-${new Date().toISOString().slice(0, 10)}.csv"`);
@@ -232,9 +283,26 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
       z.object({ csv: z.string().min(1).max(10_000_000), funnel_id: uuid.optional(), stage_id: uuid.optional(), tag_ids: z.array(uuid).optional() }),
       req.body,
     );
+    const text = body.csv.replace(/^﻿/, '');
+    // U+FFFD means the file was decoded as UTF-8 but is not (Excel's plain "CSV" is ANSI/cp1252 in
+    // Spanish locales): the accents are already lost, so headers like "Teléfono" would not match and
+    // names would be stored garbled. Refuse with a way out instead.
+    if (text.includes('\ufffd')) {
+      throw badRequest(
+        'El archivo no está guardado en UTF-8 y se perderían los acentos (por ejemplo, en "Teléfono" o en los nombres). En Excel, usa Guardar como → "CSV UTF-8 (delimitado por comas)" e impórtalo de nuevo.',
+        'CSV_NOT_UTF8',
+      );
+    }
     let records: Record<string, string>[];
     try {
-      records = parseCsv(body.csv.replace(/^﻿/, ''), { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true, bom: true });
+      records = parseCsv(text, {
+        columns: true,
+        delimiter: detectCsvDelimiter(text),
+        skip_empty_lines: true,
+        trim: true,
+        relax_column_count: true,
+        bom: true,
+      });
     } catch (err) {
       throw badRequest(`No se pudo leer el CSV: ${(err as Error).message}`);
     }
@@ -247,7 +315,9 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
     for (const [i, rec] of records.entries()) {
       const mapped: Record<string, string> = {};
       const custom: Record<string, string> = {};
-      for (const [k, v] of Object.entries(rec)) {
+      for (const [k, raw] of Object.entries(rec)) {
+        // Undo the export's formula guard (a leading ') so an exported file imports back as it was.
+        const v = typeof raw === 'string' ? raw.replace(/^'(?=[=+\-@\t\r])/, '') : raw;
         const target = HEADER_ALIASES[normHeader(k)];
         if (target) mapped[target] = v;
         else if (v) custom[k.trim()] = v;
@@ -278,7 +348,7 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
             name: mapped.name,
             email: mapped.email && mapped.email.includes('@') ? mapped.email : null,
             company: mapped.company,
-            dealValue: mapped.deal_value ? Number(String(mapped.deal_value).replace(/[^\d.]/g, '')) || 0 : 0,
+            dealValue: mapped.deal_value ? parseAmount(mapped.deal_value) : 0,
             customFields: custom,
             funnelId: body.funnel_id,
             stageId: body.stage_id,
@@ -356,8 +426,12 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
        WHERE e.contact_id = $1 ORDER BY e.created_at DESC LIMIT 100`,
       [id],
     );
+    // Failed sends stay listed (with their error) for a week so the panel can show and dismiss them;
+    // one being sent stays listed until it is done (cancelling it answers 409 SCHEDULED_SENDING).
     const scheduled = await ctx.db.query(
-      `SELECT * FROM scheduled_messages WHERE contact_id = $1 AND status = 'pending' ORDER BY send_at`,
+      `SELECT * FROM scheduled_messages WHERE contact_id = $1
+         AND (status IN ('pending', 'sending') OR (status = 'failed' AND send_at > now() - interval '7 days'))
+       ORDER BY send_at`,
       [id],
     );
     return { contact, events: events.rows, scheduled: scheduled.rows, window_open: isWindowOpen(contact.last_inbound_at) };
@@ -445,16 +519,23 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
     const send = (content: SendContent, replyTo?: string) =>
       sendMessage(ctx, { workspaceId: a.workspaceId, contactId: id, content, sentBy: 'user', userId: a.user.id, replyToWamid: replyTo });
     if (body.type === 'quick_reply') {
-      const qr = await ctx.db.query<{ body: string; media_file_id: string | null }>(
-        `SELECT body, media_file_id FROM quick_replies WHERE id = $1 AND workspace_id = $2`,
+      const qr = await ctx.db.query<{ body: string; media_file_id: string | null; media_mime: string | null }>(
+        `SELECT q.body, q.media_file_id, mf.mime AS media_mime FROM quick_replies q
+         LEFT JOIN media_files mf ON mf.id = q.media_file_id AND mf.workspace_id = q.workspace_id
+         WHERE q.id = $1 AND q.workspace_id = $2`,
         [body.quick_reply_id, a.workspaceId],
       );
       if (!qr.rows[0]) throw badRequest('Respuesta rápida no encontrada');
+      const { media_file_id: mediaFileId, media_mime: mime } = qr.rows[0];
       const text = renderPlaceholders(qr.rows[0].body, contact, false);
-      const messages = [];
-      if (qr.rows[0].media_file_id) messages.push(await send({ type: 'media', mediaFileId: qr.rows[0].media_file_id, caption: text }));
-      else messages.push(await send({ type: 'text', text }));
-      return { message: messages[0] };
+      if (!mediaFileId) return { message: await send({ type: 'text', text }) };
+      // WhatsApp only carries a caption (up to 1024 characters) on images, videos and documents:
+      // otherwise the file goes first and the text follows as its own message, so it is never lost.
+      const kind = waTypeForMime(mime ?? '');
+      const asCaption = kind !== 'audio' && kind !== 'sticker' && text.length <= MAX_CAPTION;
+      const messages = [await send({ type: 'media', mediaFileId, ...(asCaption ? { caption: text } : {}) })];
+      if (!asCaption && text.trim()) messages.push(await send({ type: 'text', text }));
+      return { message: messages[0], messages };
     }
     if (body.type === 'text') return { message: await send({ type: 'text', text: body.text }, body.reply_to_wamid) };
     if (body.type === 'media') return { message: await send({ type: 'media', mediaFileId: body.media_file_id, caption: body.caption }) };
@@ -512,7 +593,7 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
   app.post('/api/contacts/:id/scheduled', async (req) => {
     const a = await requireWs(ctx, req);
     const { id } = parse(z.object({ id: uuid }), req.params);
-    await ensureVisible(a, id);
+    const contact = await ensureVisible(a, id);
     const body = parse(
       z.object({
         send_at: z.string().datetime({ offset: true }),
@@ -523,6 +604,13 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
       }),
       req.body,
     );
+    if (body.content.type === 'template') {
+      // Refuse now what would only fail at send time (missing variables, location, coupon…).
+      // Checked as the send renders them: a placeholder such as {campo.cupon} is not the coupon itself.
+      const channel = await getChannel(ctx.db, a.workspaceId, contact.channel_id).catch(() => null);
+      const tpl = channel ? await findTemplate(ctx.db, channel.id, body.content.name, body.content.language) : null;
+      if (tpl) checkTemplateParams(tpl.components, renderTemplateParams(body.content.params as TemplateParams | undefined, contact));
+    }
     const s = await scheduleMessage(ctx, a.workspaceId, id, a.user.id, body.content as SendContent, new Date(body.send_at));
     return { scheduled: s };
   });

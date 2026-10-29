@@ -28,7 +28,7 @@ const meta = fakeFetch([
     if (c.body?.to === '525500000047') return { status: 400, json: { error: { message: '(#131047) Re-engagement message', code: 131047 } } };
     return { json: { messaging_product: 'whatsapp', contacts: [{ input: c.body.to, wa_id: c.body.to }], messages: [{ id: `wamid.OUT${meta.calls.length}` }] } };
   },
-  (c) => (c.url.endsWith('/MEDIA123') ? { json: { url: 'https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=1', mime_type: 'image/jpeg' } } : undefined),
+  (c) => (c.url.endsWith('/1029384756') ? { json: { url: 'https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=1', mime_type: 'image/jpeg' } } : undefined),
   (c) => (c.url.startsWith('https://lookaside.fbsbx.com/') ? { body: new Uint8Array([0xff, 0xd8, 0xff, 0xe0]) } : undefined),
 ]);
 
@@ -146,7 +146,7 @@ describe('WhatsApp Cloud API channel', () => {
 
   it('downloads inbound media from Meta', async () => {
     const now = String(Math.floor(Date.now() / 1000));
-    await postWebhook(inbound([{ from: '5215598765432', id: 'wamid.IMG', timestamp: now, type: 'image', image: { id: 'MEDIA123', mime_type: 'image/jpeg', caption: 'mi foto' } }]));
+    await postWebhook(inbound([{ from: '5215598765432', id: 'wamid.IMG', timestamp: now, type: 'image', image: { id: '1029384756', mime_type: 'image/jpeg', caption: 'mi foto' } }]));
     await env.drain();
     const msgs = await env.api('GET', `/api/contacts/${contactId}/messages`);
     const img = msgs.body.messages.find((m: any) => m.wamid === 'wamid.IMG');

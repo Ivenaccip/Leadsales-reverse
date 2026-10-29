@@ -5,7 +5,7 @@ import { api, ApiError, errorMessage } from '../../lib/api';
 import { useQuickReplies } from '../../lib/queries';
 import type { Contact, Message, QuickReply } from '../../lib/types';
 import { Alert, Button, cx, IconButton, Spinner, useToast } from '../ui';
-import { renderPlaceholders } from './helpers';
+import { mediaSendPlan, renderPlaceholders, sendProblem, WA_MEDIA_ACCEPT, type SendPayload } from './helpers';
 
 type Mode = 'reply' | 'note';
 
@@ -91,9 +91,13 @@ export function Composer({
     }
     setSending(true);
     try {
-      const r = await api.post<{ message: Message }>(`/api/contacts/${contact.id}/messages`, { type: 'quick_reply', quick_reply_id: q.id });
-      onSent(r.message);
+      // A quick reply can go out as two messages (e.g. an audio and then its text).
+      const r = await api.post<{ message: Message; messages?: Message[] }>(`/api/contacts/${contact.id}/messages`, { type: 'quick_reply', quick_reply_id: q.id });
+      const sent = r.messages ?? [r.message];
+      for (const m of sent) onSent(m);
       setText('');
+      const problem = sent.map(sendProblem).find(Boolean);
+      if (problem) toast.error(problem);
     } catch (err) {
       handleError(err);
     } finally {
@@ -121,15 +125,33 @@ export function Composer({
     if (blocked || (!body && !attachment)) return;
     setSending(true);
     setCreditsError(null);
+    const steps: SendPayload[] = attachment ? mediaSendPlan(attachment.id, attachment.mime, body) : [{ type: 'text', text: body }];
     try {
-      const payload = attachment
-        ? { type: 'media', media_file_id: attachment.id, ...(body ? { caption: body.slice(0, 1024) } : {}) }
-        : { type: 'text', text: body };
-      const r = await api.post<{ message: Message }>(`/api/contacts/${contact.id}/messages`, payload);
-      onSent(r.message);
-      setText('');
-      setAttachment(null);
-      if (r.message.status === 'failed') toast.error(r.message.error?.message ?? 'WhatsApp rechazó el mensaje');
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        let r: { message: Message };
+        try {
+          r = await api.post<{ message: Message }>(`/api/contacts/${contact.id}/messages`, step);
+        } catch (err) {
+          // The server decides which files take a caption: if it refuses, send the text apart.
+          if (err instanceof ApiError && err.code === 'CAPTION_NOT_SUPPORTED' && step.type === 'media' && step.caption) {
+            steps.splice(i, 1, { type: 'media', media_file_id: step.media_file_id }, { type: 'text', text: body });
+            i--;
+            continue;
+          }
+          throw err;
+        }
+        onSent(r.message);
+        // What already went out is not sent again if a later step fails.
+        if (step.type === 'media') setAttachment(null);
+        if (step.type === 'text' || step.caption) setText('');
+        // Failed or unconfirmed: what is left (the text after a file) stays in the composer.
+        const problem = sendProblem(r.message);
+        if (problem) {
+          toast.error(problem);
+          return;
+        }
+      }
     } catch (err) {
       handleError(err);
     } finally {
@@ -242,7 +264,11 @@ export function Composer({
           <div className="mb-2 flex items-center gap-2 rounded-lg bg-slate-100 px-3 py-2 text-sm">
             <Paperclip className="h-4 w-4 text-slate-500" />
             <span className="flex-1 truncate text-slate-700">{attachment.name}</span>
-            <span className="text-xs text-slate-400">El texto se enviará como descripción</span>
+            <span className="text-xs text-slate-400">
+              {mediaSendPlan(attachment.id, attachment.mime, text.trim() || ' ').length > 1
+                ? 'El texto se enviará en un mensaje aparte'
+                : 'El texto se enviará como descripción'}
+            </span>
             <IconButton title="Quitar archivo" className="h-7 w-7" onClick={() => setAttachment(null)}>
               <X className="h-4 w-4" />
             </IconButton>
@@ -264,7 +290,7 @@ export function Composer({
               ref={fileRef}
               type="file"
               className="hidden"
-              accept="image/jpeg,image/png,image/webp,video/mp4,audio/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip"
+              accept={WA_MEDIA_ACCEPT}
               onChange={(e) => void pickFile(e.target.files?.[0])}
             />
           </div>

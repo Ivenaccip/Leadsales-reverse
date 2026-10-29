@@ -66,6 +66,6 @@ export const jobHandlers: Record<string, JobHandler> = {
   'automation.inbound': (ctx, p) => handleInboundAutomation(ctx, p),
   'ai.reply': (ctx, p) => runAiReply(ctx, p),
   'broadcast.process': (ctx, p) => processBroadcast(ctx, p),
-  'scheduled.send': (ctx, p) => processScheduled(ctx, p),
+  'scheduled.send': (ctx, p, job) => processScheduled(ctx, p, job),
   'webhook.deliver': (ctx, p) => deliverWebhook(ctx, p),
 };

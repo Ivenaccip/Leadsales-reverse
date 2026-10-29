@@ -67,7 +67,8 @@ describe('broadcasts', () => {
   it('counts replies to the broadcast', async () => {
     const list = (await env.api('GET', '/api/broadcasts')).body.broadcasts;
     const ch = (await env.api('GET', '/api/channels')).body.channels[0];
-    await env.api('POST', `/api/channels/${ch.id}/simulate`, { from: '5255100001', text: 'Me interesa' });
+    // WhatsApp ids are full international numbers: Ana was stored as 52 + 5255100001.
+    await env.api('POST', `/api/channels/${ch.id}/simulate`, { from: '525255100001', text: 'Me interesa' });
     const b = (await env.api('GET', `/api/broadcasts/${list[0].id}`)).body.broadcast;
     expect(b.stats.replied).toBe(1);
   });

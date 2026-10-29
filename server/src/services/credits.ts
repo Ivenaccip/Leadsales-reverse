@@ -6,6 +6,14 @@ import type { MessageRow } from '../types.js';
 
 export type PriceCategory = 'marketing' | 'utility' | 'authentication' | 'service';
 
+/**
+ * Money columns hold 6 decimals. Every amount is rounded here, once, before it is
+ * stored or used, so the database never rounds a charge and its refund differently.
+ */
+export function roundMoney(n: number): number {
+  return Math.round(Number(n) * 1e6) / 1e6;
+}
+
 /** Maps Meta pricing categories (webhooks / templates) to our rate card categories. */
 export function normalizeCategory(raw: string | null | undefined): PriceCategory | null {
   const c = (raw ?? '').toLowerCase();
@@ -23,7 +31,7 @@ export async function getRate(q: Queryable, phone: string, category: PriceCatego
     [category, market],
   );
   const exact = rows.find((r) => r.market === market) ?? rows.find((r) => r.market === 'OTHER');
-  return exact ? Number(exact.price) : 0;
+  return exact ? roundMoney(exact.price) : 0;
 }
 
 interface LedgerOpts {
@@ -33,36 +41,55 @@ interface LedgerOpts {
   userId?: string | null;
 }
 
+interface WalletOpts {
+  /**
+   * Whether the prepaid wallet pays: pass the mode the message was sent under
+   * (messages.charged_prepaid), never the workspace's current mode, so switching
+   * billing_mode cannot create or lose credits. Omitted: the current mode.
+   */
+  prepaid?: boolean;
+}
+
 /**
- * Debits credits. In prepaid mode it fails when the balance is not enough
+ * Debits credits. When the wallet pays it fails if the balance is not enough
  * (unless force: the message was already delivered and Meta billed it).
  * In meta_direct mode Meta bills the business directly: we only record the spend.
+ * Returns whether the prepaid balance was debited.
  */
-export async function charge(q: Queryable, workspaceId: string, amount: number, opts: LedgerOpts & { force?: boolean } = {}) {
-  if (amount <= 0) return;
-  const { rows } = await q.query<{ credit_balance: number; billing_mode: string }>(
-    `UPDATE workspaces SET credit_balance = CASE WHEN billing_mode = 'prepaid' THEN credit_balance - $2 ELSE credit_balance END
-     WHERE id = $1 AND (billing_mode <> 'prepaid' OR credit_balance >= $2 OR $3)
-     RETURNING credit_balance, billing_mode`,
-    [workspaceId, amount, !!opts.force],
+export async function charge(
+  q: Queryable,
+  workspaceId: string,
+  amount: number,
+  opts: LedgerOpts & WalletOpts & { force?: boolean } = {},
+): Promise<boolean> {
+  amount = roundMoney(amount);
+  if (amount <= 0) return false;
+  const { rows } = await q.query<{ credit_balance: number; prepaid: boolean }>(
+    `UPDATE workspaces SET credit_balance = CASE WHEN COALESCE($4::boolean, billing_mode = 'prepaid') THEN credit_balance - $2 ELSE credit_balance END
+     WHERE id = $1 AND (NOT COALESCE($4::boolean, billing_mode = 'prepaid') OR credit_balance >= $2 OR $3)
+     RETURNING credit_balance, COALESCE($4::boolean, billing_mode = 'prepaid') AS prepaid`,
+    [workspaceId, amount, !!opts.force, opts.prepaid ?? null],
   );
   if (!rows[0]) {
     throw new AppError(402, 'INSUFFICIENT_CREDITS', 'No tienes créditos suficientes para enviar este mensaje. Recarga tu saldo.');
   }
   await insertLedger(q, workspaceId, -amount, rows[0].credit_balance, 'charge', opts);
+  return rows[0].prepaid;
 }
 
-export async function refund(q: Queryable, workspaceId: string, amount: number, opts: LedgerOpts = {}) {
+export async function refund(q: Queryable, workspaceId: string, amount: number, opts: LedgerOpts & WalletOpts = {}) {
+  amount = roundMoney(amount);
   if (amount <= 0) return;
   const { rows } = await q.query<{ credit_balance: number }>(
-    `UPDATE workspaces SET credit_balance = CASE WHEN billing_mode = 'prepaid' THEN credit_balance + $2 ELSE credit_balance END
+    `UPDATE workspaces SET credit_balance = CASE WHEN COALESCE($3::boolean, billing_mode = 'prepaid') THEN credit_balance + $2 ELSE credit_balance END
      WHERE id = $1 RETURNING credit_balance`,
-    [workspaceId, amount],
+    [workspaceId, amount, opts.prepaid ?? null],
   );
   await insertLedger(q, workspaceId, amount, rows[0]?.credit_balance ?? 0, 'refund', opts);
 }
 
 export async function topup(q: Queryable, workspaceId: string, amount: number, opts: LedgerOpts = {}) {
+  amount = roundMoney(amount);
   const { rows } = await q.query<{ credit_balance: number }>(
     `UPDATE workspaces SET credit_balance = credit_balance + $2 WHERE id = $1 RETURNING credit_balance`,
     [workspaceId, amount],
@@ -80,6 +107,35 @@ async function insertLedger(q: Queryable, workspaceId: string, amount: number, b
   );
 }
 
+const creditsNotify = new Map<string, { last: number; timer: NodeJS.Timeout | null }>();
+const CREDITS_NOTIFY_MS = 2000;
+
+/**
+ * Tells the workspace's clients that the balance or spend changed (the sidebar refetches).
+ * Throttled per workspace so a broadcast does not trigger one refetch per message; a
+ * trailing event always follows the last change.
+ */
+export function notifyCredits(ctx: AppContext, workspaceId: string): void {
+  const now = Date.now();
+  const st = creditsNotify.get(workspaceId) ?? { last: 0, timer: null };
+  creditsNotify.set(workspaceId, st);
+  if (now - st.last >= CREDITS_NOTIFY_MS) {
+    st.last = now;
+    ctx.realtime.emit(workspaceId, 'credits:update', {});
+    return;
+  }
+  if (st.timer) return;
+  st.timer = setTimeout(() => {
+    st.timer = null;
+    st.last = Date.now();
+    ctx.realtime.emit(workspaceId, 'credits:update', {});
+  }, CREDITS_NOTIFY_MS - (now - st.last));
+  st.timer.unref?.();
+  if (creditsNotify.size > 5000) {
+    for (const [k, v] of creditsNotify) if (!v.timer) creditsNotify.delete(k);
+  }
+}
+
 export interface MetaPricing {
   billable?: boolean;
   category?: string;
@@ -90,7 +146,8 @@ export interface MetaPricing {
 /**
  * Adjusts what we charged at send time to what Meta actually bills, using the
  * pricing object Meta includes in status webhooks. Runs once per message.
- * Without pricing (failed message) the estimated charge is refunded.
+ * Without pricing (failed message) the estimated charge is refunded. The wallet is
+ * touched only for messages it paid for (charged_prepaid), whatever the current mode.
  */
 export async function reconcilePricing(
   ctx: AppContext,
@@ -107,8 +164,8 @@ export async function reconcilePricing(
     category = c ?? pricing.category ?? category;
     actual = pricing.billable && c ? await getRate(q, phone, c) : 0;
   }
-  const diff = Math.round((actual - Number(msg.cost)) * 10000) / 10000;
-  const opts = { messageId: msg.id, broadcastId: msg.broadcast_id };
+  const diff = roundMoney(actual - Number(msg.cost));
+  const opts = { messageId: msg.id, broadcastId: msg.broadcast_id, prepaid: !!msg.charged_prepaid };
   if (diff > 0) {
     await charge(q, msg.workspace_id, diff, { ...opts, force: true, description: `Ajuste Meta (${category})` });
   } else if (diff < 0) {
@@ -122,5 +179,5 @@ export async function reconcilePricing(
     actual,
     category,
   ]);
-  if (diff !== 0) ctx.realtime.emit(msg.workspace_id, 'credits:update', { delta: -diff });
+  if (diff !== 0) notifyCredits(ctx, msg.workspace_id);
 }

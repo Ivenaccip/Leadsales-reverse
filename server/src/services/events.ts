@@ -24,18 +24,18 @@ export async function recordEvent(
   );
 }
 
-/** Queues delivery to every active outgoing webhook subscribed to the event. */
-export async function dispatchWebhook(ctx: AppContext, workspaceId: string, event: WebhookEvent, data: unknown): Promise<void> {
-  const { rows } = await ctx.db.query<{ id: string }>(
+/**
+ * Queues delivery to every active outgoing webhook subscribed to the event. Inside transaction `q`
+ * the deliveries are queued if and only if the change they report commits.
+ */
+export async function dispatchWebhook(ctx: AppContext, workspaceId: string, event: WebhookEvent, data: unknown, q: Queryable = ctx.db): Promise<void> {
+  const { rows } = await q.query<{ id: string }>(
     `SELECT id FROM webhook_endpoints
      WHERE workspace_id = $1 AND is_active AND (cardinality(events) = 0 OR $2 = ANY(events) OR '*' = ANY(events))`,
     [workspaceId, event],
   );
+  // Retries (about 34 h) and the per-workspace lane come from the queue's webhook.deliver policy.
   for (const ep of rows) {
-    await ctx.queue.enqueue(
-      'webhook.deliver',
-      { endpointId: ep.id, event, data, sentAt: new Date().toISOString() },
-      { maxAttempts: 6 },
-    );
+    await ctx.queue.enqueue('webhook.deliver', { workspaceId, endpointId: ep.id, event, data, sentAt: new Date().toISOString() }, {}, q);
   }
 }

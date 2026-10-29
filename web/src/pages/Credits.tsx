@@ -4,6 +4,7 @@ import { ArrowDownLeft, ArrowUpRight, Coins, Info, Receipt } from 'lucide-react'
 import { api } from '../lib/api';
 import { CATEGORY_LABEL, credits, dateTime, formatPhone, MARKET_LABEL, number } from '../lib/format';
 import { useCredits } from '../lib/queries';
+import { useSession } from '../lib/session';
 import { BarList, SERIES } from '../components/charts';
 import { Alert, Badge, Button, Card, EmptyState, Page, PageHeader, PageLoader, Stat } from '../components/ui';
 
@@ -29,13 +30,20 @@ const KIND: Record<LedgerEntry['kind'], { label: string; color: 'green' | 'gray'
 
 const CATS = ['marketing', 'utility', 'authentication', 'service'];
 
-export default function CreditsPage() {
-  const summary = useCredits();
-  const [page, setPage] = useState(1);
-  const ledger = useQuery({
+/** The movements (who was charged, each top-up) are admin-only on the server. */
+export function ledgerQuery(page: number, isAdmin: boolean) {
+  return {
     queryKey: ['ledger', page],
     queryFn: async () => (await api.get<{ entries: LedgerEntry[] }>(`/api/credits/ledger?page=${page}`)).entries,
-  });
+    enabled: isAdmin,
+  };
+}
+
+export default function CreditsPage() {
+  const { isAdmin } = useSession();
+  const summary = useCredits();
+  const [page, setPage] = useState(1);
+  const ledger = useQuery(ledgerQuery(page, isAdmin));
   const rates = useQuery({
     queryKey: ['rates'],
     queryFn: async () => (await api.get<{ rates: { market: string; category: string; price: number }[] }>('/api/credits/rates')).rates,
@@ -120,58 +128,70 @@ export default function CreditsPage() {
           </Card>
         </div>
 
-        <Card title="Movimientos" padded={false}>
-          {ledger.isLoading ? (
-            <PageLoader />
-          ) : !ledger.data?.length ? (
-            <EmptyState icon={<Receipt className="h-6 w-6" />} title="Sin movimientos" description="Aquí verás cada plantilla cobrada, reembolso y recarga." />
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
-                  <tr>
-                    <th className="px-4 py-2">Fecha</th>
-                    <th className="px-4 py-2">Tipo</th>
-                    <th className="px-4 py-2">Detalle</th>
-                    <th className="px-4 py-2 text-right">Monto</th>
-                    {prepaid && <th className="px-4 py-2 text-right">Saldo</th>}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {ledger.data.map((e) => (
-                    <tr key={e.id}>
-                      <td className="whitespace-nowrap px-4 py-2 text-slate-500">{dateTime(e.created_at)}</td>
-                      <td className="px-4 py-2">
-                        <Badge color={KIND[e.kind].color}>{KIND[e.kind].label}</Badge>
-                      </td>
-                      <td className="px-4 py-2 text-slate-700">
-                        {e.description}
-                        {(e.contact_name || e.contact_phone) && <span className="text-slate-500"> · {e.contact_name ?? formatPhone(e.contact_phone)}</span>}
-                        {e.broadcast_name && <span className="text-slate-500"> · Difusión “{e.broadcast_name}”</span>}
-                        {e.created_by_name && e.kind === 'topup' && <span className="text-slate-500"> · por {e.created_by_name}</span>}
-                      </td>
-                      <td className={`whitespace-nowrap px-4 py-2 text-right font-mono text-xs ${e.amount >= 0 ? 'text-emerald-700' : 'text-slate-800'}`}>
-                        <span className="inline-flex items-center gap-1">
-                          {e.amount >= 0 ? <ArrowDownLeft className="h-3 w-3" /> : <ArrowUpRight className="h-3 w-3" />}
-                          {credits(Math.abs(e.amount))}
-                        </span>
-                      </td>
-                      {prepaid && <td className="whitespace-nowrap px-4 py-2 text-right font-mono text-xs">{credits(e.balance_after)}</td>}
+        {isAdmin ? (
+          <Card title="Movimientos" padded={false}>
+            {ledger.isLoading ? (
+              <PageLoader />
+            ) : ledger.isError ? (
+              <div className="p-4">
+                <Alert tone="error">No se pudieron cargar los movimientos.</Alert>
+              </div>
+            ) : !ledger.data?.length ? (
+              <EmptyState icon={<Receipt className="h-6 w-6" />} title="Sin movimientos" description="Aquí verás cada plantilla cobrada, reembolso y recarga." />
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
+                    <tr>
+                      <th className="px-4 py-2">Fecha</th>
+                      <th className="px-4 py-2">Tipo</th>
+                      <th className="px-4 py-2">Detalle</th>
+                      <th className="px-4 py-2 text-right">Monto</th>
+                      {prepaid && <th className="px-4 py-2 text-right">Saldo</th>}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {ledger.data.map((e) => (
+                      <tr key={e.id}>
+                        <td className="whitespace-nowrap px-4 py-2 text-slate-500">{dateTime(e.created_at)}</td>
+                        <td className="px-4 py-2">
+                          <Badge color={KIND[e.kind].color}>{KIND[e.kind].label}</Badge>
+                        </td>
+                        <td className="px-4 py-2 text-slate-700">
+                          {e.description}
+                          {(e.contact_name || e.contact_phone) && <span className="text-slate-500"> · {e.contact_name ?? formatPhone(e.contact_phone)}</span>}
+                          {e.broadcast_name && <span className="text-slate-500"> · Difusión “{e.broadcast_name}”</span>}
+                          {e.created_by_name && e.kind === 'topup' && <span className="text-slate-500"> · por {e.created_by_name}</span>}
+                        </td>
+                        <td className={`whitespace-nowrap px-4 py-2 text-right font-mono text-xs ${e.amount >= 0 ? 'text-emerald-700' : 'text-slate-800'}`}>
+                          <span className="inline-flex items-center gap-1">
+                            {e.amount >= 0 ? <ArrowDownLeft className="h-3 w-3" /> : <ArrowUpRight className="h-3 w-3" />}
+                            {credits(Math.abs(e.amount))}
+                          </span>
+                        </td>
+                        {prepaid && <td className="whitespace-nowrap px-4 py-2 text-right font-mono text-xs">{credits(e.balance_after)}</td>}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <div className="flex justify-between border-t border-slate-100 px-4 py-3">
+              <Button size="sm" variant="outline" disabled={page === 1} onClick={() => setPage((p) => p - 1)}>
+                Anterior
+              </Button>
+              <Button size="sm" variant="outline" disabled={(ledger.data?.length ?? 0) < 100} onClick={() => setPage((p) => p + 1)}>
+                Siguiente
+              </Button>
             </div>
-          )}
-          <div className="flex justify-between border-t border-slate-100 px-4 py-3">
-            <Button size="sm" variant="outline" disabled={page === 1} onClick={() => setPage((p) => p - 1)}>
-              Anterior
-            </Button>
-            <Button size="sm" variant="outline" disabled={(ledger.data?.length ?? 0) < 100} onClick={() => setPage((p) => p + 1)}>
-              Siguiente
-            </Button>
-          </div>
-        </Card>
+          </Card>
+        ) : (
+          <Card title="Movimientos">
+            <p className="flex gap-2 text-sm text-slate-500">
+              <Info className="h-4 w-4 shrink-0" /> Solo los administradores del espacio ven el detalle de cobros, reembolsos y recargas.
+            </p>
+          </Card>
+        )}
       </div>
     </Page>
   );

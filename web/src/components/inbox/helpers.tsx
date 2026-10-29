@@ -104,6 +104,75 @@ export function renderPlaceholders(text: string, c: Pick<Contact, 'name' | 'phon
   });
 }
 
+// ---------- Attachments ----------
+
+/** WhatsApp message type for an uploaded file (same rule as the server's waTypeForMime). */
+export function waTypeForMime(mime: string): 'image' | 'video' | 'audio' | 'document' | 'sticker' {
+  const m = mime.split(';')[0].trim().toLowerCase();
+  if (m === 'image/jpeg' || m === 'image/png') return 'image';
+  if (m === 'image/webp') return 'sticker';
+  if (m.startsWith('video/')) return 'video';
+  if (m.startsWith('audio/')) return 'audio';
+  return 'document';
+}
+
+export const CAPTION_MAX = 1024;
+
+/**
+ * File picker filter matching the server's upload allow-list (the WhatsApp Cloud API media types,
+ * services/media.ts WA_MEDIA_LIMITS). Extensions cover browsers that report other MIME names
+ * for the same audio files (audio/x-m4a, audio/mp3), which the server maps to the allowed ones.
+ */
+export const WA_MEDIA_ACCEPT = [
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'video/mp4',
+  'video/3gpp',
+  'audio/aac',
+  'audio/amr',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/ogg',
+  '.mp3',
+  '.m4a',
+  '.aac',
+  '.amr',
+  '.ogg',
+  'application/pdf',
+  '.doc',
+  '.docx',
+  '.xls',
+  '.xlsx',
+  '.ppt',
+  '.pptx',
+  '.txt',
+].join(',');
+
+/** What to tell the agent about a send that did not plainly succeed, or null when it went out. */
+export function sendProblem(m: Pick<Message, 'status' | 'error'>): string | null {
+  if (m.status === 'failed') return m.error?.message ?? 'WhatsApp rechazó el mensaje';
+  // Meta may have it: say so, because resending could deliver it twice.
+  if (m.status === 'unknown') return m.error?.message ?? 'No pudimos confirmar si WhatsApp recibió el mensaje. Revisa en unos minutos antes de reenviarlo.';
+  return null;
+}
+
+export type SendPayload = { type: 'text'; text: string } | { type: 'media'; media_file_id: string; caption?: string };
+
+/**
+ * Requests that send an attachment plus the typed text. WhatsApp audios and stickers cannot carry
+ * text and captions are capped, so then the text goes as its own message right after the file.
+ */
+export function mediaSendPlan(mediaId: string, mime: string, text: string): SendPayload[] {
+  if (!text) return [{ type: 'media', media_file_id: mediaId }];
+  const kind = waTypeForMime(mime);
+  if (kind !== 'audio' && kind !== 'sticker' && text.length <= CAPTION_MAX) return [{ type: 'media', media_file_id: mediaId, caption: text }];
+  return [
+    { type: 'media', media_file_id: mediaId },
+    { type: 'text', text },
+  ];
+}
+
 // ---------- Conversation list filters & cache patching ----------
 
 export type InboxTab = 'all' | 'mine' | 'unassigned';
@@ -115,6 +184,12 @@ export interface ConversationFilters {
   tag_id: string;
   stage_id: string;
 }
+
+/**
+ * Socket events patch the inbox caches only while the inbox is mounted and connected, so these
+ * queries refetch whenever they are shown again (messages may have arrived on another page).
+ */
+export const LIVE_QUERY = { refetchOnMount: 'always', refetchOnWindowFocus: 'always' } as const;
 
 export type ConversationsData = InfiniteData<Paged<Contact>, number>;
 export type MessagesData = InfiniteData<{ messages: Message[]; has_more: boolean }, string | undefined>;
@@ -180,6 +255,16 @@ export function removeConversations(qc: QueryClient, ids: string[]) {
   }
 }
 
+/** The conversation is no longer visible to this user: drop it from every cache. */
+export function revokeContact(qc: QueryClient, id: string) {
+  removeConversations(qc, [id]);
+  qc.removeQueries({ queryKey: ['contact', id] });
+  qc.removeQueries({ queryKey: ['messages', id] });
+  void qc.invalidateQueries({ queryKey: ['contact-counts'] });
+  void qc.invalidateQueries({ queryKey: ['contacts'] });
+  void qc.invalidateQueries({ queryKey: ['board'] });
+}
+
 /** Finds a contact in any cached list (used to patch previews on new messages). */
 export function findCachedContact(qc: QueryClient, id: string): Contact | undefined {
   for (const [, data] of qc.getQueriesData<ConversationsData>({ queryKey: ['conversations'] })) {
@@ -212,7 +297,7 @@ export function upsertMessage(qc: QueryClient, msg: Message, append = true) {
 }
 
 /** Status tick ordering: never downgrade a status we already showed. */
-const RANK: Record<string, number> = { pending: 0, sent: 1, delivered: 2, read: 3, failed: 4 };
+const RANK: Record<string, number> = { pending: 0, unknown: 1, sent: 2, delivered: 3, read: 4, failed: 5 };
 export function newerStatus(a: string, b: string) {
   if (b === 'failed') return a === 'read' ? a : b;
   return (RANK[b] ?? 0) >= (RANK[a] ?? 0) ? b : a;

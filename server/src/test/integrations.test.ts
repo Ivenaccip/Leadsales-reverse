@@ -74,6 +74,25 @@ describe('public API and webhooks', () => {
     expect(list.last_error).toMatch(/red privada/);
   });
 
+  it('queues deliveries in the webhooks lane, tagged with the workspace', async () => {
+    const { rows } = await env.built.ctx.db.query(`SELECT lane, workspace_id, max_attempts FROM jobs WHERE type = 'webhook.deliver' ORDER BY id LIMIT 1`);
+    const me = (await env.api('GET', '/api/auth/me')).body;
+    expect(rows[0].lane).toBe('webhooks');
+    expect(me.workspaces.map((w: any) => w.id)).toContain(rows[0].workspace_id);
+    expect(rows[0].max_attempts).toBeGreaterThanOrEqual(12);
+  });
+
+  it('limits outgoing webhooks to 10 per workspace', async () => {
+    const existing = (await env.api('GET', '/api/webhooks')).body.webhooks.length;
+    for (let i = existing; i < 10; i++) {
+      expect((await env.api('POST', '/api/webhooks', { url: `https://93.184.216.34/hook-${i}`, events: ['contact.created'] })).status).toBe(200);
+    }
+    const over = await env.api('POST', '/api/webhooks', { url: 'https://93.184.216.34/hook-extra', events: ['*'] });
+    expect(over.status).toBe(400);
+    expect(over.body.error.code).toBe('WEBHOOK_LIMIT');
+    expect((await env.api('GET', '/api/webhooks')).body.webhooks).toHaveLength(10);
+  });
+
   it('creates templates in Meta format', async () => {
     const ch = (await env.api('GET', '/api/channels')).body.channels[0];
     const r = await env.api('POST', '/api/templates', {
