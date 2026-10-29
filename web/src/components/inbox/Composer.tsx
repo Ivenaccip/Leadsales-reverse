@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { Link } from 'react-router-dom';
-import { AlarmClock, FileText, Lock, Paperclip, Send, StickyNote, X, Zap } from 'lucide-react';
+import { useQueryClient } from '@tanstack/react-query';
+import { AlarmClock, FileText, Lock, Paperclip, PhoneOff, Send, StickyNote, X, Zap } from 'lucide-react';
 import { api, ApiError, errorMessage } from '../../lib/api';
-import { useQuickReplies } from '../../lib/queries';
+import { recheckContactChannel, useContactChannel, useQuickReplies } from '../../lib/queries';
 import type { Contact, Message, QuickReply } from '../../lib/types';
 import { Alert, Button, cx, IconButton, Spinner, useToast } from '../ui';
 import { mediaSendPlan, renderPlaceholders, sendProblem, WA_MEDIA_ACCEPT, type SendPayload } from './helpers';
+import { disabledChannelNotice } from './TemplateModals';
 
 type Mode = 'reply' | 'note';
 
@@ -31,7 +33,10 @@ export function Composer({
   onOpenSchedule: () => void;
 }) {
   const toast = useToast();
+  const qc = useQueryClient();
   const quickReplies = useQuickReplies();
+  // The conversation's number is disabled: nothing can be sent to this customer until it is back.
+  const channelOff = useContactChannel(contact).disabled;
   const [mode, setMode] = useState<Mode>('reply');
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
@@ -68,9 +73,17 @@ export function Composer({
 
   useEffect(() => setQrIndex(0), [qrQuery]);
 
-  const blocked = mode === 'reply' && !windowOpen;
+  const blocked = mode === 'reply' && (!windowOpen || !!channelOff);
 
   function handleError(err: unknown) {
+    // The number may have been disabled since the list of numbers was loaded: reload it, so the
+    // notice above says which one instead of the server's generic "Conecta un número".
+    if (err instanceof ApiError && err.code === 'NO_CHANNEL') {
+      void recheckContactChannel(qc, contact, err).then((off) => {
+        if (!off) toast.error(errorMessage(err));
+      });
+      return;
+    }
     if (err instanceof ApiError && err.code === 'WINDOW_CLOSED') {
       toast.error('La ventana de 24 h está cerrada: envía una plantilla.');
       onOpenTemplate();
@@ -219,7 +232,16 @@ export function Composer({
           </Alert>
         </div>
       )}
-      {mode === 'reply' && !windowOpen && (
+      {mode === 'reply' && channelOff && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-900">
+          <PhoneOff className="h-4 w-4 shrink-0" />
+          <span className="flex-1">{disabledChannelNotice(channelOff)}</span>
+          <Link to="/ajustes/canales" className="font-medium underline">
+            Ir a Canales
+          </Link>
+        </div>
+      )}
+      {mode === 'reply' && !channelOff && !windowOpen && (
         <div className="flex flex-wrap items-center gap-2 border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-900">
           <Lock className="h-4 w-4 shrink-0" />
           <span className="flex-1">La ventana de 24 h está cerrada; envía una plantilla aprobada para retomar la conversación.</span>
@@ -304,9 +326,11 @@ export function Composer({
             placeholder={
               mode === 'note'
                 ? 'Escribe una nota interna (solo la ve tu equipo)…'
-                : blocked
-                  ? 'Ventana cerrada: usa una plantilla'
-                  : 'Escribe un mensaje… ( / para respuestas rápidas)'
+                : channelOff
+                  ? 'El número de esta conversación está deshabilitado'
+                  : blocked
+                    ? 'Ventana cerrada: usa una plantilla'
+                    : 'Escribe un mensaje… ( / para respuestas rápidas)'
             }
             className="max-h-[180px] min-h-9 flex-1 resize-none bg-transparent px-1 py-2 text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none disabled:cursor-not-allowed"
           />

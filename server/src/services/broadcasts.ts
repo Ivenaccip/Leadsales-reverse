@@ -1,11 +1,11 @@
 import type { AppContext } from '../context.js';
 import type { Queryable } from '../db/index.js';
 import { AppError, badRequest, notFound } from '../lib/errors.js';
-import { marketFromPhone } from '../lib/phone.js';
+import { deliveryNumber, marketFromPhone } from '../lib/phone.js';
 import type { ContactRow } from '../types.js';
 import { getChannel } from '../whatsapp/provider.js';
 import { isMetaThrottle, type TemplateParams } from '../whatsapp/types.js';
-import { normalizeCategory, roundMoney } from './credits.js';
+import { roundMoney, templatePriceCategory } from './credits.js';
 import { dispatchWebhook } from './events.js';
 import { abandonAutoRetry, isNetworkFailure, sendMessage } from './messages.js';
 import { dayStart, nextDay, workspaceTimezone } from './reports.js';
@@ -194,12 +194,16 @@ export async function estimateAudience(
   audience: Audience,
   templateCategory: string,
 ): Promise<Estimate> {
-  const category = normalizeCategory(templateCategory) ?? 'marketing';
+  // Priced as each send will be: by template category (never free) and the number messaged.
+  const category = templatePriceCategory(templateCategory);
   const where = audienceWhere(audience, await workspaceTimezone(ctx, workspaceId));
-  const { rows } = await ctx.db.query<{ phone: string }>(`SELECT c.phone FROM contacts c WHERE ${where.sql}`, [workspaceId, ...where.params]);
+  const { rows } = await ctx.db.query<{ phone: string; wa_id: string | null }>(`SELECT c.phone, c.wa_id FROM contacts c WHERE ${where.sql}`, [
+    workspaceId,
+    ...where.params,
+  ]);
   const counts = new Map<string, number>();
   for (const r of rows) {
-    const m = marketFromPhone(r.phone);
+    const m = marketFromPhone(deliveryNumber(r.phone, r.wa_id));
     counts.set(m, (counts.get(m) ?? 0) + 1);
   }
   const prices = await ctx.db.query<{ market: string; price: number }>(`SELECT market, price FROM rate_card WHERE category = $1`, [category]);
@@ -223,9 +227,15 @@ export async function estimateAudience(
   };
 }
 
+/** A broadcast whose number was deleted (channel_id set to NULL): it never falls back to another number. */
+export const CHANNEL_GONE = 'Se eliminó el número de WhatsApp de esta difusión. Edítala, elige otro número y vuelve a enviarla o reanúdala.';
+
 export async function launchBroadcast(ctx: AppContext, workspaceId: string, id: string): Promise<BroadcastRow> {
   const b = await getBroadcast(ctx.db, workspaceId, id);
   if (!['draft', 'paused', 'scheduled'].includes(b.status)) throw badRequest(`La difusión ya está en estado "${b.status}"`);
+  // Every broadcast is saved with its number: none means it was deleted, and getChannel would pick
+  // the workspace's default number (another business line, or the sandbox) without anyone choosing it.
+  if (!b.channel_id) throw new AppError(400, 'NO_CHANNEL', CHANNEL_GONE);
   const channel = await getChannel(ctx.db, workspaceId, b.channel_id);
   const tpl = await findTemplate(ctx.db, channel.id, b.template_name, b.template_language);
   if (!tpl) throw badRequest('La plantilla no existe en este canal. Sincroniza las plantillas.', 'TEMPLATE_NOT_FOUND');
@@ -348,6 +358,8 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
   }
   if (b.status !== 'running') return;
   if (!b.ws_active) return pauseBroadcast(ctx, b, 'El espacio de trabajo está suspendido');
+  // Its number was deleted: stop until someone chooses another (sendMessage would use the default one).
+  if (!b.channel_id) return pauseBroadcast(ctx, b, CHANNEL_GONE);
 
   const claimed = await ctx.db.query<{ id: string; contact_id: string }>(
     `UPDATE broadcast_recipients SET status = 'sending', claimed_at = now()

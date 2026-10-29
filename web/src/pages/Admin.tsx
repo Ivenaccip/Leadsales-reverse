@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Navigate, useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Building2, Coins, KeyRound, LogIn, MessageCircle, Trash2, Users } from 'lucide-react';
-import { api, errorMessage } from '../lib/api';
+import { api, ApiError, errorMessage } from '../lib/api';
 import { CATEGORY_LABEL, credits, dateTime, MARKET_LABEL, number } from '../lib/format';
 import { useSession } from '../lib/session';
 import { Alert, Badge, Button, Card, Field, Input, Modal, Page, PageHeader, PageLoader, Select, Stat, Tabs, Toggle, useConfirm, useToast } from '../components/ui';
@@ -93,16 +93,102 @@ export function AdminUserRow({
   );
 }
 
-function TempPasswordModal({ u, onClose }: { u: AdminUser; onClose: () => void }) {
+// Operator rights and other accounts' passwords are step-up actions: the server checks the
+// operator's current password (a stolen operator session cannot make them on its own).
+export function setOperatorRights(userId: string, isSuperadmin: boolean, currentPassword: string) {
+  return api.patch(`/api/admin/users/${userId}`, { is_superadmin: isSuperadmin, currentPassword });
+}
+
+export function setTemporaryPassword(userId: string, password: string, currentPassword: string) {
+  return api.post(`/api/admin/users/${userId}/password`, { password, currentPassword });
+}
+
+/** A refusal of the password check (WRONG_PASSWORD, TOO_MANY_REQUESTS) goes next to the field; other errors are toasts. */
+export function currentPasswordProblem(err: unknown): string | null {
+  return err instanceof ApiError && (err.code === 'WRONG_PASSWORD' || err.code === 'TOO_MANY_REQUESTS') ? errorMessage(err) : null;
+}
+
+export function CurrentPasswordField({ value, onChange, error }: { value: string; onChange: (v: string) => void; error: string | null }) {
+  return (
+    <Field label="Tu contraseña actual" hint="La de tu cuenta: confirma que eres tú quien hace este cambio." error={error}>
+      <Input type="password" value={value} onChange={(e) => onChange(e.target.value)} autoComplete="current-password" />
+    </Field>
+  );
+}
+
+/** Promotes or demotes an instance operator, after asking for the current operator's password. */
+export function OperatorRoleModal({ u, onClose }: { u: AdminUser; onClose: () => void }) {
+  const toast = useToast();
+  const qc = useQueryClient();
+  const promote = !u.is_superadmin;
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [problem, setProblem] = useState<string | null>(null);
+  const save = useMutation({
+    mutationFn: () => setOperatorRights(u.id, promote, currentPassword),
+    onSuccess: () => {
+      toast.success(promote ? `${u.email} ahora administra la instancia` : `${u.email} ya no administra la instancia`);
+      void qc.invalidateQueries({ queryKey: ['admin', 'users'] });
+      onClose();
+    },
+    onError: (e) => {
+      const p = currentPasswordProblem(e);
+      if (p) setProblem(p);
+      else toast.error(errorMessage(e));
+    },
+  });
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={promote ? 'Hacer administrador de la instancia' : 'Quitar rol de administrador'}
+      size="sm"
+      footer={
+        <Button variant={promote ? 'primary' : 'danger'} onClick={() => save.mutate()} loading={save.isPending} disabled={!currentPassword}>
+          {promote ? 'Hacer administrador' : 'Quitar rol'}
+        </Button>
+      }
+    >
+      <div className="space-y-4 text-sm text-slate-600">
+        <p>
+          {promote ? (
+            <>
+              <b>{u.email}</b> podrá entrar a cualquier espacio de trabajo y administrar créditos, tarifas y usuarios de toda la instancia.
+            </>
+          ) : (
+            <>
+              <b>{u.email}</b> dejará de administrar la instancia. Conserva el acceso a sus propios espacios de trabajo.
+            </>
+          )}
+        </p>
+        <CurrentPasswordField
+          value={currentPassword}
+          onChange={(v) => {
+            setCurrentPassword(v);
+            setProblem(null);
+          }}
+          error={problem}
+        />
+      </div>
+    </Modal>
+  );
+}
+
+export function TempPasswordModal({ u, onClose }: { u: AdminUser; onClose: () => void }) {
   const toast = useToast();
   const [password, setPassword] = useState(() => temporaryPassword());
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [problem, setProblem] = useState<string | null>(null);
   const save = useMutation({
-    mutationFn: () => api.post(`/api/admin/users/${u.id}/password`, { password }),
+    mutationFn: () => setTemporaryPassword(u.id, password, currentPassword),
     onSuccess: () => {
       toast.success(`Contraseña temporal guardada para ${u.email}. Sus sesiones abiertas se cerraron.`);
       onClose();
     },
-    onError: (e) => toast.error(errorMessage(e)),
+    onError: (e) => {
+      const p = currentPasswordProblem(e);
+      if (p) setProblem(p);
+      else toast.error(errorMessage(e));
+    },
   });
   return (
     <Modal
@@ -111,7 +197,7 @@ function TempPasswordModal({ u, onClose }: { u: AdminUser; onClose: () => void }
       title="Poner contraseña temporal"
       size="sm"
       footer={
-        <Button onClick={() => save.mutate()} loading={save.isPending} disabled={password.length < 8}>
+        <Button onClick={() => save.mutate()} loading={save.isPending} disabled={password.length < 8 || !currentPassword}>
           Guardar contraseña
         </Button>
       }
@@ -130,8 +216,42 @@ function TempPasswordModal({ u, onClose }: { u: AdminUser; onClose: () => void }
           </div>
         </Field>
         <Alert tone="info">Se cerrarán todas las sesiones abiertas de esa cuenta.</Alert>
+        <CurrentPasswordField
+          value={currentPassword}
+          onChange={(v) => {
+            setCurrentPassword(v);
+            setProblem(null);
+          }}
+          error={problem}
+        />
       </div>
     </Modal>
+  );
+}
+
+/**
+ * PATCH of a workspace. The switch to prepaid re-reads the templates of its numbers from Meta
+ * (their categories set the price); the ones that failed come back as warnings.
+ */
+export async function patchWorkspace(id: string, body: Partial<Pick<AdminWorkspace, 'billing_mode' | 'is_active'>>): Promise<string[]> {
+  const r = await api.patch<{ warnings?: string[] }>(`/api/admin/workspaces/${id}`, body);
+  return r?.warnings ?? [];
+}
+
+export function WorkspaceWarnings({ warnings }: { warnings: string[] }) {
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-slate-600">El cambio se guardó, pero:</p>
+      {warnings.map((w) => (
+        <Alert key={w} tone="warning">
+          {w}
+        </Alert>
+      ))}
+      <p className="text-sm text-slate-600">
+        Cuando se resuelva, abre el espacio y sincroniza sus plantillas (Plantillas → Sincronizar con Meta) para que los cobros usen las categorías
+        actuales de Meta.
+      </p>
+    </div>
   );
 }
 
@@ -259,6 +379,8 @@ export default function AdminPage() {
   const [tab, setTab] = useState<'workspaces' | 'rates' | 'users'>('workspaces');
   const [topup, setTopup] = useState<AdminWorkspace | null>(null);
   const [passwordFor, setPasswordFor] = useState<AdminUser | null>(null);
+  const [roleFor, setRoleFor] = useState<AdminUser | null>(null);
+  const [wsWarnings, setWsWarnings] = useState<{ name: string; warnings: string[] } | null>(null);
   const confirm = useConfirm();
   const overview = useQuery({
     queryKey: ['admin', 'overview'],
@@ -283,8 +405,9 @@ export default function AdminPage() {
 
   async function patchWs(ws: AdminWorkspace, body: Partial<Pick<AdminWorkspace, 'billing_mode' | 'is_active'>>) {
     try {
-      await api.patch(`/api/admin/workspaces/${ws.id}`, body);
+      const warnings = await patchWorkspace(ws.id, body);
       void qc.invalidateQueries({ queryKey: ['admin'] });
+      if (warnings.length) setWsWarnings({ name: ws.name, warnings });
     } catch (e) {
       toast.error(errorMessage(e));
     }
@@ -294,15 +417,6 @@ export default function AdminPage() {
   function openWorkspace(w: AdminWorkspace) {
     switchWorkspace(w.id, { id: w.id, name: w.name, role: 'owner', billing_mode: w.billing_mode, is_active: w.is_active });
     navigate('/ajustes/canales');
-  }
-
-  async function toggleSuper(u: AdminUser) {
-    try {
-      await api.patch(`/api/admin/users/${u.id}`, { is_superadmin: !u.is_superadmin });
-      void qc.invalidateQueries({ queryKey: ['admin', 'users'] });
-    } catch (e) {
-      toast.error(errorMessage(e));
-    }
   }
 
   async function deleteUser(u: AdminUser) {
@@ -423,7 +537,7 @@ export default function AdminPage() {
                     key={u.id}
                     u={u}
                     meId={user.id}
-                    onToggleSuper={() => void toggleSuper(u)}
+                    onToggleSuper={() => setRoleFor(u)}
                     onPassword={() => setPasswordFor(u)}
                     onDelete={() => void deleteUser(u)}
                   />
@@ -434,6 +548,15 @@ export default function AdminPage() {
       </div>
       {topup && <TopupModal ws={topup} onClose={() => setTopup(null)} />}
       {passwordFor && <TempPasswordModal u={passwordFor} onClose={() => setPasswordFor(null)} />}
+      {roleFor && <OperatorRoleModal u={roleFor} onClose={() => setRoleFor(null)} />}
+      <Modal
+        open={!!wsWarnings}
+        onClose={() => setWsWarnings(null)}
+        title={`Revisa las plantillas de ${wsWarnings?.name ?? ''}`}
+        footer={<Button onClick={() => setWsWarnings(null)}>Entendido</Button>}
+      >
+        {wsWarnings && <WorkspaceWarnings warnings={wsWarnings.warnings} />}
+      </Modal>
     </Page>
   );
 }

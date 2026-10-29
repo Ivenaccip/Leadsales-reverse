@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { AlertCircle, Check, CheckCheck, Clock, Download, FileText, ImageOff, Loader2, MapPin, StickyNote } from 'lucide-react';
 import { mediaUrl } from '../../lib/api';
 import type { Message } from '../../lib/types';
@@ -162,7 +163,9 @@ function Content({ m }: { m: Message }) {
   return <WaText text={m.body ?? ''} />;
 }
 
-export function MessageBubble({ m, senderName }: { m: Message; senderName?: string | null }) {
+// Memoized: the chat re-renders every bubble on each tick, new message or status change, and a
+// long customer text is not cheap to format; a cached message keeps its object until it changes.
+export const MessageBubble = memo(function MessageBubble({ m, senderName }: { m: Message; senderName?: string | null }) {
   if (m.direction === 'internal') {
     return (
       <div className="flex justify-end">
@@ -224,4 +227,4 @@ export function MessageBubble({ m, senderName }: { m: Message; senderName?: stri
       </div>
     </div>
   );
-}
+});

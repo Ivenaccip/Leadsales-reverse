@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import { FileText, Search } from 'lucide-react';
 import { api, errorMessage } from '../../lib/api';
 import { CATEGORY_LABEL } from '../../lib/format';
-import { defaultChannel, useChannels, useTemplates } from '../../lib/queries';
-import type { Contact, Template } from '../../lib/types';
+import { recheckContactChannel, useChannels, useContactChannel, useRecheckChannels, useTemplates } from '../../lib/queries';
+import type { Channel, Contact, Template } from '../../lib/types';
 import {
   categoryColor,
   emptyTemplateValue,
@@ -23,15 +24,28 @@ export interface TemplateChoice {
   value: TemplateFormValue;
 }
 
-/** Channel used to send to this contact: its last channel, else the workspace default. */
-export function useContactChannelId(contact: Contact | undefined): string | undefined {
-  const channels = useChannels();
-  if (contact?.channel_id) return contact.channel_id;
-  return defaultChannel(channels.data)?.id;
+/** Why a conversation's number cannot send (shown in the composer and the template pickers). */
+export function disabledChannelNotice(channel: Pick<Channel, 'name' | 'last_error'>): string {
+  const why = (channel.last_error ?? '').trim();
+  const reason = why ? `: ${why.endsWith('.') ? why.slice(0, -1) : why}` : '';
+  return `El número de esta conversación (${channel.name}) está deshabilitado${reason}. Reactívalo en Ajustes → Canales para responder.`;
 }
 
-/** Lists approved templates of a channel and lets the user fill in their variables. */
-export function TemplatePicker({ channelId, choice, onChange }: { channelId: string | undefined; choice: TemplateChoice; onChange: (c: TemplateChoice) => void }) {
+/**
+ * Lists approved templates of a channel and lets the user fill in their variables. `disabled`: the
+ * conversation's own number, when it is disabled (then there is no channelId to send from).
+ */
+export function TemplatePicker({
+  channelId,
+  disabled,
+  choice,
+  onChange,
+}: {
+  channelId: string | undefined;
+  disabled?: Channel | null;
+  choice: TemplateChoice;
+  onChange: (c: TemplateChoice) => void;
+}) {
   const templates = useTemplates(channelId);
   const channels = useChannels();
   const [q, setQ] = useState('');
@@ -39,12 +53,15 @@ export function TemplatePicker({ channelId, choice, onChange }: { channelId: str
   const filtered = approved.filter((t) => t.name.toLowerCase().includes(q.toLowerCase()));
 
   if (!channelId) {
-    // No sending number: either none is connected or every one is disabled (e.g. after the switch to prepaid).
+    // No sending number: the conversation's own is disabled, or none is connected, or every one is
+    // disabled (e.g. after the switch to prepaid).
     return (
       <Alert tone="warning">
-        {channels.data?.length
-          ? 'Tus números de WhatsApp están deshabilitados. Reactiva uno en Ajustes → Canales para usar plantillas.'
-          : 'Conecta un número de WhatsApp para usar plantillas.'}
+        {disabled
+          ? disabledChannelNotice(disabled)
+          : channels.data?.length
+            ? 'Tus números de WhatsApp están deshabilitados. Reactiva uno en Ajustes → Canales para usar plantillas.'
+            : 'Conecta un número de WhatsApp para usar plantillas.'}
       </Alert>
     );
   }
@@ -133,7 +150,9 @@ export function TemplatePicker({ channelId, choice, onChange }: { channelId: str
 }
 
 export function SendTemplateModal({ open, onClose, contact, onSent }: { open: boolean; onClose: () => void; contact: Contact; onSent: (message: any) => void }) {
-  const channelId = useContactChannelId(contact);
+  const qc = useQueryClient();
+  const { id: channelId, disabled } = useContactChannel(contact);
+  useRecheckChannels(open);
   const [choice, setChoice] = useState<TemplateChoice>({ template: null, value: emptyTemplateValue(null) });
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -164,7 +183,8 @@ export function SendTemplateModal({ open, onClose, contact, onSent }: { open: bo
       else toast.success('Plantilla enviada');
       onClose();
     } catch (err) {
-      setError(errorMessage(err));
+      // The number was disabled since the dialog opened: the picker now names it.
+      if (!(await recheckContactChannel(qc, contact, err))) setError(errorMessage(err));
     } finally {
       setSending(false);
     }
@@ -190,7 +210,7 @@ export function SendTemplateModal({ open, onClose, contact, onSent }: { open: bo
     >
       <div className="space-y-4">
         {error && <Alert tone="error">{error}</Alert>}
-        <TemplatePicker channelId={channelId} choice={choice} onChange={setChoice} />
+        <TemplatePicker channelId={channelId} disabled={disabled} choice={choice} onChange={setChoice} />
       </div>
     </Modal>
   );
@@ -204,7 +224,9 @@ function defaultLocalDateTime() {
 }
 
 export function ScheduleModal({ open, onClose, contact, windowOpen, onScheduled }: { open: boolean; onClose: () => void; contact: Contact; windowOpen: boolean; onScheduled: () => void }) {
-  const channelId = useContactChannelId(contact);
+  const qc = useQueryClient();
+  const { id: channelId, disabled } = useContactChannel(contact);
+  useRecheckChannels(open);
   const [when, setWhen] = useState(defaultLocalDateTime());
   const [kind, setKind] = useState<'text' | 'template'>(windowOpen ? 'text' : 'template');
   const [text, setText] = useState('');
@@ -246,7 +268,7 @@ export function ScheduleModal({ open, onClose, contact, windowOpen, onScheduled 
       onScheduled();
       onClose();
     } catch (err) {
-      setError(errorMessage(err));
+      if (!(await recheckContactChannel(qc, contact, err))) setError(errorMessage(err));
     } finally {
       setSaving(false);
     }
@@ -271,6 +293,7 @@ export function ScheduleModal({ open, onClose, contact, windowOpen, onScheduled 
     >
       <div className="space-y-4">
         {error && <Alert tone="error">{error}</Alert>}
+        {disabled && <Alert tone="warning">{disabledChannelNotice(disabled)}</Alert>}
         <Field label="Fecha y hora de envío" error={!validDate ? 'Elige una fecha futura' : null}>
           <Input type="datetime-local" value={when} onChange={(e) => setWhen(e.target.value)} />
         </Field>
@@ -296,7 +319,7 @@ export function ScheduleModal({ open, onClose, contact, windowOpen, onScheduled 
             )}
           </>
         ) : (
-          <TemplatePicker channelId={channelId} choice={choice} onChange={setChoice} />
+          <TemplatePicker channelId={channelId} disabled={disabled} choice={choice} onChange={setChoice} />
         )}
       </div>
     </Modal>

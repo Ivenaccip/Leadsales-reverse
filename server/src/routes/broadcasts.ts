@@ -4,6 +4,7 @@ import type { AppContext } from '../context.js';
 import { badRequest } from '../lib/errors.js';
 import {
   broadcastStats,
+  CHANNEL_GONE,
   checkBroadcastParams,
   estimateAudience,
   getBroadcast,
@@ -147,6 +148,8 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
     if (b.status !== 'draft' && body.audience) {
       throw badRequest('La audiencia de una difusión ya lanzada no se puede cambiar', 'AUDIENCE_LOCKED');
     }
+    // Its number was deleted: another one is chosen on purpose, never the workspace's default.
+    if (!b.channel_id && !body.channel_id) throw badRequest(CHANNEL_GONE, 'NO_CHANNEL');
     // Resolve the channel inside this workspace (a foreign or unknown id is a 400, never stored)
     // and check the template exists there, like POST does.
     const channel = await getChannel(ctx.db, a.workspaceId, body.channel_id ?? b.channel_id);

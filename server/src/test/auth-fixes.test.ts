@@ -261,10 +261,10 @@ describe('sessions (#51)', () => {
 describe('superadmin demotion (#20)', () => {
   it('stops the live feed of workspaces the demoted user does not belong to', async () => {
     const x = await env.register('soporte@instancia.com', 'Soporte');
-    await env.api('PATCH', `/api/admin/users/${x.userId}`, { is_superadmin: true }, op);
+    await env.api('PATCH', `/api/admin/users/${x.userId}`, { is_superadmin: true, currentPassword: 'secreto123' }, op);
     const rt = await joined(x.cookie, tenant.workspaceId);
     env.built.ctx.realtime.emit(tenant.workspaceId, 'contact:update', { id: 'antes', assigned_user_id: null });
-    await env.api('PATCH', `/api/admin/users/${x.userId}`, { is_superadmin: false }, op);
+    await env.api('PATCH', `/api/admin/users/${x.userId}`, { is_superadmin: false, currentPassword: 'secreto123' }, op);
     await sleep(200);
     expect(rt.events.find((e) => e.event === 'session:refresh')?.data).toEqual({ workspaceId: tenant.workspaceId });
     env.built.ctx.realtime.emit(tenant.workspaceId, 'contact:update', { id: 'despues', assigned_user_id: null });

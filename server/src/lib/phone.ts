@@ -73,6 +73,12 @@ export function phoneVariants(waId: string): string[] {
   return [...out];
 }
 
+/** The contact phones a WhatsApp id can stand for: its own normalized form and the variants above. */
+export function lineForms(waId: string): string[] {
+  const d = digitsOnly(waId);
+  return d ? [normalizePhone(`+${d}`), ...phoneVariants(d)] : [];
+}
+
 // Countries whose subscriber numbers can be 4 digits: their full international numbers have 7.
 const SHORT_NUMBER_CODES = ['683', '690', '290'];
 
@@ -88,6 +94,16 @@ export function countryFromPhone(phone: string): string | null {
     if (cc) return cc;
   }
   return null;
+}
+
+/**
+ * The number a message to this contact goes to (and is priced by): the WhatsApp id Meta resolved
+ * when it is another form of the phone (Brazil's 9th digit, Argentina's 9, Mexico's 1), otherwise
+ * the phone, which Meta resolves itself. Any other wa_id is not this line: one forged abroad, or the
+ * number the customer left, which an earlier version learned from a late status.
+ */
+export function deliveryNumber(phone: string, waId: string | null | undefined): string {
+  return waId && lineForms(waId).includes(phone) ? waId : phone;
 }
 
 /** Pricing market used in the rate card for a phone number. */

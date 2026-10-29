@@ -143,7 +143,8 @@ export async function miscRoutes(app: FastifyInstance, ctx: AppContext) {
       if (rows[0]) throw forbidden('Este archivo pertenece a una conversación asignada a otra persona');
     }
     const abs = mediaAbsPath(ctx, file);
-    if (!fs.existsSync(abs)) throw badRequest('El archivo ya no existe en el servidor');
+    const stat = await fs.promises.stat(abs).catch(() => null);
+    if (!stat?.isFile()) throw badRequest('El archivo ya no existe en el servidor');
     // Files may come from anyone on WhatsApp: only well-known media types are rendered
     // by the browser; everything else (SVG, HTML…) is downloaded, never executed.
     const inline = INLINE_SAFE.has(file.mime);
@@ -153,6 +154,44 @@ export async function miscRoutes(app: FastifyInstance, ctx: AppContext) {
     reply.header('Content-Security-Policy', "default-src 'none'; img-src 'self'; media-src 'self'; sandbox");
     const safeName = (file.filename ?? 'archivo').replace(/[^\w.\- ]+/g, '_');
     reply.header('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename="${safeName}"`);
+    // Byte ranges: Safari and iOS only play <video>/<audio> from servers that answer them (206), and
+    // every browser needs them to seek. A file never changes under its id, so If-Range always holds.
+    reply.header('Accept-Ranges', 'bytes');
+    const range = byteRange(req.headers.range, stat.size);
+    if (range === 'unsatisfiable') {
+      reply.header('Content-Range', `bytes */${stat.size}`);
+      return reply.code(416).send();
+    }
+    if (range) {
+      reply.code(206);
+      reply.header('Content-Range', `bytes ${range.start}-${range.end}/${stat.size}`);
+      reply.header('Content-Length', range.end - range.start + 1);
+      return reply.send(fs.createReadStream(abs, range));
+    }
+    reply.header('Content-Length', stat.size);
     return reply.send(fs.createReadStream(abs));
   });
+}
+
+/**
+ * A single "bytes=" range of a file of `size` bytes (RFC 9110 14.1.2): first-last, first- or -suffix.
+ * null = serve the whole file (no header, an unknown unit, several ranges or a malformed one).
+ */
+export function byteRange(header: string | undefined, size: number): { start: number; end: number } | 'unsatisfiable' | null {
+  const m = /^bytes=(\d*)-(\d*)$/.exec((header ?? '').trim());
+  if (!m || (!m[1] && !m[2])) return null;
+  let start: number;
+  let end: number;
+  if (!m[1]) {
+    const suffix = Number(m[2]);
+    if (suffix === 0) return 'unsatisfiable';
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = Number(m[1]);
+    end = m[2] ? Math.min(Number(m[2]), size - 1) : size - 1;
+    if (m[2] && Number(m[2]) < start) return null;
+  }
+  if (start >= size || end < start) return 'unsatisfiable';
+  return { start, end };
 }

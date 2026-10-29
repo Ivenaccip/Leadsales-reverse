@@ -1,5 +1,7 @@
 // C0 control bytes other than tab, LF and CR: no text file has them, binary files (xlsx, zip) do.
 const BINARY_BYTE = /[\x00-\x08\x0b\x0c\x0e-\x1f]/;
+// A non-ASCII character decoded from valid UTF-8 (anything but U+FFFD, the replacement of a bad byte).
+const UTF8_CHAR = /[\u0080-\ufffc\ufffe-\u{10ffff}]/u;
 
 // windows-1252 for bytes 0x80-0x9F (€, curly quotes, dashes…). Some engines (Node) decode the
 // 'windows-1252' label as ISO-8859-1 and return C1 controls there; the five unassigned bytes stay as is.
@@ -32,10 +34,15 @@ export function decodeCsvFile(data: ArrayBuffer | Uint8Array): { text: string; l
   try {
     return { text: new TextDecoder('utf-8', { fatal: true }).decode(bytes), lossy: false };
   } catch {
+    const utf8 = new TextDecoder('utf-8').decode(bytes);
+    // Well-formed multi-byte sequences mean UTF-8 with a bad byte (a value cut mid-character, files
+    // joined together), not ANSI: Spanish windows-1252 text practically never forms them. Reading it
+    // as windows-1252 would store every accent as mojibake ("JosÃ©"), so it goes on as lossy.
+    if (UTF8_CHAR.test(utf8)) return { text: utf8, lossy: true };
     // Every byte is valid windows-1252, so only fall back for what looks like text.
     const latin = decodeWindows1252(bytes);
     if (!BINARY_BYTE.test(latin)) return { text: latin, lossy: false };
-    return { text: new TextDecoder('utf-8').decode(bytes), lossy: true };
+    return { text: utf8, lossy: true };
   }
 }
 

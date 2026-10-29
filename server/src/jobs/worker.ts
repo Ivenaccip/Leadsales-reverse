@@ -106,6 +106,7 @@ export class Worker {
   private lastBeat = 0;
   private lastCleanup = 0;
   private lastAnalyze = 0;
+  private lastVacuumAll = 0;
   /** Jobs whose handler or final write is still in progress in this process. */
   private active = new Set<number>();
 
@@ -219,7 +220,9 @@ export class Worker {
         if (free <= 0) break;
         const jobs = await this.claim(lane, free);
         if (this.stopped) {
-          for (const job of jobs) await this.giveBack(job, this.id, { counted: false });
+          for (const job of jobs) {
+            await this.giveBack(job, this.id, { counted: false }).catch((err) => this.ctx.log.error({ err, jobId: job.id }, 'could not requeue job'));
+          }
           break;
         }
         for (const job of jobs) this.launch(lane, job);
@@ -271,7 +274,16 @@ export class Worker {
     if (!lane.opts.perWorkspace) return this.claimInOrder(lane.name, slots, false);
     const jobs = await this.claimFair(lane, slots);
     // Jobs without a workspace share whatever is left, in arrival order.
-    if (jobs.length < slots) jobs.push(...(await this.claimInOrder(lane.name, slots - jobs.length, true)));
+    if (jobs.length < slots) {
+      try {
+        jobs.push(...(await this.claimInOrder(lane.name, slots - jobs.length, true)));
+      } catch (err) {
+        // The fair claim is already committed: its jobs must still run, or they would sit 'running'
+        // with no handler (holding their contact's serial key) until recovery charges them an attempt.
+        if (!jobs.length) throw err;
+        this.ctx.log.error({ err, lane: lane.name }, 'worker claim failed');
+      }
+    }
     return jobs;
   }
 
@@ -496,6 +508,8 @@ export class Worker {
    * Returns a claimed job to the queue. `counted: false` (shutdown) undoes the attempt and runs it
    * again right away; otherwise the attempt counts (waiting its backoff unless `now`) and a job out
    * of attempts fails for good, so a job that kills the process cannot crash-loop it forever.
+   * A job run again right away keeps its run_at (it was due when claimed): it stays first among the
+   * jobs of its serial key, so release() leaves the one queued behind it held and their order holds.
    */
   private async giveBack(
     job: Pick<Job, 'id' | 'type' | 'attempts' | 'max_attempts' | 'serial_key'>,
@@ -519,9 +533,10 @@ export class Worker {
       try {
         await this.ctx.db.query(
           `UPDATE jobs SET status = 'queued', locked_at = NULL, locked_by = NULL, last_error = COALESCE($4, last_error),
-             attempts = attempts - $5, run_at = now() + ($6 || ' seconds')::interval
+             attempts = attempts - $5,
+             run_at = CASE WHEN $6::int > 0 THEN now() + $6::int * interval '1 second' ELSE LEAST(run_at, now()) END
            WHERE ${owned}`,
-          [...p, o.reason ?? null, o.counted ? 0 : 1, String(o.counted && !o.now ? retryDelaySec(job.type, job.attempts) : 0)],
+          [...p, o.reason ?? null, o.counted ? 0 : 1, o.counted && !o.now ? retryDelaySec(job.type, job.attempts) : 0],
         );
       } catch (err: any) {
         if (err?.code !== '23505') throw err;
@@ -613,9 +628,9 @@ export class Worker {
 
   /**
    * Stale-job recovery, release of stranded serial keys, fresh planner statistics on PGlite and,
-   * every 10 minutes, cleanup (old jobs, partial downloads left by a crash) and settlement of what no
-   * job will finish: sends Meta never confirmed and scheduled messages whose job died with the
-   * process. Each step runs on its own so one failure cannot block the others.
+   * every 10 minutes, cleanup (old jobs, then VACUUM on PGlite; partial downloads left by a crash)
+   * and settlement of what no job will finish: sends Meta never confirmed and scheduled messages
+   * whose job died with the process. Each step runs on its own so one failure cannot block the others.
    */
   async maintenance(): Promise<void> {
     try {
@@ -644,6 +659,18 @@ export class Worker {
       await this.ctx.db.query(`DELETE FROM worker_heartbeats WHERE seen_at < now() - interval '1 day'`);
     } catch (err) {
       this.ctx.log.error({ err }, 'job cleanup failed');
+    }
+    if (this.ctx.db.kind === 'pglite') {
+      // PGlite runs no autovacuum: without VACUUM the space of deleted and updated rows is never
+      // reused, and the jobs table (a few row versions per job) grows with every job ever run. Once a
+      // day the whole database, as autovacuum would (message statuses, contacts, old transaction ids).
+      const all = Date.now() - this.lastVacuumAll >= 24 * 60 * 60_000;
+      try {
+        await this.ctx.db.query(all ? `VACUUM` : `VACUUM jobs`);
+        if (all) this.lastVacuumAll = Date.now();
+      } catch (err) {
+        this.ctx.log.error({ err }, 'vacuum failed');
+      }
     }
     try {
       await removeStaleMediaTemp(this.ctx);

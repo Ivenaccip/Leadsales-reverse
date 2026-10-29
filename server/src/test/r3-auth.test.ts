@@ -599,13 +599,13 @@ describe('accounts created through an invitation by someone else (r3 #25)', () =
     const rt = await connected(s.cookie);
     const id = (await env.api('GET', '/api/auth/me', undefined, { cookie: s.cookie, ws: null })).body.user.id;
     expect((await env.api('POST', `/api/admin/users/${id}/password`, { password: 'temporal12345' }, owner)).status).toBe(403);
-    expect((await env.api('POST', `/api/admin/users/${id}/password`, { password: 'temporal12345' }, op)).status).toBe(200);
+    expect((await env.api('POST', `/api/admin/users/${id}/password`, { password: 'temporal12345', currentPassword: 'secreto123' }, op)).status).toBe(200);
     await sleep(150);
     expect(rt.s.connected).toBe(false);
     expect((await env.api('GET', '/api/auth/me', undefined, { cookie: s.cookie, ws: null })).status).toBe(401);
     expect((await login('olvido@r3.com', 'antigua12345')).status).toBe(401);
     expect((await login('olvido@r3.com', 'temporal12345')).status).toBe(200);
-    expect((await env.api('POST', `/api/admin/users/${op.userId}/password`, { password: 'temporal12345' }, op)).status).toBe(400);
+    expect((await env.api('POST', `/api/admin/users/${op.userId}/password`, { password: 'temporal12345', currentPassword: 'secreto123' }, op)).status).toBe(400);
   });
 });
 

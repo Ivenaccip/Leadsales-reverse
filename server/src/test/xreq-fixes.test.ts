@@ -414,19 +414,27 @@ describe('status webhooks remember the WhatsApp id Meta delivered to', () => {
     processStatus(ctx(), cloud, { id: wamid, status: 'sent', recipient_id: recipient, timestamp: String(Math.floor(Date.now() / 1000)) });
 
   it('stores recipient_id when the contact has no wa_id yet, unless another contact holds it', async () => {
-    const id = await newContact('Brasil');
+    // Argentina: Meta delivers to 549 + area + number; both leads were typed as other forms of that line.
+    const id = await newContact('Argentina', { phone: '+54 11 2345 6701' });
     const r = await env.api('POST', `/api/contacts/${id}/messages`, { type: 'template', name: 'promo', language: 'es_MX', params: { body: ['x'] } });
     expect((await q(`SELECT wa_id FROM contacts WHERE id = $1`, [id])).rows[0].wa_id).toBeNull();
-    expect(await status(r.body.message.wamid, '551187650001')).toBe(true);
-    expect((await q(`SELECT wa_id FROM contacts WHERE id = $1`, [id])).rows[0].wa_id).toBe('551187650001');
+    expect(await status(r.body.message.wamid, '5491123456701')).toBe(true);
+    expect((await q(`SELECT wa_id FROM contacts WHERE id = $1`, [id])).rows[0].wa_id).toBe('5491123456701');
     // A later status never replaces a wa_id the contact already has.
-    await status(r.body.message.wamid, '551187650002');
-    expect((await q(`SELECT wa_id FROM contacts WHERE id = $1`, [id])).rows[0].wa_id).toBe('551187650001');
+    await status(r.body.message.wamid, '5491123456702');
+    expect((await q(`SELECT wa_id FROM contacts WHERE id = $1`, [id])).rows[0].wa_id).toBe('5491123456701');
 
-    const other = await newContact('Otro');
+    const other = await newContact('Otro', { phone: '+54 11 15 2345 6701' });
     const r2 = await env.api('POST', `/api/contacts/${other}/messages`, { type: 'template', name: 'promo', language: 'es_MX', params: { body: ['x'] } });
-    await status(r2.body.message.wamid, '551187650001');
+    await status(r2.body.message.wamid, '5491123456701');
     expect((await q(`SELECT wa_id FROM contacts WHERE id = $1`, [other])).rows[0].wa_id).toBeNull();
+  });
+
+  it("never stores a recipient_id that is not a form of the contact's number", async () => {
+    const id = await newContact('México');
+    const r = await env.api('POST', `/api/contacts/${id}/messages`, { type: 'template', name: 'promo', language: 'es_MX', params: { body: ['x'] } });
+    await status(r.body.message.wamid, '551187650001');
+    expect((await q(`SELECT wa_id FROM contacts WHERE id = $1`, [id])).rows[0].wa_id).toBeNull();
   });
 });
 

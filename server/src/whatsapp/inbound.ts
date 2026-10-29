@@ -2,7 +2,7 @@ import type { AppContext } from '../context.js';
 import type { Queryable } from '../db/index.js';
 import type { Job } from '../jobs/queue.js';
 import { AppError, notFound } from '../lib/errors.js';
-import { digitsOnly, isValidPhone, normalizePhone, phoneVariants } from '../lib/phone.js';
+import { deliveryNumber, digitsOnly, isValidPhone, lineForms, normalizePhone, phoneVariants } from '../lib/phone.js';
 import { createContact, getContact, type Contact } from '../services/contacts.js';
 import { notifyCredits, reconcilePricing, refund } from '../services/credits.js';
 import { dispatchWebhook, recordEvent } from '../services/events.js';
@@ -30,6 +30,14 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // message_template_status_update events that are real template statuses. REINSTATED means the
 // template can be sent again; FLAGGED, LOCKED and UNLOCKED are notices that leave it sendable.
 const TEMPLATE_STATUSES = new Set(['APPROVED', 'REJECTED', 'PENDING', 'PAUSED', 'DISABLED', 'IN_APPEAL', 'PENDING_DELETION', 'DELETED', 'ARCHIVED', 'LIMIT_EXCEEDED']);
+// The only template categories Meta has: anything else in a category update is not Meta's (a
+// 'service' template would be sent for free).
+const TEMPLATE_CATEGORIES = new Set(['marketing', 'utility', 'authentication']);
+// How long after a number change what still comes from the old number belongs to the contact that
+// moved: Meta retries a webhook for up to 7 days, and a number given up is reassigned much later.
+const MOVED_NUMBER_DAYS = 30;
+// How far ahead of our clock Meta's may run: a time further ahead in a payload is not Meta's.
+const META_CLOCK_SKEW_S = 300;
 
 class RetryLater extends Error {}
 
@@ -59,8 +67,13 @@ function isoMicros(value: number): string {
  * Late deliveries keep Meta's original time.
  */
 function messageTime(ts: string | undefined, receivedUs: number, seq: number): number {
+  return (lateDelivery(ts, receivedUs) ? Number(ts) * 1_000_000 : receivedUs) + seq;
+}
+
+/** A delivery 60 s or more away from Meta's time: the message is stored at Meta's time. */
+function lateDelivery(ts: string | undefined, receivedUs: number): boolean {
   const meta = ts ? Number(ts) * 1_000_000 : NaN;
-  return (Number.isFinite(meta) && Math.abs(receivedUs - meta) >= 60_000_000 ? meta : receivedUs) + seq;
+  return Number.isFinite(meta) && Math.abs(receivedUs - meta) >= 60_000_000;
 }
 
 /** Meta's timestamp (whole seconds) of an inbound message or echo, stored as messages.wa_ts. */
@@ -88,7 +101,7 @@ async function edgeTime(q: Queryable, agg: 'min' | 'max', where: string, params:
  * of its own so the order never falls to the id tie-break. Call under the contact row lock so
  * messages of one chat handled at once see each other.
  */
-async function chatTime(q: Queryable, contactId: string, us: number, waTs: number | null): Promise<string> {
+async function chatTime(q: Queryable, contactId: string, us: number, waTs: number | null, late: boolean): Promise<string> {
   if (waTs == null) return isoMicros(us);
   const after = await edgeTime(q, 'max', 'wa_ts < $2', [contactId, waTs]);
   // Placed this way, every message of an earlier Meta second is stored before those of later ones.
@@ -97,9 +110,16 @@ async function chatTime(q: Queryable, contactId: string, us: number, waTs: numbe
     const prev = await edgeTime(q, 'max', 'created_at < $2', [contactId, isoMicros(before)]);
     return isoMicros(prev == null ? before - SLOT_US : await between(q, contactId, prev, before, true));
   }
-  if (after != null && us <= after) {
-    const next = await edgeTime(q, 'min', 'created_at > $2', [contactId, isoMicros(after)]);
-    return isoMicros(await between(q, contactId, after, next, false));
+  // Stored at Meta's time, a late message has no receipt time of its own to keep its place within
+  // that second: it goes after the messages of the second that reached us before it (two late ones
+  // of one second would otherwise tie on the same microsecond).
+  const same = late
+    ? await edgeTime(q, 'max', 'wa_ts = $2 AND created_at < $3', [contactId, waTs, before == null ? 'infinity' : isoMicros(before)])
+    : null;
+  const floor = same != null && (after == null || same > after) ? same : after;
+  if (floor != null && us <= floor) {
+    const next = await edgeTime(q, 'min', 'created_at > $2', [contactId, isoMicros(floor)]);
+    return isoMicros(await between(q, contactId, floor, next, false));
   }
   return isoMicros(us);
 }
@@ -181,6 +201,10 @@ export async function processWebhook(
   let receipt: Promise<number> | null = null;
   const receivedAt = () => (receipt ??= receiptTime(ctx, job));
   const trust: Trust = { allowed, trusted };
+  // Positions count across the whole payload: messages of different changes or entries (one
+  // customer's burst, a phone reply) reach us together and must not share a time.
+  let position = 0;
+  const nextSeq = () => position++;
   let changes = 0;
   for (const entry of body.entry ?? []) {
     for (const change of entry.changes ?? []) {
@@ -190,19 +214,19 @@ export async function processWebhook(
       try {
         switch (change.field) {
           case 'messages':
-            await processMessagesChange(ctx, value, job, trust, receivedAt);
+            await processMessagesChange(ctx, value, job, trust, receivedAt, nextSeq);
             break;
           case 'smb_message_echoes':
-            await processEchoes(ctx, value, allowed, receivedAt);
+            await processEchoes(ctx, value, allowed, receivedAt, nextSeq);
             break;
           case 'message_template_status_update':
-            await processTemplateStatus(ctx, entry.id, value, allowed);
+            await processTemplateStatus(ctx, entry.id, value, allowed, entryTime(entry.time));
             break;
           case 'message_template_components_update':
             await refreshTemplates(ctx, entry.id, value, allowed);
             break;
           case 'template_category_update':
-            await processTemplateCategory(ctx, entry.id, value, allowed);
+            await processTemplateCategory(ctx, entry.id, value, allowed, entryTime(entry.time));
             break;
           default:
             ctx.log.debug({ field: change.field }, 'webhook field ignored');
@@ -222,6 +246,20 @@ export async function processWebhook(
   if (retry) throw new Error('Estados de mensajes aún no registrados; se reintentará');
 }
 
+/**
+ * When Meta raised the notification (entry.time: seconds, milliseconds tolerated), as an instant.
+ * Template events are applied in this order: a retried or redelivered older one comes after newer ones.
+ * Meta's clock may run a little ahead of ours, never minutes: a later time is not Meta's (a payload
+ * signed with an App Secret the business knew) and, stored, would freeze the template against every
+ * genuine event after it. Such an event counts as undated.
+ */
+function entryTime(t: unknown): string | null {
+  const n = Number(t);
+  if (t == null || t === '' || !Number.isFinite(n) || n <= 0) return null;
+  const ms = n >= 1e11 ? n : n * 1000;
+  return ms > Date.now() + META_CLOCK_SKEW_S * 1000 ? null : new Date(ms).toISOString();
+}
+
 async function channelByPhoneNumberId(ctx: AppContext, phoneNumberId: string | undefined, allowed: string[] | null): Promise<ChannelRow | null> {
   if (!phoneNumberId) return null;
   const { rows } = await ctx.db.query<ChannelRow>(
@@ -231,7 +269,14 @@ async function channelByPhoneNumberId(ctx: AppContext, phoneNumberId: string | u
   return rows[0] ?? null;
 }
 
-async function processMessagesChange(ctx: AppContext, value: any, job: Job | undefined, trust: Trust, receivedAt: () => Promise<number>) {
+async function processMessagesChange(
+  ctx: AppContext,
+  value: any,
+  job: Job | undefined,
+  trust: Trust,
+  receivedAt: () => Promise<number>,
+  nextSeq: () => number,
+) {
   const channel = await channelByPhoneNumberId(ctx, value.metadata?.phone_number_id, trust.allowed);
   if (!channel) {
     ctx.log.warn({ phoneNumberId: value.metadata?.phone_number_id }, 'webhook for unknown phone number id');
@@ -244,7 +289,7 @@ async function processMessagesChange(ctx: AppContext, value: any, job: Job | und
     const msg = messages[i];
     const profile = (value.contacts ?? []).find((c: any) => c.wa_id === msg.from) ?? value.contacts?.[0];
     try {
-      await processInboundMessage(ctx, channel, msg, profile, await receivedAt(), i);
+      await processInboundMessage(ctx, channel, msg, profile, await receivedAt(), nextSeq());
     } catch (err) {
       const e = keepTransient(ctx, err, { channel: channel.id, wamid: msg?.id });
       failure ??= e;
@@ -351,23 +396,25 @@ export function optOutKeyword(parsed: ParsedContent): string | null {
  * Finds the contact behind a WhatsApp id. Meta's wa_id can differ from the number we stored
  * (Brazil's 9th digit, Argentina's 9...), and sends record the wa_id Meta answers with, so a
  * contact already holding this wa_id wins. Next comes a lead stored under another form of the
- * same number that no other WhatsApp id claimed yet (it then learns this wa_id); otherwise
- * match or create by phone. A wa_id is already international: the workspace country code
- * must never be added to it.
+ * same number that no other WhatsApp id claimed yet (it then learns this wa_id), then a contact
+ * that moved off this number when the customer changed it (`moved`); otherwise match or create
+ * by phone. A wa_id is already international: the workspace country code must never be added to it.
+ * `sentAt` is Meta's time (seconds) of the message or echo; null for a WhatsApp notice.
  */
 async function contactForWaId(
   ctx: AppContext,
   channel: ChannelRow,
   waId: string,
+  sentAt: number | null,
   extra: { name?: string | null; source: string },
-): Promise<Contact> {
+): Promise<{ contact: Contact; moved: boolean }> {
   if (waId) {
     const phone = normalizePhone(`+${waId}`);
     const { rows } = await ctx.db.query<{ id: string }>(
       `SELECT id FROM contacts WHERE workspace_id = $1 AND wa_id = $2 ORDER BY (phone = $3) DESC, created_at ASC LIMIT 1`,
       [channel.workspace_id, waId, phone],
     );
-    if (rows[0]) return getContact(ctx.db, channel.workspace_id, rows[0].id);
+    if (rows[0]) return { contact: await getContact(ctx.db, channel.workspace_id, rows[0].id), moved: false };
     const variants = phoneVariants(waId).filter((v) => v !== phone);
     if (variants.length) {
       const { rows: same } = await ctx.db.query<{ id: string }>(
@@ -376,8 +423,23 @@ async function contactForWaId(
          ORDER BY created_at ASC LIMIT 1`,
         [channel.workspace_id, variants, phone],
       );
-      if (same[0]) return getContact(ctx.db, channel.workspace_id, same[0].id);
+      if (same[0]) return { contact: await getContact(ctx.db, channel.workspace_id, same[0].id), moved: false };
     }
+    // The customer changed number: a message sent from the old one before the change and delivered
+    // late, a reply typed in its old chat on the phone before it, the notice again through another
+    // of the business's numbers. They belong to the contact that moved, not to a new lead. What is
+    // stamped after the change comes from, or goes to, whoever holds the old number now: a new lead.
+    // (changed_at: Meta's time of the change; events recorded before it was kept have their own time.)
+    const { rows: moved } = await ctx.db.query<{ contact_id: string }>(
+      `SELECT e.contact_id FROM contact_events e
+       WHERE e.workspace_id = $1 AND e.type = 'number_changed' AND e.created_at > now() - interval '${MOVED_NUMBER_DAYS} days'
+         AND (e.data->>'old_wa_id' = $2 OR e.data->>'old_phone' = $3) AND e.data->>'moved' = 'true'
+         AND ($4::bigint IS NULL OR $4::bigint <= COALESCE((e.data->>'changed_at')::bigint, extract(epoch FROM e.created_at)::bigint))
+         AND NOT EXISTS (SELECT 1 FROM contacts o WHERE o.workspace_id = $1 AND o.phone = $3)
+       ORDER BY e.created_at DESC LIMIT 1`,
+      [channel.workspace_id, waId, phone, sentAt],
+    );
+    if (moved[0]) return { contact: await getContact(ctx.db, channel.workspace_id, moved[0].contact_id), moved: true };
   }
   const { contact } = await createContact(ctx, channel.workspace_id, {
     phone: `+${waId}`,
@@ -386,7 +448,7 @@ async function contactForWaId(
     source: extra.source,
     channelId: channel.id,
   });
-  return contact;
+  return { contact, moved: false };
 }
 
 /** The message already stored for a WhatsApp id (a redelivery by Meta, or a retried job). */
@@ -429,10 +491,16 @@ export async function processInboundMessage(
   const waId = digitsOnly(String(msg.from ?? ''));
   const profileName: string | null = profile?.profile?.name ?? null;
   const referral = msg.referral ?? null;
-  const contact = await contactForWaId(ctx, channel, waId, { name: profileName, source: referral ? 'whatsapp_ad' : 'whatsapp' });
+  const waTs = metaSeconds(msg.timestamp);
+  const receivedS = Math.floor(receivedUs / 1_000_000);
+  const { contact, moved } = await contactForWaId(ctx, channel, waId, isSystem ? null : (waTs ?? receivedS), {
+    name: profileName,
+    source: referral ? 'whatsapp_ad' : 'whatsapp',
+  });
+  // Sent from the number the customer has since left: kept in the chat, but too old to answer.
+  const answer = automate && !moved;
 
   const payload = referral ? { ...(parsed.payload ?? {}), referral } : parsed.payload;
-  const waTs = metaSeconds(msg.timestamp);
   const preview = previewFor(parsed.type, parsed.body);
 
   let isNew = false;
@@ -445,7 +513,7 @@ export async function processInboundMessage(
       `SELECT last_message_at IS NULL AND source LIKE 'whatsapp%' AS opened FROM contacts WHERE id = $1 FOR NO KEY UPDATE`,
       [contact.id],
     );
-    const createdAt = await chatTime(q, contact.id, messageTime(msg.timestamp, receivedUs, seq), waTs);
+    const createdAt = await chatTime(q, contact.id, messageTime(msg.timestamp, receivedUs, seq), waTs, lateDelivery(msg.timestamp, receivedUs));
     const { rows } = await q.query<MessageRow>(
       `INSERT INTO messages (workspace_id, contact_id, channel_id, direction, type, body, media, payload, wamid,
          reply_to_wamid, status, sent_by, created_at, followups_done, wa_ts)
@@ -468,7 +536,9 @@ export async function processInboundMessage(
     const m = rows[0];
     if (!m) return null; // duplicate delivery
     if (isSystem) {
-      await applySystemNotice(q, contact, waId, msg.system, createdAt, preview);
+      // The change happened at Meta's time of the notice (one far ahead of our clock is not Meta's).
+      const changedAt = Math.min(waTs ?? receivedS, receivedS + META_CLOCK_SKEW_S);
+      await applySystemNotice(q, contact, waId, msg.system, createdAt, preview, changedAt);
     } else {
       // A lead is new while the conversation it started over WhatsApp has no message yet (read
       // under the lock: of several first messages only one is the first, and a retry after the
@@ -478,17 +548,19 @@ export async function processInboundMessage(
       // older than a reply typed in the WhatsApp Business app was already seen on the phone.
       // A sandbox message never moves a contact off its real (Cloud API) number: replies would
       // stop reaching WhatsApp (the simulate route refuses this too; this guards every other path).
+      // The wa_id is only learned for the number the contact has now (read under the lock): a message
+      // from a number the customer left, however late, never points the replies back at it.
       await q.query(
         `UPDATE contacts SET last_message_at = GREATEST(COALESCE(last_message_at, $2), $2), last_inbound_at = GREATEST(COALESCE(last_inbound_at, $2), $2),
            last_message_preview = CASE WHEN last_message_at IS NULL OR $2 >= last_message_at THEN $3 ELSE last_message_preview END,
            unread_count = unread_count + CASE WHEN $4::int > 0 AND NOT EXISTS (
              SELECT 1 FROM messages e WHERE e.contact_id = $1 AND e.sent_by = 'phone' AND e.created_at > $2) THEN $4::int ELSE 0 END,
-           wa_id = $5,
+           wa_id = CASE WHEN phone = ANY($9::text[]) THEN $5 ELSE wa_id END,
            channel_id = CASE WHEN $8 AND EXISTS (SELECT 1 FROM channels ch WHERE ch.id = contacts.channel_id AND ch.provider = 'cloud_api')
              THEN channel_id ELSE $6 END,
            name = COALESCE(name, $7), is_archived = false, updated_at = now()
          WHERE id = $1`,
-        [contact.id, createdAt, preview, parsed.type === 'reaction' ? 0 : 1, waId, channel.id, profileName, channel.provider === 'sandbox'],
+        [contact.id, createdAt, preview, parsed.type === 'reaction' ? 0 : 1, waId, channel.id, profileName, channel.provider === 'sandbox', lineForms(waId)],
       );
     }
     if (optOut && !contact.opted_out) {
@@ -499,9 +571,9 @@ export async function processInboundMessage(
   });
   if (!inserted) {
     const raced = await storedMessage(ctx, channel.workspace_id, msg.id);
-    return raced ? finishDuplicate(ctx, raced, automate) : null;
+    return raced ? finishDuplicate(ctx, raced, answer) : null;
   }
-  await inboundFollowups(ctx, inserted, { isNew, automate });
+  await inboundFollowups(ctx, inserted, { isNew, automate: answer });
   return publicRow(inserted);
 }
 
@@ -514,9 +586,18 @@ async function finishDuplicate(ctx: AppContext, m: MessageRow, automate: boolean
 /**
  * WhatsApp system notices are not written by the customer: they neither open the 24h window
  * nor count as unread. When the customer changed number the contact moves to the new one,
- * unless another contact already has it (the event then links both).
+ * unless another contact already has it (the event then links both). `changedAt`: Meta's time of
+ * the change (seconds), which tells what still came from the customer on the old number.
  */
-async function applySystemNotice(q: Queryable, contact: Contact, waId: string, system: any, createdAt: string, preview: string) {
+async function applySystemNotice(
+  q: Queryable,
+  contact: Contact,
+  waId: string,
+  system: any,
+  createdAt: string,
+  preview: string,
+  changedAt: number,
+) {
   await q.query(
     `UPDATE contacts SET last_message_at = GREATEST(COALESCE(last_message_at, $2), $2),
        last_message_preview = CASE WHEN last_message_at IS NULL OR $2 >= last_message_at THEN $3 ELSE last_message_preview END,
@@ -529,6 +610,12 @@ async function applySystemNotice(q: Queryable, contact: Contact, waId: string, s
   const newWaId = digitsOnly(String(system.new_wa_id ?? system.wa_id ?? ''));
   const newPhone = normalizePhone(`+${newWaId}`);
   if (!newWaId || newWaId === waId || !isValidPhone(newPhone)) return;
+  // Read under the contact lock the caller holds: the same change notified at once through two of
+  // the business's numbers is applied once. Only a contact still on the number the notice is about
+  // moves: the change notified again, or late after a later one, leaves it where it is now.
+  const { rows: fresh } = await q.query<{ phone: string; wa_id: string | null }>(`SELECT phone, wa_id FROM contacts WHERE id = $1`, [contact.id]);
+  const cur = fresh[0];
+  if (!cur || (cur.wa_id !== waId && !lineForms(waId).includes(cur.phone))) return;
   const other = await q.query<{ id: string }>(
     `SELECT id FROM contacts WHERE workspace_id = $1 AND id <> $2 AND (phone = $3 OR wa_id = $4) ORDER BY created_at LIMIT 1`,
     [contact.workspace_id, contact.id, newPhone, newWaId],
@@ -539,7 +626,15 @@ async function applySystemNotice(q: Queryable, contact: Contact, waId: string, s
     workspaceId: contact.workspace_id,
     contactId: contact.id,
     type: 'number_changed',
-    data: { old_wa_id: waId, new_wa_id: newWaId, old_phone: contact.phone, new_phone: newPhone, moved: !otherId, other_contact_id: otherId },
+    data: {
+      old_wa_id: waId,
+      new_wa_id: newWaId,
+      old_phone: cur.phone,
+      new_phone: newPhone,
+      moved: !otherId,
+      other_contact_id: otherId,
+      changed_at: changedAt,
+    },
   });
 }
 
@@ -630,16 +725,21 @@ async function statusTarget(ctx: AppContext, channel: ChannelRow, st: any): Prom
 /**
  * A status names the WhatsApp id Meta delivered to (Brazil's 9th digit, Argentina's 9): remember
  * it as a send's answer does, so replies from it land on this contact even when that answer was
- * lost. Same guard as sendMessage: never an id that another contact already holds.
+ * lost. Same guard as sendMessage: never an id that another contact already holds. Only another
+ * form of the number the contact has now: a late status of a message sent before the customer
+ * changed number names the old one, and a status signed with a secret the business knew could
+ * name any number (sends go to, and are priced by, the wa_id).
  */
 async function rememberRecipient(ctx: AppContext, msg: StatusTarget, recipientId: unknown) {
   const waId = digitsOnly(String(recipientId ?? ''));
   if (!/^\d{6,20}$/.test(waId) || waId === msg.phone || (msg.contact_wa_id && msg.contact_wa_id !== msg.phone)) return;
+  const forms = lineForms(waId);
+  if (!forms.includes(msg.phone)) return;
   await ctx.db
     .query(
-      `UPDATE contacts SET wa_id = $2 WHERE id = $1 AND (wa_id IS NULL OR wa_id = phone)
+      `UPDATE contacts SET wa_id = $2 WHERE id = $1 AND phone = ANY($4::text[]) AND (wa_id IS NULL OR wa_id = phone)
          AND NOT EXISTS (SELECT 1 FROM contacts o WHERE o.workspace_id = $3 AND o.wa_id = $2 AND o.id <> $1)`,
-      [msg.contact_id, waId, msg.workspace_id],
+      [msg.contact_id, waId, msg.workspace_id, forms],
     )
     .catch((err) => ctx.log.warn({ err: (err as Error).message, contactId: msg.contact_id }, 'storing wa_id from status failed'));
 }
@@ -672,8 +772,11 @@ export async function processStatus(ctx: AppContext, channel: ChannelRow, st: an
     }
     const wasReconciled = msg.pricing_reconciled;
     const settles = billingTrusted || !msg.charged_prepaid;
-    if (settles && st.pricing) await reconcilePricing(ctx, q, msg, msg.phone, st.pricing);
-    else if (settles && status === 'failed') await reconcilePricing(ctx, q, msg, msg.phone, null);
+    // Priced by the number the message went to, as the send was: the one Meta names when the status is its word.
+    const recipient = digitsOnly(String(st.recipient_id ?? ''));
+    const billedTo = billingTrusted && isValidPhone(recipient) ? recipient : deliveryNumber(msg.phone, msg.contact_wa_id);
+    if (settles && st.pricing) await reconcilePricing(ctx, q, msg, billedTo, st.pricing);
+    else if (settles && status === 'failed') await reconcilePricing(ctx, q, msg, billedTo, null);
     // Meta only bills delivered messages: a failure after a billable "sent" gives the charge back.
     if (settles && status === 'failed' && wasReconciled && msg.status !== 'delivered' && msg.status !== 'read' && Number(msg.cost) > 0) {
       await q.query(`UPDATE messages SET cost = 0 WHERE id = $1`, [msg.id]);
@@ -694,6 +797,20 @@ export async function processStatus(ctx: AppContext, channel: ChannelRow, st: an
         title: e.title ?? e.message ?? 'Error',
         message: explainMetaError(e.code, e.error_data?.details ?? e.message ?? e.title ?? 'Mensaje no entregado'),
       };
+    }
+    if (status === 'failed' && msg.status === 'failed') {
+      // The same failure again (Meta redelivers, a retried job runs every status of its payload): it was
+      // already stored and reported. A different explanation (e.g. Meta's own, for a send we had given
+      // up on) replaces ours, without telling integrations about one failure twice.
+      const r = await q.query<MessageRow>(`UPDATE messages SET error = $2 WHERE id = $1 AND error IS DISTINCT FROM $2::jsonb RETURNING *`, [
+        msg.id,
+        JSON.stringify(error),
+      ]);
+      if (!r.rows[0]) return { row: msg as MessageRow, changed: false };
+      if (msg.broadcast_id) {
+        await q.query(`UPDATE broadcast_recipients SET error = $2 WHERE message_id = $1`, [msg.id, (error as any).message]);
+      }
+      return { row: r.rows[0], changed: true };
     }
     const canUpgrade =
       status === 'failed' ? msg.status !== 'read' : (STATUS_RANK[status] ?? 0) > (STATUS_RANK[msg.status] ?? -1) && msg.status !== 'failed';
@@ -736,7 +853,7 @@ export async function processStatus(ctx: AppContext, channel: ChannelRow, st: an
 }
 
 /** Coexistence: messages the business sent from the WhatsApp Business app on the phone. */
-async function processEchoes(ctx: AppContext, value: any, allowed: string[] | null, receivedAt: () => Promise<number>) {
+async function processEchoes(ctx: AppContext, value: any, allowed: string[] | null, receivedAt: () => Promise<number>, nextSeq: () => number) {
   const channel = await channelByPhoneNumberId(ctx, value.metadata?.phone_number_id, allowed);
   if (!channel) return;
   let failure: unknown = null;
@@ -744,7 +861,7 @@ async function processEchoes(ctx: AppContext, value: any, allowed: string[] | nu
   for (let i = 0; i < echoes.length; i++) {
     if (i) await yieldToEventLoop();
     try {
-      await processEcho(ctx, channel, echoes[i], await receivedAt(), i);
+      await processEcho(ctx, channel, echoes[i], await receivedAt(), nextSeq());
     } catch (err) {
       const e = keepTransient(ctx, err, { channel: channel.id, wamid: echoes[i]?.id });
       failure ??= e;
@@ -760,13 +877,13 @@ async function processEcho(ctx: AppContext, channel: ChannelRow, echo: any, rece
     return;
   }
   const waId = digitsOnly(String(echo.to ?? ''));
-  const contact = await contactForWaId(ctx, channel, waId, { source: 'whatsapp' });
-  const parsed = parseInboundContent(echo);
   const waTs = metaSeconds(echo.timestamp);
+  const { contact } = await contactForWaId(ctx, channel, waId, waTs ?? Math.floor(receivedUs / 1_000_000), { source: 'whatsapp' });
+  const parsed = parseInboundContent(echo);
   const inserted = await ctx.db.tx(async (q) => {
     await lockChannel(q, channel.id);
     await q.query(`SELECT 1 FROM contacts WHERE id = $1 FOR NO KEY UPDATE`, [contact.id]);
-    const createdAt = await chatTime(q, contact.id, messageTime(echo.timestamp, receivedUs, seq), waTs);
+    const createdAt = await chatTime(q, contact.id, messageTime(echo.timestamp, receivedUs, seq), waTs, lateDelivery(echo.timestamp, receivedUs));
     const { rows } = await q.query<MessageRow>(
       `INSERT INTO messages (workspace_id, contact_id, channel_id, direction, type, body, media, payload, wamid, status, sent_by, created_at, followups_done, wa_ts)
        VALUES ($1, $2, $3, 'out', $4, $5, $6, $7, $8, 'sent', 'phone', $9, false, $10)
@@ -817,7 +934,11 @@ async function echoFollowups(ctx: AppContext, m: MessageRow) {
   ctx.realtime.emit(m.workspace_id, 'contact:update', await getContact(ctx.db, m.workspace_id, m.contact_id));
 }
 
-async function processTemplateStatus(ctx: AppContext, wabaId: string, value: any, allowed: string[] | null) {
+/**
+ * `at` is when Meta raised the event: one older than the last applied (a redelivery after an outage,
+ * a job retried for another change of its payload) is stale and changes nothing.
+ */
+async function processTemplateStatus(ctx: AppContext, wabaId: string, value: any, allowed: string[] | null, at: string | null) {
   const event = String(value.event ?? '').toUpperCase();
   const status = event === 'REINSTATED' ? 'APPROVED' : TEMPLATE_STATUSES.has(event) ? event : null;
   if (!status) {
@@ -825,11 +946,12 @@ async function processTemplateStatus(ctx: AppContext, wabaId: string, value: any
     return;
   }
   const { rows } = await ctx.db.query<{ workspace_id: string; id: string }>(
-    `UPDATE templates t SET status = $1, rejected_reason = NULLIF($2, 'NONE'), updated_at = now()
+    `UPDATE templates t SET status = $1, rejected_reason = NULLIF($2, 'NONE'), status_event_at = COALESCE($8::timestamptz, t.status_event_at), updated_at = now()
      FROM channels ch
      WHERE ch.id = t.channel_id AND ch.waba_id = $3
        AND (t.meta_id = $4 OR (t.name = $5 AND t.language = $6))
        AND ($7::uuid[] IS NULL OR ch.id = ANY($7::uuid[]))
+       AND ($8::timestamptz IS NULL OR t.status_event_at IS NULL OR t.status_event_at <= $8::timestamptz)
      RETURNING t.workspace_id, t.id`,
     [
       status,
@@ -839,6 +961,7 @@ async function processTemplateStatus(ctx: AppContext, wabaId: string, value: any
       value.message_template_name ?? '',
       value.message_template_language ?? '',
       allowed,
+      at,
     ],
   );
   for (const r of rows) ctx.realtime.emit(r.workspace_id, 'template:update', { id: r.id });
@@ -865,14 +988,19 @@ async function queueTemplateRefresh(ctx: AppContext, rows: { workspace_id: strin
   }
 }
 
-async function processTemplateCategory(ctx: AppContext, wabaId: string, value: any, allowed: string[] | null) {
+async function processTemplateCategory(ctx: AppContext, wabaId: string, value: any, allowed: string[] | null, at: string | null) {
   const category = String(value.new_category ?? '').toLowerCase();
-  if (!category) return;
-  // Meta recategorizes each language version on its own (each has its own template id).
+  if (!TEMPLATE_CATEGORIES.has(category)) {
+    ctx.log.warn({ category: value.new_category, template: value.message_template_name }, 'template category update ignored');
+    return;
+  }
+  // Meta recategorizes each language version on its own (each has its own template id). Applied in
+  // event order, as statuses are.
   await ctx.db.query(
-    `UPDATE templates t SET category = $1, updated_at = now() FROM channels ch
+    `UPDATE templates t SET category = $1, category_event_at = COALESCE($7::timestamptz, t.category_event_at), updated_at = now() FROM channels ch
      WHERE ch.id = t.channel_id AND ch.waba_id = $2 AND (t.meta_id = $3 OR (t.name = $4 AND t.language = $5))
-       AND ($6::uuid[] IS NULL OR ch.id = ANY($6::uuid[]))`,
-    [category, wabaId, String(value.message_template_id ?? ''), value.message_template_name ?? '', value.message_template_language ?? '', allowed],
+       AND ($6::uuid[] IS NULL OR ch.id = ANY($6::uuid[]))
+       AND ($7::timestamptz IS NULL OR t.category_event_at IS NULL OR t.category_event_at <= $7::timestamptz)`,
+    [category, wabaId, String(value.message_template_id ?? ''), value.message_template_name ?? '', value.message_template_language ?? '', allowed, at],
   );
 }

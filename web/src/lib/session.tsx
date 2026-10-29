@@ -143,8 +143,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     setUnauthorizedHandler(signOut);
     setRealtimeSessionHandlers({
       revoked: signOut,
-      // A refused handshake usually means the session ended: a 401 here signs out (see api.ts).
-      unauthorized: () => void api.get('/api/auth/me').catch(() => {}),
+      // A handshake refused as 'unauthorized' usually means the session ended: a 401 here signs out
+      // (see api.ts). Any other answer keeps it, and the socket tries again once this settles.
+      unauthorized: () => api.get('/api/auth/me').catch(() => {}),
       // Rights changed while the tab is open (role, membership, suspension, operator status): reload
       // them. A passing network error keeps the session; a 401 still signs out (api.ts).
       refreshed: () => void loadMe().catch(() => {}),
@@ -186,8 +187,11 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       setWorkspaceId(id, workspaceOpener(user, workspaces, id));
       setWsId(id);
       qc.clear();
+      // The role shown comes from the last /api/auth/me: rights in this workspace may have changed
+      // while the tab showed another one, so they are reloaded (a lost membership moves the tab on).
+      void loadMe().catch(() => {});
     },
-    [qc, workspaces, user],
+    [qc, workspaces, user, loadMe],
   );
 
   const logout = useCallback(async () => {

@@ -71,22 +71,17 @@ invitaciones y números verificados por el operador):
 
 - **Todos vuelven a iniciar sesión una vez.** Las sesiones ahora se pueden revocar y las
   cookies anteriores dejan de servir.
-- **Números de espacios prepagados: se desactivan hasta que los verifiques.** Nada en la
-  base dice quién capturó las credenciales de un número: si un negocio conectó su propio
-  número cuando pagaba directo a Meta y después pasaste su espacio a prepagado, ese número
-  tiene una *App Secret* que el negocio conoce y con la que podría firmar estados falsos
-  (reembolsos al saldo que tú pagas). Por eso la migración no da por verificado ningún
-  número: los números oficiales de espacios prepagados quedan **desactivados** (con el
-  aviso de prepagado en **Ajustes → Canales de WhatsApp**) y no envían ni reciben hasta que
-  los verifiques. Para cada uno, abre el espacio (**Administración → Abrir**) y, en
-  **Ajustes → Canales de WhatsApp → Editar**, captura el token y la *App Secret* de **tu
-  propia app de Meta**: eso lo marca como verificado, suscribe tu app a la WABA y lo
-  reactiva. Configura el webhook de tu app como en el paso 6 de
-  `03-conectar-whatsapp-meta.md`; mientras tu app no esté suscrita, los webhooks llegan
-  firmados con la clave anterior y LeadLibre los rechaza. Si prefieres que ese negocio
-  vuelva a pagar directo a Meta, pásalo a `meta_direct` en **Administración**: sus números
-  se reactivan solos. Planea la actualización: hasta que verifiques sus números, esos
-  espacios no tienen WhatsApp.
+- **Números de espacios prepagados: se desactivan hasta que los verifiques** (lo hace la
+  migración `006_review_four`, que se aplica justo después: ver abajo). Nada en la base
+  dice quién capturó las credenciales de un número: si un negocio conectó su propio número
+  cuando pagaba directo a Meta y después pasaste su espacio a prepagado, ese número tiene
+  una *App Secret* que el negocio conoce y con la que podría firmar estados falsos
+  (reembolsos al saldo que tú pagas). Por eso ningún número existente queda verificado:
+  los números oficiales de espacios prepagados quedan **desactivados** (con el aviso de
+  prepagado en **Ajustes → Canales de WhatsApp**) y no envían ni reciben hasta que los
+  verifiques como se explica en "Verificar los números de espacios prepagados".
+  Planea la actualización: hasta que verifiques sus números, esos espacios no tienen
+  WhatsApp.
 - **Equipo.** Los administradores de un espacio ya no crean cuentas con contraseña ni
   agregan cuentas existentes: **Ajustes → Equipo** genera un enlace de invitación de un
   solo uso. Ojo: quien tiene el enlace, incluido quien invitó, puede crear la cuenta de ese
@@ -119,6 +114,61 @@ Si vienes de una versión sin la migración `005_review_three`:
 - Lo demás se migra solo: los trabajos en cola pasan a sus carriles nuevos y las
   plantillas en estado `REINSTATED`, `FLAGGED`, `LOCKED` o `UNLOCKED` (avisos de Meta que
   no impiden enviarlas) quedan como aprobadas.
+
+Si vienes de una versión sin la migración `006_review_four` (por ejemplo `ef96be8` o
+`d15f26b`):
+
+- **Números de espacios prepagados conectados antes de la `004`: se desactivan otra vez
+  hasta que los verifiques.** La `004_hardening` de `ef96be8` dio por verificados todos los
+  números de espacios prepagados sin que nadie los verificara, también los que un negocio
+  conectó con su propia app mientras pagaba directo a Meta (conoce su *App Secret*). La
+  `006` desmarca y **desactiva** los números oficiales de espacios prepagados que ya
+  existían cuando tu instancia aplicó la `004`. Eso incluye los que **ya volviste a
+  verificar en `d15f26b`**: la base no distingue tu verificación de la marca general de
+  `ef96be8`, así que hay que verificarlos una vez más. Los números que se conectaron
+  después de aplicar la `004` no cambian. Si vienes de una versión anterior a la `004`,
+  esto aplica a todos los números de espacios prepagados.
+- **Plantillas de los números verificados que siguen activos: vuelve a leerlas de Meta.**
+  Antes, verificar un número o pasar un espacio a prepagado no volvía a leer sus
+  plantillas, así que una categoría que el negocio falsificó mientras firmaba sus propios
+  webhooks (por ejemplo `UTILITY` en una plantilla de marketing) puede seguir guardada y
+  abaratar sus envíos y estimaciones. Después de actualizar, en cada espacio prepagado abre
+  el espacio (**Administración → Abrir**) y, en **Plantillas**, pulsa **Sincronizar con
+  Meta** para cada número. Con la API basta una llamada por espacio:
+  `PATCH /api/admin/workspaces/:id { "billing_mode": "prepaid" }` (aunque ya sea
+  prepagado) vuelve a leer las plantillas de todos sus números verificados y responde en
+  `warnings` los que no se pudieron leer. Los números que desactiva la `006` se leen solos
+  al verificarlos.
+- **Archivos recibidos que ya no se iban a descargar** (la descarga se había rendido antes
+  de que existiera el aviso): ahora muestran "No se pudo descargar el archivo de WhatsApp"
+  en lugar de quedarse cargando. Pídele al cliente que lo reenvíe si lo necesitas.
+- **Bot de menú:** no arranca en conversaciones que una persona del equipo ya respondió
+  (la `006` las marca; antes solo quedaban marcadas las que el bot ya había atendido).
+- **Administración de la instancia:** dar o quitar el rol de administrador de la instancia
+  y poner una contraseña temporal a una cuenta ahora piden tu contraseña actual.
+
+#### Verificar los números de espacios prepagados
+
+Para cada número desactivado, abre el espacio (**Administración → Abrir**) y, en
+**Ajustes → Canales de WhatsApp → Editar**, captura el token y la *App Secret* de **tu
+propia app de Meta**: eso lo marca como verificado, suscribe tu app a la WABA, vuelve a
+leer sus plantillas de Meta (sus categorías deciden el precio de cada envío) y lo
+reactiva. Configura el webhook de tu app como en el paso 6 de
+`03-conectar-whatsapp-meta.md`; mientras tu app no esté suscrita, los webhooks llegan
+firmados con la clave anterior y LeadLibre los rechaza.
+
+- Si usas la app de la instancia (la de `META_APP_SECRET`), captura esa *App Secret*
+  aunque el número ya la tuviera: siempre se acepta, porque es tuya por definición.
+- Si usas otra app tuya y el número ya tenía su *App Secret* (porque lo verificaste en
+  `d15f26b`), capturarla otra vez se rechaza con `APP_SECRET_NOT_NEW`: LeadLibre no puede
+  saber que esa clave la escribiste tú y no el negocio. Restablece la clave secreta de esa
+  app en Meta (**Configuración de la app → Básica → Clave secreta de la app →
+  Restablecer**) y captura la nueva en **todos** los números que usan esa app (de
+  cualquier espacio): desde ese momento Meta firma sus webhooks con la clave nueva y
+  LeadLibre rechaza los de los números que todavía tengan la anterior. Otra opción es
+  verificar el número con otra app tuya o con la de la instancia.
+- Si prefieres que ese negocio vuelva a pagar directo a Meta, pásalo a `meta_direct` en
+  **Administración**: sus números desactivados por esto se reactivan solos.
 
 ### Respaldos
 
@@ -198,8 +248,12 @@ npm run typecheck
   y también los que capturaste tú mientras el negocio pagaba directo a Meta (normalmente
   son las credenciales de su app). Para reactivarlos, edita el número con el token y la
   *App Secret* de tu app (LeadLibre suscribe tu app a la WABA); volver a capturar la clave
-  que ya tenía se rechaza (`APP_SECRET_NOT_NEW`), porque el negocio puede conocerla.
-  "Probar conexión" nunca reactiva un número desactivado.
+  que ya tenía se rechaza (`APP_SECRET_NOT_NEW`), porque el negocio puede conocerla, salvo
+  la `META_APP_SECRET` de la instancia. Al verificar un número, y al pasar un espacio a
+  prepagado, LeadLibre vuelve a leer de Meta las plantillas de sus números verificados:
+  una categoría que el negocio pudo falsificar mientras firmaba sus propios webhooks no
+  sobrevive al cambio, y los siguientes cambios de estado o de categoría que mande Meta se
+  aplican aunque el negocio hubiera fechado los suyos más adelante. "Probar conexión" nunca reactiva un número desactivado.
   Volver a pasar el espacio a `meta_direct` reactiva los números desactivados solo por
   eso. Los reembolsos y ajustes de mensajes cobrados del saldo prepagado solo los aceptan
   estados firmados con una clave que el negocio no conoce (la `META_APP_SECRET` global o la
@@ -209,7 +263,9 @@ npm run typecheck
   plantillas viven por WABA en Meta y otro espacio podría leerlas o borrarlas. Solo
   cuentan los números oficiales (comprobados con Meta): un canal sandbox no acepta WABA,
   token ni *App Secret*, así que nadie puede "apartar" la WABA de otro con él.
-- Webhook de Meta: como máximo 3 MB y 1000 eventos por payload, y cada payload se reparte
+- Webhook de Meta: como máximo 3 MB y 1000 eventos por payload (cuentan todos los
+  elementos de cada cambio: mensajes, estados, ecos de la app de WhatsApp Business,
+  contactos, errores…), y cada payload se reparte
   en un trabajo por espacio de trabajo en un carril con turnos por espacio: un negocio que
   inunda su propio número no retrasa los mensajes de los demás.
 - Tokens de Meta y llaves de IA cifrados en reposo (AES-256-GCM).
@@ -231,11 +287,23 @@ npm run typecheck
 - Cambiar la contraseña pide la actual, con un máximo de 10 intentos fallidos cada 15
   minutos por sesión: una sesión robada no sirve para adivinarla, y sus intentos no le
   quitan a la dueña los suyos (cambiar la contraseña desde su sesión cierra la robada).
+  Lo mismo piden, con el mismo límite, dar o quitar el rol de administrador de la
+  instancia y ponerle una contraseña temporal a una cuenta: una sesión robada del
+  operador no puede quitarle el rol a otro operador (para luego cambiarle la contraseña)
+  ni convertir en operador una cuenta suya.
+- Cada espacio conserva al menos un propietario activo: no se puede degradar, desactivar
+  ni quitar al último (un propietario desactivado no cuenta), tampoco con dos propietarios
+  quitándose uno al otro al mismo tiempo.
 - Tiempo real: al unirse a un espacio, el socket vuelve a leer sus permisos si mientras los
   leía alguien fue expulsado o cambió de permisos (quitar a un miembro, desactivarlo,
   limitar a los agentes a sus conversaciones): un `join` en curso no puede devolverle el
   acceso a quien se lo acaban de quitar. Solo cuentan los cambios de ese espacio, de esa
-  persona o de esa sesión: los de otros espacios no hacen fallar el `join`.
+  persona o de esa sesión: los de otros espacios no hacen fallar el `join`. Un cambio de
+  permisos (rol o acceso en cualquier espacio, rol de administrador de la instancia,
+  espacio suspendido o reactivado) llega a todas las pestañas de la persona, vean el
+  espacio que vean, y la interfaz vuelve a leer sus permisos. Un fallo pasajero al
+  conectar el socket (por ejemplo, la base de datos reiniciándose) no cierra la sesión: el
+  navegador lo reintenta.
 - Cookies `httpOnly`, `SameSite=Lax`, `Secure` cuando `PUBLIC_URL` es HTTPS.
 - Equipo por invitación: un administrador de espacio no agrega cuentas existentes ni
   escribe contraseñas en el formulario; genera un enlace de un solo uso (7 días) que la
@@ -265,8 +333,11 @@ npm run typecheck
   ocupa los pocos hilos que también usan las llamadas a Meta: un dominio cuyos servidores
   DNS no responden no frena los envíos de nadie.
 - Archivos recibidos por WhatsApp: solo imágenes, audio y video conocidos se muestran en el
-  navegador; el resto (SVG, HTML…) se descarga, con CSP `sandbox`.
-- Exportación CSV protegida contra inyección de fórmulas.
+  navegador; el resto (SVG, HTML…) se descarga, con CSP `sandbox`. Se sirven por rangos de
+  bytes (`206`), que Safari y el iPhone necesitan para reproducir video y audio.
+- Exportación CSV protegida contra inyección de fórmulas. La importación lee como máximo
+  200 columnas y 20,000 filas, y procesa el archivo por partes, cediendo el turno entre
+  ellas: un archivo grande de un negocio no congela la instancia para los demás.
 - Límite de intentos fallidos de inicio de sesión (15 min): 50 por red del cliente (una
   IPv6 /64 cuenta como una), 10 por red y cuenta, y 30 por cuenta desde cualquier lugar.
   Los límites por red y por cuenta no frenan a un navegador desde el que ya se inició
@@ -292,7 +363,7 @@ npm run typecheck
   veces al mismo contacto aunque se pause/reanude o se reinicie el servidor.
 - Aislamiento por espacio de trabajo en todas las consultas y en el tiempo real; con
   "los agentes solo ven sus conversaciones", cada agente recibe solo los eventos de sus
-  chats y de los no asignados, y un aviso (`contact:revoked`) cuando uno de ellos pasa a
-  otra persona. Los eventos de difusiones solo llegan a dueños y administradores. Quitarle
+  chats y de los no asignados (también los avisos de chats borrados o archivados en
+  bloque), y un aviso (`contact:revoked`) cuando uno de ellos pasa a otra persona. Los eventos de difusiones solo llegan a dueños y administradores. Quitarle
   a alguien el rol de administrador de la instancia lo saca en el acto de los espacios
   ajenos que tenía abiertos.

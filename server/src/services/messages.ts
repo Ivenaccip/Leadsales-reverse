@@ -1,11 +1,12 @@
 import type { AppContext } from '../context.js';
 import type { Queryable } from '../db/index.js';
 import { AppError, badRequest } from '../lib/errors.js';
+import { countryFromPhone, deliveryNumber } from '../lib/phone.js';
 import type { MessageRow, WorkspaceRow } from '../types.js';
 import { getChannel, providerFor } from '../whatsapp/provider.js';
 import { explainMetaError, isMetaThrottle, MetaApiError, type TemplateParams, type WaMessage } from '../whatsapp/types.js';
 import { getContact } from './contacts.js';
-import { charge, getRate, normalizeCategory, notifyCredits, refund } from './credits.js';
+import { charge, getRate, notifyCredits, refund, templatePriceCategory, type PriceCategory } from './credits.js';
 import { dispatchWebhook } from './events.js';
 import { ensureUploaded, getMedia, waTypeForMime } from './media.js';
 import { buildTemplateComponents, findTemplate, renderTemplateText } from './templates.js';
@@ -177,6 +178,8 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
   const channel = await getChannel(ctx.db, o.workspaceId, o.channelId ?? contact.channel_id);
   const provider = providerFor(ctx, channel);
   const c = o.content;
+  // The number this message goes to, and is priced by (Meta bills the market of the number it delivers to).
+  const to = deliveryNumber(contact.phone, contact.wa_id);
 
   if (c.type !== 'template' && !isWindowOpen(contact.last_inbound_at)) {
     throw new AppError(
@@ -191,7 +194,7 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
   let body: string | null = null;
   let mediaFileId: string | null = null;
   let payload: Record<string, unknown> | null = null;
-  let category: string | null = null;
+  let category: PriceCategory | null = null;
 
   switch (c.type) {
     case 'text': {
@@ -231,7 +234,7 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
       const components = buildTemplateComponents(c.params, tpl?.parameter_format === 'NAMED', tpl?.components ?? []);
       type = 'template';
       body = tpl ? renderTemplateText(tpl.components, c.params) : `[Plantilla ${c.name}]`;
-      category = normalizeCategory(tpl?.category) ?? 'marketing';
+      category = templatePriceCategory(tpl?.category);
       payload = { name: c.name, language: c.language, params: c.params ?? {}, category };
       wa = { type: 'template', template: { name: c.name, language: { code: c.language }, ...(components.length ? { components } : {}) } };
       break;
@@ -245,7 +248,7 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
     }
   }
 
-  const cost = category && category !== 'service' ? await getRate(ctx.db, contact.phone, category as any) : 0;
+  const cost = category ? await getRate(ctx.db, to, category) : 0;
   const humanTakeover = o.sentBy === 'user';
   let reused = false;
 
@@ -306,7 +309,7 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
         broadcastId: o.broadcastId,
         userId: o.userId,
         prepaid,
-        description: `Plantilla ${category} a +${contact.phone}`,
+        description: `Plantilla ${category} a +${to}`,
       });
     }
     // A human reply hands the chat to the team: the menu bot ends even if it never started (else it
@@ -337,7 +340,7 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
   let sent: { wamid: string; waId?: string | null } | null = null;
   let sendError: any = null;
   try {
-    sent = await provider.send(contact.wa_id ?? contact.phone, wa, o.replyToWamid ?? undefined);
+    sent = await provider.send(to, wa, o.replyToWamid ?? undefined);
   } catch (err) {
     sendError = err;
   }
@@ -362,13 +365,19 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
     // Replies come from the WhatsApp id Meta resolved, which can differ from the typed number
     // (Brazil's 9th digit, Argentina's 9): remember it so inbound matching finds this contact.
     // A wa_id equal to the phone adds nothing (inbound also matches by phone), so it neither
-    // costs a write nor blocks the id Meta resolves later from replacing it.
-    if (sent.waId && sent.waId !== contact.phone && (!contact.wa_id || contact.wa_id === contact.phone)) {
+    // costs a write nor blocks the id Meta resolves later from replacing it. Never one in another
+    // country (see deliveryNumber), nor once the contact moved to another number meanwhile.
+    if (
+      sent.waId &&
+      sent.waId !== contact.phone &&
+      (!contact.wa_id || contact.wa_id === contact.phone) &&
+      countryFromPhone(sent.waId) === countryFromPhone(contact.phone)
+    ) {
       await ctx.db
         .query(
-          `UPDATE contacts SET wa_id = $2 WHERE id = $1 AND (wa_id IS NULL OR wa_id = phone)
+          `UPDATE contacts SET wa_id = $2 WHERE id = $1 AND phone = $4 AND (wa_id IS NULL OR wa_id = phone)
              AND NOT EXISTS (SELECT 1 FROM contacts o WHERE o.workspace_id = $3 AND o.wa_id = $2 AND o.id <> $1)`,
-          [contact.id, sent.waId, o.workspaceId],
+          [contact.id, sent.waId, o.workspaceId, contact.phone],
         )
         .catch((err) => ctx.log.warn({ err: (err as Error).message, contactId: contact.id }, 'storing wa_id failed'));
     }

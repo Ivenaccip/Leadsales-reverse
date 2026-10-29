@@ -388,11 +388,9 @@ ALTER TABLE broadcasts ALTER COLUMN estimated_cost TYPE numeric(16,6);
 ALTER TABLE rate_card ALTER COLUMN price TYPE numeric(12,6);
 
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS operator_verified boolean NOT NULL DEFAULT false;
--- A business may know the App Secret of numbers connected before its workspace became prepaid
--- (it could connect its own app while paying Meta directly): the operator re-verifies them.
-UPDATE channels SET status = 'disabled',
-  last_error = 'Desactivado en modo de créditos prepagados: el negocio puede conocer la clave secreta (App Secret) de este número. Para activarlo, el administrador de la instancia debe capturar el token y la App Secret de su propia app de Meta.'
-  WHERE provider = 'cloud_api' AND NOT operator_verified AND status <> 'disabled'
+-- Since 850282e only the operator could connect numbers in prepaid workspaces: keep them working.
+UPDATE channels SET operator_verified = true
+  WHERE provider = 'cloud_api' AND NOT operator_verified
     AND workspace_id IN (SELECT id FROM workspaces WHERE billing_mode = 'prepaid');
 
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS locked_by text;
@@ -453,10 +451,54 @@ WHERE type = 'broadcast.process' AND status = 'queued';
 ALTER TABLE jobs SET (autovacuum_analyze_scale_factor = 0, autovacuum_analyze_threshold = 1000);
 `;
 
+// Shipped migrations are never edited (installs that applied them would never see the change):
+// corrections go in a new one. test/migrations-frozen.test.ts enforces it.
+// 006 fixes what 004 trusted too much, and backfills rows older versions left behind.
+const reviewFour = `
+-- 004 marked every prepaid cloud number operator-verified, including numbers a business connected
+-- with its own Meta app while it paid Meta directly: it knows their App Secret and could forge
+-- billing statuses. They stay off until the operator re-verifies them with their own app.
+UPDATE channels SET operator_verified = false, status = 'disabled',
+  last_error = 'Desactivado en modo de créditos prepagados: el negocio puede conocer la clave secreta (App Secret) de este número. Para activarlo, el administrador de la instancia debe capturar el token y la App Secret de su propia app de Meta.'
+  WHERE provider = 'cloud_api' AND operator_verified
+    AND workspace_id IN (SELECT id FROM workspaces WHERE billing_mode = 'prepaid')
+    AND created_at < (SELECT applied_at FROM schema_migrations WHERE name = '004_hardening');
+-- Inbound files whose download had already given up before download_error existed: show why
+-- instead of a spinner that never ends.
+UPDATE messages m SET media = m.media || jsonb_build_object('download_error', 'No se pudo descargar el archivo de WhatsApp.')
+  WHERE m.direction = 'in' AND m.media_file_id IS NULL AND m.media IS NOT NULL
+    AND jsonb_typeof(m.media) = 'object' AND NOT (m.media ? 'download_error')
+    AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type = 'media.download' AND j.status IN ('queued', 'running')
+                    AND j.payload->>'messageId' = m.id::text);
+-- Conversations a person answered after the bot's last step (or where it never ran): the menu bot
+-- must not start in them (it now needs bot_state.done, which older versions only set once the bot
+-- had run). A bot restarted after the reply (the customer typed 'menú') keeps going.
+UPDATE contacts c SET bot_state = jsonb_set(COALESCE(c.bot_state, '{"path":[]}'::jsonb), '{done}', 'true')
+  WHERE COALESCE(c.bot_state->>'done', 'false') <> 'true'
+    AND EXISTS (SELECT 1 FROM messages m WHERE m.contact_id = c.id AND m.direction = 'out' AND m.sent_by IN ('user', 'phone')
+                AND m.created_at > COALESCE(CASE WHEN c.bot_state->>'updated_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$'
+                                                 THEN (c.bot_state->>'updated_at')::timestamptz END, '-infinity'));
+-- Contacts an earlier version pointed back at the number the customer had left (a late status of a
+-- message sent before the change): replies went to the old number and its new holder's messages
+-- landed in their chat. Back to the number they moved to.
+UPDATE contacts c SET wa_id = c.phone, updated_at = now()
+  WHERE c.wa_id IS NOT NULL AND c.wa_id <> c.phone
+    AND EXISTS (SELECT 1 FROM contact_events e WHERE e.contact_id = c.id AND e.type = 'number_changed'
+                AND e.data->>'moved' = 'true' AND e.data->>'old_wa_id' = c.wa_id)
+    AND NOT EXISTS (SELECT 1 FROM contact_events e WHERE e.contact_id = c.id AND e.type = 'number_changed'
+                    AND e.data->>'moved' = 'true' AND e.data->>'new_wa_id' = c.wa_id)
+    AND NOT EXISTS (SELECT 1 FROM contacts o WHERE o.workspace_id = c.workspace_id AND o.wa_id = c.phone AND o.id <> c.id);
+-- Template webhooks are applied in the order Meta raised them (entry.time): a redelivered or retried
+-- older event must not undo a newer one.
+ALTER TABLE templates ADD COLUMN IF NOT EXISTS status_event_at timestamptz;
+ALTER TABLE templates ADD COLUMN IF NOT EXISTS category_event_at timestamptz;
+`;
+
 export const migrations: { name: string; sql: string }[] = [
   { name: '001_init', sql: init },
   { name: '002_rate_card_seed', sql: seedRates },
   { name: '003_wamid_per_workspace', sql: wamidPerWorkspace },
   { name: '004_hardening', sql: hardening },
   { name: '005_review_three', sql: reviewThree },
+  { name: '006_review_four', sql: reviewFour },
 ];

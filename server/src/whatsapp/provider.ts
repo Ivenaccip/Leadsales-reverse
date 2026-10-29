@@ -2,6 +2,7 @@ import type { AppContext } from '../context.js';
 import type { Queryable } from '../db/index.js';
 import { decryptJson } from '../lib/crypto.js';
 import { AppError, badRequest } from '../lib/errors.js';
+import { templatePriceCategory } from '../services/credits.js';
 import type { ChannelRow } from '../types.js';
 import { CloudApiProvider } from './cloud-api.js';
 import { SandboxProvider } from './sandbox.js';
@@ -90,7 +91,8 @@ async function simulateStatuses(ctx: AppContext, channel: ChannelRow, wamid: str
       `SELECT category FROM templates WHERE channel_id = $1 AND name = $2 AND language = $3`,
       [channel.id, tpl.name, tpl.language.code],
     );
-    pricing = { billable: true, pricing_model: 'PMP', category: (rows[0]?.category ?? 'marketing').toLowerCase(), type: 'regular' };
+    // As Meta does: every template is billed by its category, and never as a free 'service' message.
+    pricing = { billable: true, pricing_model: 'PMP', category: templatePriceCategory(rows[0]?.category), type: 'regular' };
   }
   const steps: [string, number][] = [
     ['sent', 1],

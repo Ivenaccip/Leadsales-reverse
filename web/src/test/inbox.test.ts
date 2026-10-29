@@ -77,7 +77,7 @@ describe("'contact:revoked' (contract 3)", () => {
   it('drops the conversation from every list and forgets its detail and messages', () => {
     const qc = appClient();
     const contact = (id: string) => ({ id, last_message_at: '2026-01-01T00:00:00Z' }) as any;
-    const list: ConversationsData = { pages: [{ items: [contact('x'), contact('y')], total: 2, page: 1, limit: 30 }], pageParams: [1] };
+    const list: ConversationsData = { pages: [{ items: [contact('x'), contact('y')], total: 2, page: 1, limit: 30 }], pageParams: [null] };
     qc.setQueryData(['conversations', { inbox: 'all' }], list);
     qc.setQueryData(['conversations', { inbox: 'unassigned' }], list);
     qc.setQueryData(['contact', 'x'], { contact: contact('x') });

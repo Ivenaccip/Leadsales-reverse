@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
-import { parse as parseCsv } from 'csv-parse/sync';
+import { finished } from 'node:stream/promises';
+import { parse as parseCsvStream } from 'csv-parse';
 import { stringify } from 'csv-stringify/sync';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
@@ -35,6 +36,8 @@ const listSchema = z.object({
   sort: z.enum(['recent', 'created', 'name', 'value']).default('recent'),
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(500).default(50),
+  // sort=recent only: the next_cursor of the previous page (see GET /api/contacts).
+  cursor: z.string().max(200).optional(),
 });
 type ListFilters = z.infer<typeof listSchema>;
 
@@ -69,11 +72,45 @@ function buildWhere(a: WsAuth, f: Partial<ListFilters>, restrictToMine: boolean)
 }
 
 const ORDER: Record<string, string> = {
-  recent: 'c.last_message_at DESC NULLS LAST, c.created_at DESC',
+  // id breaks ties so a page boundary (keyset cursor) is exact.
+  recent: 'c.last_message_at DESC NULLS LAST, c.created_at DESC, c.id DESC',
   created: 'c.created_at DESC',
   name: 'c.name ASC NULLS LAST',
   value: 'c.deal_value DESC',
 };
+
+/**
+ * Keyset of the recency order: the last row's (last_message_at, created_at, id), timestamps at full
+ * microsecond precision (rows of one webhook are microseconds apart). Opaque to clients.
+ */
+const recentKey = z.tuple([z.string().datetime().nullable(), z.string().datetime(), z.string().uuid()]);
+const KEY_COLUMNS = `to_char(c.last_message_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS _k_lm,
+  to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS _k_ca`;
+
+function encodeCursor(row: { _k_lm: string | null; _k_ca: string; id: string }): string {
+  return Buffer.from(JSON.stringify([row._k_lm, row._k_ca, row.id])).toString('base64url');
+}
+
+function decodeCursor(cursor: string): z.infer<typeof recentKey> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+  } catch {
+    raw = null;
+  }
+  const r = recentKey.safeParse(raw);
+  if (!r.success) throw badRequest('Cursor inválido: vuelve a cargar la lista', 'INVALID_CURSOR');
+  return r.data;
+}
+
+/** Rows after the cursor in the recency order (last_message_at DESC NULLS LAST, created_at DESC, id DESC). */
+function afterCursor(key: z.infer<typeof recentKey>, p: (v: unknown) => string): string {
+  const [lm, ca, id] = key;
+  const tie = `(c.created_at, c.id) < (${p(ca)}::timestamptz, ${p(id)}::uuid)`;
+  if (lm === null) return `(c.last_message_at IS NULL AND ${tie})`;
+  const at = p(lm);
+  return `(c.last_message_at < ${at}::timestamptz OR c.last_message_at IS NULL OR (c.last_message_at = ${at}::timestamptz AND ${tie}))`;
+}
 
 const templateParamsSchema = z.object({
   header: z
@@ -222,16 +259,133 @@ const UNSETTLED_CHARGE = `EXISTS (SELECT 1 FROM messages m WHERE m.contact_id = 
   AND m.cost > 0 AND m.created_at > now() - interval '30 days'
   AND (NOT m.pricing_reconciled OR m.status NOT IN ('delivered', 'read', 'failed')))`;
 
-/** Delimiter of a CSV from its header line: Excel saves ';' (or tab) in locales with a decimal comma. */
-export function detectCsvDelimiter(text: string): string {
+/** Where the header line starts: the parser skips the blank lines before it (skip_empty_lines). */
+function headerStart(text: string): number {
+  // Linear scans: a regex over millions of blank lines would backtrack until the stack overflows.
+  const first = text.search(/\S/);
+  if (first < 0) return text.length;
+  return Math.max(text.lastIndexOf('\n', first), text.lastIndexOf('\r', first)) + 1;
+}
+
+/** The header line (the first one that is not blank). */
+function headerLine(text: string): string {
+  const start = headerStart(text);
+  const end = text.slice(start).search(/[\r\n]|$/);
+  return text.slice(start, start + end);
+}
+
+/**
+ * Delimiter of a CSV from its header line (Excel saves ';' or tab in locales with a decimal comma)
+ * and how many columns that line has. The scan stops once some separator passes `maxColumns`: the
+ * line then has more columns than that whichever separator wins.
+ */
+export function csvHeaderShape(text: string, maxColumns = Infinity): { delimiter: string; columns: number } {
   let inQuotes = false;
   const counts: Record<string, number> = { ',': 0, ';': 0, '\t': 0 };
-  for (const ch of text) {
+  for (let i = headerStart(text); i < text.length; i++) {
+    const ch = text[i];
     if (ch === '"') inQuotes = !inQuotes;
     else if (!inQuotes && (ch === '\n' || ch === '\r')) break;
-    else if (!inQuotes && ch in counts) counts[ch]++;
+    else if (!inQuotes && ch in counts && ++counts[ch] >= maxColumns) break;
   }
-  return [';', '\t'].reduce((best, d) => (counts[d] > counts[best] ? d : best), ',');
+  const delimiter = [';', '\t'].reduce((best, d) => (counts[d] > counts[best] ? d : best), ',');
+  return { delimiter, columns: counts[delimiter] + 1 };
+}
+
+export function detectCsvDelimiter(text: string): string {
+  return csvHeaderShape(text).delimiter;
+}
+
+/** Every column of an import becomes a custom field (and work for each row): real files have far fewer. */
+export const MAX_IMPORT_COLUMNS = 200;
+export const MAX_IMPORT_ROWS = 20_000;
+/** Bytes parsed between yields to the event loop, so other requests, webhooks and jobs keep running. */
+const CSV_CHUNK = 64 * 1024;
+/** Time an import may hold the event loop before yielding (the loop over rows, the checks). */
+const IMPORT_SLICE_MS = 10;
+
+const yieldToEventLoop = () => new Promise<void>((r) => setImmediate(r));
+
+/** Yields once this many milliseconds passed since the last yield (call it inside long loops). */
+function yielder(sliceMs = IMPORT_SLICE_MS) {
+  let since = performance.now();
+  return async () => {
+    if (performance.now() - since < sliceMs) return;
+    await yieldToEventLoop();
+    since = performance.now();
+  };
+}
+
+/**
+ * Parses a CSV (header row → objects) in chunks, yielding between them: a 10 MB file must not
+ * freeze every tenant for seconds. Stops as soon as it holds more than `maxRows` rows, or at a
+ * header of more than `maxColumns`.
+ */
+async function parseCsvYielding(
+  text: string,
+  delimiter: string,
+  limits: { maxRows: number; maxColumns: number },
+): Promise<{ header: string[]; records: Record<string, string>[] }> {
+  const { maxRows } = limits;
+  let header: string[] = [];
+  const parser = parseCsvStream({
+    // The header the parser actually uses (csvHeaderShape only looked ahead): each of its columns
+    // is a key of every row, walked for every row.
+    columns: (h: string[]) => {
+      if (h.length > limits.maxColumns) throw tooManyColumns();
+      return (header = h);
+    },
+    delimiter,
+    skip_empty_lines: true,
+    trim: true,
+    relax_column_count: true,
+    bom: true,
+  });
+  const records: Record<string, string>[] = [];
+  parser.on('data', (r: Record<string, string>) => records.push(r));
+  const done = finished(parser);
+  done.catch(() => {}); // awaited below; a parse error also rejects the pending write
+  const buf = Buffer.from(text, 'utf8');
+  try {
+    for (let at = 0; at < buf.length; at += CSV_CHUNK) {
+      await new Promise<void>((resolve, reject) => parser.write(buf.subarray(at, at + CSV_CHUNK), (err) => (err ? reject(err) : resolve())));
+      if (records.length > maxRows) break;
+      await yieldToEventLoop();
+    }
+    if (records.length > maxRows) {
+      parser.destroy();
+      throw tooManyRows();
+    }
+    parser.end();
+    await done;
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    throw badRequest(`No se pudo leer el CSV: ${(err as Error).message}`);
+  }
+  // The last row only comes out when the parser ends.
+  if (records.length > maxRows) throw tooManyRows();
+  return { header, records };
+}
+
+const tooManyRows = () => badRequest(`Máximo ${MAX_IMPORT_ROWS.toLocaleString('en-US')} filas por importación`);
+const tooManyColumns = () => badRequest(`El archivo tiene demasiadas columnas (máximo ${MAX_IMPORT_COLUMNS})`, 'CSV_TOO_MANY_COLUMNS');
+
+/**
+ * Columns of our own export that are not contact fields: `campos` holds the custom fields (JSON),
+ * `embudo`/`etapa` the placement (matched by name), the rest is read-only history. A file is ours
+ * only with all of them: other files can have a "Campos" or "Origen" column of their own.
+ */
+const EXPORT_COLUMNS = new Set(['campos', 'embudo', 'etapa', 'asignado_a', 'origen', 'creado', 'ultimo_mensaje']);
+
+/** The custom fields our export wrote in `campos` (a JSON object), or null when it is not one. */
+function exportedFields(cell: string | undefined): Record<string, unknown> | null {
+  if (!cell) return null;
+  try {
+    const v = JSON.parse(cell);
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Amount typed as 1500, 1,500.50, 1.500,50, 150.000 or 1500,5 (decimal comma), ignoring currency signs. */
@@ -264,16 +418,32 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
     return contact;
   }
 
+  // With sort=recent (the inbox) pages can also be read by keyset: `cursor` = the previous page's
+  // next_cursor. Conversations that move to the top or leave the filter meanwhile then never shift
+  // the next page (OFFSET would skip or repeat rows); `page` keeps working for the other sorts.
   app.get('/api/contacts', async (req) => {
     const a = await requireWs(ctx, req);
     const f = parse(listSchema, req.query);
+    if (f.cursor && f.sort !== 'recent') throw badRequest('El cursor solo sirve con sort=recent', 'INVALID_CURSOR');
+    const key = f.cursor ? decodeCursor(f.cursor) : null;
     const { where, params } = buildWhere(a, f, await visibilityFilter(ctx, a));
     const total = await ctx.db.query<{ n: number }>(`SELECT count(*)::int AS n FROM contacts c WHERE ${where}`, params);
-    const { rows } = await ctx.db.query(
-      `SELECT ${CONTACT_COLUMNS} FROM contacts c WHERE ${where} ORDER BY ${ORDER[f.sort]} LIMIT ${f.limit} OFFSET ${(f.page - 1) * f.limit}`,
+    const p = (v: unknown) => {
+      params.push(v);
+      return `$${params.length}`;
+    };
+    const recent = f.sort === 'recent';
+    const { rows } = await ctx.db.query<{ id: string; _k_lm: string | null; _k_ca: string }>(
+      `SELECT ${CONTACT_COLUMNS}${recent ? `, ${KEY_COLUMNS}` : ''} FROM contacts c
+       WHERE ${where}${key ? ` AND ${afterCursor(key, p)}` : ''}
+       ORDER BY ${ORDER[f.sort]} LIMIT ${f.limit + (recent ? 1 : 0)} OFFSET ${key ? 0 : (f.page - 1) * f.limit}`,
       params,
     );
-    return { items: rows, total: total.rows[0].n, page: f.page, limit: f.limit };
+    const more = recent && rows.length > f.limit;
+    const items = rows.slice(0, f.limit);
+    const next = more ? encodeCursor(items[items.length - 1]) : null;
+    const out = recent ? items.map(({ _k_lm, _k_ca, ...c }) => c) : items;
+    return { items: out, total: total.rows[0].n, page: f.page, limit: f.limit, next_cursor: next };
   });
 
   app.get('/api/contacts/counts', async (req) => {
@@ -391,29 +561,46 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
     // stored garbled. It can also be real data (a customer's WhatsApp name, kept by our own export),
     // so when the caller does not say how it decoded the file, only a U+FFFD in the header line or
     // standing for a letter (checked below) is refused.
-    const headerLine = text.slice(0, text.search(/[\r\n]|$/));
-    if (body.lossy === true ? text.includes('\ufffd') : body.lossy === undefined && headerLine.includes('\ufffd')) throw notUtf8();
-    let records: Record<string, string>[];
-    try {
-      records = parseCsv(text, {
-        columns: true,
-        delimiter: detectCsvDelimiter(text),
-        skip_empty_lines: true,
-        trim: true,
-        relax_column_count: true,
-        bom: true,
-      });
-    } catch (err) {
-      throw badRequest(`No se pudo leer el CSV: ${(err as Error).message}`);
-    }
-    if (records.length > 20_000) throw badRequest('Máximo 20,000 filas por importación');
+    if (body.lossy === true ? text.includes('\ufffd') : body.lossy === undefined && headerLine(text).includes('\ufffd')) throw notUtf8();
+    // Bounded before parsing: a header of a million columns costs seconds and stores nothing useful.
+    const shape = csvHeaderShape(text, MAX_IMPORT_COLUMNS);
+    if (shape.columns > MAX_IMPORT_COLUMNS) throw tooManyColumns();
+    const { header: columns, records } = await parseCsvYielding(text, shape.delimiter, { maxRows: MAX_IMPORT_ROWS, maxColumns: MAX_IMPORT_COLUMNS });
+    const pause = yielder();
     if (body.lossy === undefined) {
       for (const [i, rec] of records.entries()) {
+        await pause();
         const bad = Object.values(rec).find((v) => typeof v === 'string' && LOST_LETTER.test(v));
         if (bad) {
           const at = bad.indexOf('\ufffd');
           throw notUtf8(`La fila ${i + 2} tiene letras que no se pudieron leer ("${bad.slice(Math.max(0, at - 20), at + 20)}"). `);
         }
+      }
+    }
+    // Headers are resolved once per file, not once per cell.
+    const headers = new Map<string, { target: string | undefined; name: string; norm: string }>();
+    const header = (k: string) => {
+      let h = headers.get(k);
+      if (!h) headers.set(k, (h = { target: HEADER_ALIASES[normHeader(k)], name: k.trim(), norm: normHeader(k) }));
+      return h;
+    };
+    // Our own export: its custom fields come back as fields, its placement by name, and its other
+    // columns are not stored as fields.
+    const norms = new Set(columns.map((k) => header(k).norm));
+    const ourExport = [...EXPORT_COLUMNS].every((c) => norms.has(c));
+    const camposKey = ourExport ? columns.find((k) => header(k).norm === 'campos') : undefined;
+    const placement = new Map<string, { funnelId: string; stageId: string | null }>();
+    if (ourExport && !body.funnel_id && !body.stage_id) {
+      const st = await ctx.db.query<{ funnel_id: string; funnel: string; stage_id: string; stage: string }>(
+        `SELECT f.id AS funnel_id, f.name AS funnel, s.id AS stage_id, s.name AS stage FROM funnels f JOIN stages s ON s.funnel_id = f.id
+         WHERE f.workspace_id = $1 ORDER BY f.position, s.position`,
+        [a.workspaceId],
+      );
+      for (const r of st.rows) {
+        const f = r.funnel.trim().toLowerCase();
+        if (!placement.has(f)) placement.set(f, { funnelId: r.funnel_id, stageId: null });
+        const k = `${f}\n${r.stage.trim().toLowerCase()}`;
+        if (!placement.has(k)) placement.set(k, { funnelId: r.funnel_id, stageId: r.stage_id });
       }
     }
     const tagsRes = await ctx.db.query<{ id: string; name: string }>(`SELECT id, name FROM tags WHERE workspace_id = $1`, [a.workspaceId]);
@@ -423,14 +610,22 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
     let existing = 0;
     const errors: { row: number; error: string }[] = [];
     for (const [i, rec] of records.entries()) {
+      await pause();
       const mapped: Record<string, string> = {};
-      const custom: Record<string, string> = {};
+      const exported: Record<string, string> = {};
+      let custom: Record<string, unknown> = {};
+      // A row whose `campos` is not the JSON our export wrote (edited by hand) keeps every column.
+      const fields = camposKey !== undefined ? exportedFields(uncsvCell(rec[camposKey] ?? '')) : null;
       for (const [k, raw] of Object.entries(rec)) {
         const v = typeof raw === 'string' ? uncsvCell(raw) : raw;
-        const target = HEADER_ALIASES[normHeader(k)];
-        if (target) mapped[target] = v;
-        else if (v) custom[k.trim()] = v;
+        const h = header(k);
+        if (h.target) mapped[h.target] = v;
+        else if (fields && EXPORT_COLUMNS.has(h.norm)) exported[h.norm] = v;
+        else if (v) custom[h.name] = v;
       }
+      if (fields) custom = { ...fields, ...custom };
+      const funnelName = exported.embudo?.trim().toLowerCase();
+      const place = funnelName ? (placement.get(`${funnelName}\n${exported.etapa?.trim().toLowerCase() ?? ''}`) ?? placement.get(funnelName)) : undefined;
       if (!mapped.phone) {
         errors.push({ row: i + 2, error: 'Falta el teléfono' });
         continue;
@@ -472,8 +667,8 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
             company: mapped.company,
             dealValue: mapped.deal_value ? parseAmount(mapped.deal_value) : 0,
             customFields: custom,
-            funnelId: body.funnel_id,
-            stageId: body.stage_id,
+            funnelId: body.funnel_id ?? place?.funnelId,
+            stageId: body.stage_id ?? place?.stageId ?? undefined,
             tagIds,
             source: 'import',
           },
@@ -516,18 +711,20 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
       const r = await ctx.db.tx(async (q) => {
         // Locked first: a send in progress (it locks its contact) commits before the check reads.
         await q.query(`SELECT id FROM contacts WHERE workspace_id = $1 AND id = ANY($2::uuid[]) ORDER BY id FOR UPDATE`, [a.workspaceId, body.ids]);
-        const kept = await q.query<{ id: string }>(
-          `UPDATE contacts c SET is_archived = true, updated_at = now() WHERE c.workspace_id = $1 AND c.id = ANY($2::uuid[]) AND ${UNSETTLED_CHARGE} RETURNING c.id`,
+        const kept = await q.query<{ id: string; assigned_user_id: string | null }>(
+          `UPDATE contacts c SET is_archived = true, updated_at = now() WHERE c.workspace_id = $1 AND c.id = ANY($2::uuid[]) AND ${UNSETTLED_CHARGE}
+           RETURNING c.id, c.assigned_user_id`,
           [a.workspaceId, body.ids],
         );
-        const deleted = await q.query<{ id: string }>(
-          `DELETE FROM contacts c WHERE c.workspace_id = $1 AND c.id = ANY($2::uuid[]) AND NOT ${UNSETTLED_CHARGE} RETURNING c.id`,
+        const deleted = await q.query<{ id: string; assigned_user_id: string | null }>(
+          `DELETE FROM contacts c WHERE c.workspace_id = $1 AND c.id = ANY($2::uuid[]) AND NOT ${UNSETTLED_CHARGE} RETURNING c.id, c.assigned_user_id`,
           [a.workspaceId, body.ids],
         );
-        return { kept: kept.rows.map((x) => x.id), deleted: deleted.rows.map((x) => x.id) };
+        return { kept: kept.rows, deleted: deleted.rows };
       });
-      if (r.deleted.length) ctx.realtime.emit(a.workspaceId, 'contacts:bulk', { action: 'delete', ids: r.deleted });
-      if (r.kept.length) ctx.realtime.emit(a.workspaceId, 'contacts:bulk', { action: 'archive', ids: r.kept });
+      // Restricted agents only hear about the conversations they could see.
+      ctx.realtime.emitContactsBulk(a.workspaceId, 'delete', r.deleted);
+      ctx.realtime.emitContactsBulk(a.workspaceId, 'archive', r.kept);
       return { updated: r.deleted.length, archived: r.kept.length };
     }
     let updated = 0;
@@ -626,7 +823,7 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
   app.delete('/api/contacts/:id', async (req, reply) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
-    await ctx.db.tx(async (q) => {
+    const gone = await ctx.db.tx(async (q) => {
       await q.query(`SELECT id FROM contacts WHERE id = $1 AND workspace_id = $2 FOR UPDATE`, [id, a.workspaceId]);
       const pending = await q.query(`SELECT 1 FROM contacts c WHERE c.id = $1 AND c.workspace_id = $2 AND ${UNSETTLED_CHARGE}`, [id, a.workspaceId]);
       if (pending.rows[0]) {
@@ -636,9 +833,13 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
           'Este contacto tiene mensajes cobrados que Meta todavía no confirma como entregados. Si lo borras ahora, ya no se podría reembolsar uno que no se entregue: archívalo y bórralo cuando se confirmen (a más tardar en 30 días).',
         );
       }
-      await q.query(`DELETE FROM contacts WHERE id = $1 AND workspace_id = $2`, [id, a.workspaceId]);
+      const del = await q.query<{ id: string; assigned_user_id: string | null }>(
+        `DELETE FROM contacts WHERE id = $1 AND workspace_id = $2 RETURNING id, assigned_user_id`,
+        [id, a.workspaceId],
+      );
+      return del.rows;
     });
-    ctx.realtime.emit(a.workspaceId, 'contacts:bulk', { action: 'delete', ids: [id] });
+    ctx.realtime.emitContactsBulk(a.workspaceId, 'delete', gone);
     return noContent(reply);
   });
 

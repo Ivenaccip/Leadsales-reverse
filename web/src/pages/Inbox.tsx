@@ -64,12 +64,12 @@ export default function InboxPage() {
   }
 
   useRealtime<Contact>('contact:new', (c) => {
-    patchConversations(qc, c, myId);
+    patchConversations(qc, c, myId, true);
     refreshCounts();
   });
 
   useRealtime<Contact>('contact:update', (c) => {
-    patchConversations(qc, c, myId);
+    patchConversations(qc, c, myId, true);
     const cached = qc.getQueryData<ContactDetail>(['contact', c.id]);
     if (cached) {
       const metaChanged =

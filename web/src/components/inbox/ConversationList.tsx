@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
+import { infiniteQueryOptions, useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { MessageSquarePlus, Search, SlidersHorizontal, Smartphone } from 'lucide-react';
 import { api, qs } from '../../lib/api';
 import { displayName, timeAgo } from '../../lib/format';
@@ -8,7 +8,7 @@ import { stageMap, useChannels, useFunnels, useMembers, useTags } from '../../li
 import type { Contact, Paged } from '../../lib/types';
 import { StageSelect } from '../pickers';
 import { Avatar, Button, cx, EmptyState, Select, Spinner } from '../ui';
-import { LIVE_QUERY, type ConversationFilters, type InboxTab } from './helpers';
+import { LIVE_QUERY, uniqueById, type ConversationFilters, type InboxTab } from './helpers';
 
 const PAGE_SIZE = 30;
 
@@ -17,6 +17,34 @@ export interface Counts {
   mine: number;
   unassigned: number;
   unread: number;
+}
+
+/**
+ * The inbox list. Pages are read by keyset (`cursor`: after the last row the server sent), not by
+ * page number: live events move conversations to the top or out of this tab in the cached pages,
+ * and an OFFSET into the server's current order would then skip conversations or repeat them.
+ */
+export function conversationsQuery(filters: ConversationFilters) {
+  return infiniteQueryOptions({
+    queryKey: ['conversations', filters],
+    initialPageParam: null as string | null,
+    queryFn: ({ pageParam }) =>
+      api.get<Paged<Contact>>(
+        `/api/contacts${qs({
+          has_messages: true,
+          sort: 'recent',
+          inbox: filters.inbox,
+          search: filters.search.trim(),
+          unread: filters.unread,
+          tag_id: filters.tag_id,
+          stage_id: filters.stage_id,
+          cursor: pageParam,
+          limit: PAGE_SIZE,
+        })}`,
+      ),
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    ...LIVE_QUERY,
+  });
 }
 
 function useDebounced<T>(value: T, ms: number): T {
@@ -48,28 +76,10 @@ export function ConversationList({ selectedId, onSelect, className }: { selected
 
   const counts = useQuery({ queryKey: ['contact-counts'], queryFn: () => api.get<Counts>('/api/contacts/counts'), ...LIVE_QUERY });
 
-  const list = useInfiniteQuery({
-    queryKey: ['conversations', filters],
-    initialPageParam: 1,
-    queryFn: ({ pageParam }) =>
-      api.get<Paged<Contact>>(
-        `/api/contacts${qs({
-          has_messages: true,
-          sort: 'recent',
-          inbox: filters.inbox,
-          search: filters.search.trim(),
-          unread: filters.unread,
-          tag_id: filters.tag_id,
-          stage_id: filters.stage_id,
-          page: pageParam,
-          limit: PAGE_SIZE,
-        })}`,
-      ),
-    getNextPageParam: (last) => (last.page * last.limit < last.total ? last.page + 1 : undefined),
-    ...LIVE_QUERY,
-  });
+  const list = useInfiniteQuery(conversationsQuery(filters));
 
-  const items = list.data?.pages.flatMap((p) => p.items) ?? [];
+  // A conversation an event put into the first page can come again with a later one.
+  const items = uniqueById(list.data?.pages.flatMap((p) => p.items) ?? []);
   // Deleting the only number keeps its conversations: they stay listed, with a nudge to connect one.
   const noChannel = !!channels.data && channels.data.length === 0;
   const activeFilters = Number(unread) + Number(!!tagId) + Number(!!stageId);

@@ -195,10 +195,12 @@ export async function crmRoutes(app: FastifyInstance, ctx: AppContext) {
   app.post('/api/tags', async (req) => {
     const a = await requireWs(ctx, req);
     const body = parse(z.object({ name: tagName, color: color.optional() }), req.body);
+    // Creating a tag that already exists returns it unchanged: editing one (its color too) is
+    // PATCH, for admins only. The no-op update only makes RETURNING give the existing row.
     const { rows } = await ctx.db.query(
       `INSERT INTO tags (workspace_id, name, color) VALUES ($1, $2, $3)
-       ON CONFLICT (workspace_id, name) DO UPDATE SET color = COALESCE($4, tags.color) RETURNING *`,
-      [a.workspaceId, body.name, body.color ?? '#0ea5e9', body.color ?? null],
+       ON CONFLICT (workspace_id, name) DO UPDATE SET name = EXCLUDED.name RETURNING *`,
+      [a.workspaceId, body.name, body.color ?? '#0ea5e9'],
     );
     return { tag: rows[0] };
   });

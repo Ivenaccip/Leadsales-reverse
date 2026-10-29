@@ -24,7 +24,8 @@ describe('CSV import keeps accents whatever Excel saved (CSV_NOT_UTF8)', () => {
   });
 
   it('maps the cp1252-only characters (euro sign, curly quotes, dashes)', () => {
-    expect(decodeCsv(new Uint8Array([0x80, 0x20, 0x93, 0x61, 0x94, 0x20, 0x96, 0x20, 0xd1, 0x9c]))).toBe('€ “a” – Ñœ');
+    // (Ñ right before œ would be the bytes D1 9C, a well-formed UTF-8 pair: see r4-web #16.)
+    expect(decodeCsv(new Uint8Array([0x80, 0x20, 0x93, 0x61, 0x94, 0x20, 0x96, 0x20, 0xd1, 0x20, 0x9c]))).toBe('€ “a” – Ñ œ');
   });
 
   it('reads Excel "Texto Unicode" (UTF-16 with BOM)', () => {

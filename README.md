@@ -107,6 +107,9 @@ tarifas: [`docs/05-creditos-y-costos.md`](docs/05-creditos-y-costos.md).
 - Cada espacio conecta su propio número y paga a Meta con su tarjeta (`meta_direct`), o
   el operador recarga saldo (`prepaid`) desde **Administración**.
 - El operador mantiene actualizadas las tarifas de Meta (cambian cada trimestre).
+- Antes de actualizar una instancia existente, lee "Actualizar desde una versión
+  anterior" en [`docs/04-despliegue.md`](docs/04-despliegue.md): algunas versiones
+  desactivan números de espacios prepagados hasta que el operador los vuelva a verificar.
 
 ## Documentación
 

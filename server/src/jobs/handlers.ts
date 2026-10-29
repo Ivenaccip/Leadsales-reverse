@@ -100,6 +100,7 @@ async function deliverWebhook(ctx: AppContext, p: { endpointId: string; event: s
   const body = JSON.stringify({ event: p.event, workspace_id: ep.workspace_id, sent_at: p.sentAt, data: p.data });
   let status = 0;
   let error: string | null = null;
+  let privateNetwork = false;
   try {
     await assertPublicUrl(ep.url, ctx.config.allowPrivateWebhooks);
     const res = await ctx.webhookFetch(ep.url, {
@@ -118,11 +119,16 @@ async function deliverWebhook(ctx: AppContext, p: { endpointId: string; event: s
     if (res.status >= 300 && res.status < 400) error = `HTTP ${res.status}: las redirecciones no se siguen; usa la URL final`;
     else if (!res.ok) error = `HTTP ${res.status}`;
   } catch (err: any) {
-    error = String(err?.message ?? err);
+    // fetch reports every connection failure as "fetch failed": the reason is its cause (refused,
+    // DNS, TLS, or a hostname that resolves to a private address, refused at connect time).
+    const cause = err?.cause;
+    error = String(cause?.message || cause?.code || err?.message || err);
+    privateNetwork = cause?.code === 'EPRIVATE' || err?.code === 'EPRIVATE' || /red privada/.test(error);
   }
   await ctx.db.query(`UPDATE webhook_endpoints SET last_status = $2, last_error = $3 WHERE id = $1`, [ep.id, status || null, error]);
   if (error) {
-    if ((status >= 300 && status < 500 && status !== 429) || /red privada/.test(error)) throw new PermanentJobError(error);
+    // A private destination stays private: retrying for a day and a half would only resolve it again.
+    if ((status >= 300 && status < 500 && status !== 429) || privateNetwork) throw new PermanentJobError(error);
     throw new Error(error);
   }
 }

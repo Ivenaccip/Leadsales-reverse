@@ -38,6 +38,15 @@ function createPgDb(url: string, onIdleError?: (err: Error) => void): Db {
     },
     async tx(fn) {
       const client = await pool.connect();
+      // While checked out the pool's own listener is detached: a connection that drops mid-transaction
+      // (restart, failover, pg_terminate_backend, a proxy reset) would emit an unhandled 'error' and end
+      // the process. The pending query rejects on its own; the broken client is discarded on release.
+      let broken: Error | undefined;
+      const onError = (err: Error) => {
+        broken ??= err;
+        onIdleError?.(err);
+      };
+      client.on('error', onError);
       try {
         await client.query('BEGIN');
         const q: Queryable = {
@@ -50,10 +59,14 @@ function createPgDb(url: string, onIdleError?: (err: Error) => void): Db {
         await client.query('COMMIT');
         return out;
       } catch (err) {
-        await client.query('ROLLBACK').catch(() => {});
+        // A ROLLBACK that fails leaves the connection in an unknown state: never reuse it.
+        await client.query('ROLLBACK').catch((e: Error) => {
+          broken ??= e;
+        });
         throw err;
       } finally {
-        client.release();
+        client.off('error', onError);
+        client.release(broken);
       }
     },
     async exec(sql) {
@@ -128,7 +141,7 @@ export async function migrate(db: Db): Promise<void> {
 }
 
 /** Splits a migration on semicolons that end a line (our migrations avoid functions with bodies). */
-function splitSql(sql: string): string[] {
+export function splitSql(sql: string): string[] {
   return sql
     .split(/;\s*\n/)
     .map((s) => s.trim())

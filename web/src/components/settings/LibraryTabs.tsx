@@ -8,7 +8,7 @@ import type { QuickReply, Tag } from '../../lib/types';
 import { PLACEHOLDERS } from '../TemplateForm';
 import { TAG_NAME_HINT, tagNameProblem } from '../pickers';
 import { WA_MEDIA_ACCEPT } from '../inbox/helpers';
-import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageLoader, TagChip, Textarea, useConfirm, useToast } from '../ui';
+import { Alert, Badge, Button, Card, EmptyState, Field, Input, Modal, PageLoader, TagChip, Textarea, useConfirm, useToast } from '../ui';
 
 const COLORS = ['#ef4444', '#f97316', '#f59e0b', '#22c55e', '#10b981', '#0ea5e9', '#3b82f6', '#8b5cf6', '#ec4899', '#64748b'];
 
@@ -21,20 +21,55 @@ export function tagSaveBody(tag: Partial<Tag> | null, name: string, color: strin
   return { body: renamed ? { name, color } : { color }, problem: renamed ? tagNameProblem(name) : null };
 }
 
+/**
+ * Creating a tag whose name is taken returns the existing tag unchanged, its color too (editing a
+ * tag is for admins). What to tell the user then, or null for a new tag. It existed if the list
+ * already had it, or if it came back with another color than the one asked for.
+ */
+export function existingTagNotice(saved: Pick<Tag, 'id' | 'name' | 'color'>, known: Pick<Tag, 'id'>[] | undefined, color: string, isAdmin: boolean): string | null {
+  const existed = !!known?.some((t) => t.id === saved.id) || saved.color.toLowerCase() !== color.toLowerCase();
+  if (!existed) return null;
+  return `Ya existe la etiqueta “${saved.name}”: no se creó otra y su color no cambió. ${
+    isAdmin ? 'Para cambiarlo, edítala desde la lista.' : 'Solo un administrador puede cambiar su color.'
+  }`;
+}
+
 function TagModal({ tag, onClose }: { tag: Partial<Tag> | null; onClose: () => void }) {
   const toast = useToast();
   const qc = useQueryClient();
+  const { isAdmin } = useSession();
   const [name, setName] = useState(tag?.name ?? '');
   const [color, setColor] = useState(tag?.color ?? COLORS[5]);
+  const [existing, setExisting] = useState<{ tag: Tag; notice: string } | null>(null);
   const draft = tagSaveBody(tag, name, color);
   const save = useMutation({
-    mutationFn: () => (tag?.id ? api.patch(`/api/tags/${tag.id}`, draft.body) : api.post('/api/tags', draft.body)),
-    onSuccess: () => {
+    mutationFn: async () => {
+      if (tag?.id) {
+        await api.patch(`/api/tags/${tag.id}`, draft.body);
+        return null;
+      }
+      const known = qc.getQueryData<Tag[]>(['tags']);
+      const r = await api.post<{ tag: Tag }>('/api/tags', draft.body);
+      const notice = existingTagNotice(r.tag, known, color, isAdmin);
+      return notice ? { tag: r.tag, notice } : null;
+    },
+    onSuccess: (found) => {
       void qc.invalidateQueries({ queryKey: ['tags'] });
-      onClose();
+      if (found) setExisting(found);
+      else onClose();
     },
     onError: (e) => toast.error(errorMessage(e)),
   });
+  if (existing) {
+    return (
+      <Modal open onClose={onClose} title="La etiqueta ya existe" size="sm" footer={<Button onClick={onClose}>Entendido</Button>}>
+        <div className="space-y-4">
+          <Alert tone="info">{existing.notice}</Alert>
+          <TagChip name={existing.tag.name} color={existing.tag.color} />
+        </div>
+      </Modal>
+    );
+  }
   return (
     <Modal
       open

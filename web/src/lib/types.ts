@@ -319,4 +319,6 @@ export interface Paged<T> {
   total: number;
   page: number;
   limit: number;
+  /** GET /api/contacts with sort=recent: pass as `cursor` for the next page (null on the last one). */
+  next_cursor?: string | null;
 }

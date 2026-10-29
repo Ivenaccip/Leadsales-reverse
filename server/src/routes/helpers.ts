@@ -1,7 +1,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
-import { verifyToken } from '../lib/auth.js';
+import { verifyPassword, verifyToken } from '../lib/auth.js';
 import { sha256Hex } from '../lib/crypto.js';
 import { AppError, badRequest, forbidden, unauthorized } from '../lib/errors.js';
 import type { Role } from '../types.js';
@@ -106,9 +106,43 @@ export async function agentRestricted(ctx: AppContext, a: WsAuth): Promise<boole
 }
 
 export async function requireSuperadmin(ctx: AppContext, req: FastifyRequest): Promise<AuthUser> {
-  const user = await requireUser(ctx, req);
-  if (!user.is_superadmin) throw forbidden('Solo el administrador de la instancia puede hacer esto');
-  return user;
+  return (await requireSuperadminSession(ctx, req)).user;
+}
+
+export async function requireSuperadminSession(ctx: AppContext, req: FastifyRequest): Promise<AuthSession> {
+  const s = await requireSession(ctx, req);
+  if (!s.user.is_superadmin) throw forbidden('Solo el administrador de la instancia puede hacer esto');
+  return s;
+}
+
+// One budget per app instance (tests build several), shared by every route that asks for it.
+const passwordLimiters = new WeakMap<AppContext, RateLimiter>();
+
+/**
+ * Step-up check: the caller's current password, for changes a stolen session must not make on
+ * its own (its password, operator rights, other accounts' passwords). Limited per session: a stolen
+ * session is no unlimited password oracle, and its guesses never use up the owner's budget.
+ * Returns the account's password version (the one just verified).
+ */
+export async function verifyCurrentPassword(ctx: AppContext, s: AuthSession, password: string | undefined): Promise<number> {
+  let limiter = passwordLimiters.get(ctx);
+  if (!limiter) passwordLimiters.set(ctx, (limiter = new RateLimiter(10, 15 * 60 * 1000)));
+  if (limiter.blocked(s.sid)) throw tooManyAttempts();
+  const { rows } = await ctx.db.query<{ password_hash: string; password_version: number }>(
+    `SELECT password_hash, password_version FROM users WHERE id = $1`,
+    [s.user.id],
+  );
+  limiter.hit(s.sid);
+  let ok = false;
+  try {
+    ok = !!password && !!rows[0] && (await verifyPassword(password, rows[0].password_hash));
+  } catch (err) {
+    limiter.undo(s.sid); // nothing was checked (e.g. the server is busy)
+    throw err;
+  }
+  if (!ok) throw badRequest('La contraseña actual no es correcta', 'WRONG_PASSWORD');
+  limiter.undo(s.sid);
+  return rows[0].password_version;
 }
 
 /** Public API: "Authorization: Bearer ll_live_..." or "X-Api-Key". */

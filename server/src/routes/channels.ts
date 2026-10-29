@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { encryptJson, hmacSha256Hex, randomToken, safeEqual } from '../lib/crypto.js';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
-import { normalizePhone } from '../lib/phone.js';
+import { normalizePhone, phoneVariants } from '../lib/phone.js';
 import { syncTemplates } from '../services/templates.js';
 import type { ChannelRow } from '../types.js';
 import { processInboundMessage } from '../whatsapp/inbound.js';
@@ -80,6 +80,9 @@ async function assertCanManageCloudChannels(ctx: AppContext, a: WsAuth) {
  * or typed while the business paid Meta and likely came from its own app) proves nothing.
  */
 async function assertSecretUnknownToBusiness(ctx: AppContext, workspaceId: string, secret: string) {
+  // The instance's own app (META_APP_SECRET) is the operator's by definition: whoever knows it can
+  // already sign for every number. Re-verifying with it must work even if a number already has it.
+  if (ctx.config.metaAppSecret && safeEqual(secret, ctx.config.metaAppSecret)) return;
   const { rows } = await ctx.db.query<ChannelRow>(
     `SELECT * FROM channels WHERE workspace_id = $1 AND provider = 'cloud_api' AND NOT operator_verified`,
     [workspaceId],
@@ -136,18 +139,42 @@ export async function enableAfterPrepaid(ctx: AppContext, workspaceId: string) {
 /**
  * The simulator writes messages as if the customer sent them and moves the contact onto the
  * sandbox (where replies are never delivered): only new numbers or contacts already living
- * on this sandbox channel may be used, never a real customer.
+ * on this sandbox channel may be used, never a real customer. Inbound messages find their contact
+ * by more than the exact number (Brazil's 9th digit, Argentina's 9 or 15, a number the customer
+ * changed from): every contact one of those could reach counts here.
  */
 async function assertSimulatable(ctx: AppContext, ch: ChannelRow, from: string) {
+  const forms = [normalizePhone(`+${from}`), ...phoneVariants(from)];
   const { rows } = await ctx.db.query(
     `SELECT 1 FROM contacts c
-     WHERE c.workspace_id = $1 AND (c.wa_id = $2 OR c.phone = $3)
+     WHERE c.workspace_id = $1
+       AND (c.wa_id = $2 OR c.phone = ANY($3::text[]) OR c.wa_id = ANY($3::text[])
+         OR c.id IN (SELECT e.contact_id FROM contact_events e WHERE e.workspace_id = $1 AND e.type = 'number_changed'
+                     AND (e.data->>'old_wa_id' = $2 OR e.data->>'old_phone' = ANY($3::text[]))))
        AND (c.channel_id IS DISTINCT FROM $4
          OR EXISTS (SELECT 1 FROM messages m JOIN channels mc ON mc.id = m.channel_id WHERE m.contact_id = c.id AND mc.provider <> 'sandbox'))
      LIMIT 1`,
-    [ch.workspace_id, from, normalizePhone(`+${from}`), ch.id],
+    [ch.workspace_id, from, forms, ch.id],
   );
   if (rows[0]) throw conflict('Ese número es de un contacto real de tu espacio: usa otro número para simular', 'REAL_CONTACT');
+}
+
+/**
+ * Reads a number's templates from Meta again. Categories decide prepaid prices, and ones stored
+ * while the business could sign its own webhooks (template_category_update) may be forged: once
+ * the operator vouches for the number, they come from Meta. A failure is reported, not fatal.
+ */
+export async function resyncTemplates(ctx: AppContext, channels: ChannelRow[]): Promise<string[]> {
+  const warnings: string[] = [];
+  for (const ch of channels) {
+    try {
+      await syncTemplates(ctx, ch);
+    } catch (err) {
+      ctx.log.warn({ channelId: ch.id, err: (err as Error).message }, 'template re-sync failed');
+      warnings.push(`No se pudieron sincronizar las plantillas de ${ch.display_phone ?? ch.name}: ${(err as Error).message}`);
+    }
+  }
+  return warnings;
 }
 
 const cloudSchema = z.object({
@@ -306,6 +333,7 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
         .subscribeApp()
         .catch((err) => warnings.push(`No se pudo suscribir la app a la WABA: ${(err as Error).message}`));
     }
+    if (verified && !ch.operator_verified) warnings.push(...(await resyncTemplates(ctx, [rows[0]])));
     return { channel: publicChannel(ctx, rows[0]), warnings };
   });
 
@@ -478,15 +506,18 @@ export async function metaWebhookRoutes(app: FastifyInstance, ctx: AppContext) {
 }
 
 const WEBHOOK_BODY_LIMIT = 3 * 1024 * 1024;
-/** Changes plus the messages and statuses in them; Meta's batches are far smaller. */
+/** Entries and changes plus every item listed in them; Meta's batches are far smaller. */
 const MAX_WEBHOOK_ITEMS = 1000;
 
 function webhookItems(body: any): number {
   let n = 0;
   for (const e of Array.isArray(body?.entry) ? body.entry : []) {
     for (const ch of Array.isArray(e?.changes) ? e.changes : []) {
-      const v = ch?.value ?? {};
-      n += 1 + (Array.isArray(v.messages) ? v.messages.length : 0) + (Array.isArray(v.statuses) ? v.statuses.length : 0);
+      const v = ch?.value;
+      n += 1;
+      // Every list counts, whatever its field: messages, statuses, message_echoes, contacts, errors…
+      // (each item can cost a job its own database round trips).
+      if (v && typeof v === 'object') for (const items of Object.values(v)) if (Array.isArray(items)) n += items.length;
     }
     n += 1;
   }

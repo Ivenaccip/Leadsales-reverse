@@ -1,7 +1,8 @@
-import { lazy, Suspense, type ReactNode } from 'react';
+import { lazy, Suspense, useEffect, type ReactNode } from 'react';
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { Button, PageLoader } from './components/ui';
+import { listenForSessionChanges } from './lib/realtime';
 import { noWorkspaceReason, useSession } from './lib/session';
 import { LoginPage, RegisterPage } from './pages/Login';
 
@@ -17,22 +18,31 @@ const SettingsPage = lazy(() => import('./pages/Settings'));
 const AdminPage = lazy(() => import('./pages/Admin'));
 const InvitationPage = lazy(() => import('./pages/Invitation'));
 
+function NoWorkspace({ reason }: { reason: string }) {
+  const session = useSession();
+  const userId = session.user?.id;
+  // Rights changes reach the user's socket: the operator reactivating the workspace then reloads
+  // the session and lets them in without a page reload.
+  useEffect(() => {
+    if (userId) listenForSessionChanges();
+  }, [userId]);
+  return (
+    <div className="space-y-4 p-10 text-center text-slate-600">
+      <p>{reason}</p>
+      <Button variant="outline" onClick={() => void session.logout()}>
+        Cerrar sesión
+      </Button>
+    </div>
+  );
+}
+
 function RequireAuth({ children }: { children: ReactNode }) {
   const session = useSession();
   const location = useLocation();
   if (session.loading) return <PageLoader />;
   if (!session.user) return <Navigate to="/login" state={{ from: location.pathname }} replace />;
   const blocked = noWorkspaceReason(session);
-  if (blocked) {
-    return (
-      <div className="space-y-4 p-10 text-center text-slate-600">
-        <p>{blocked}</p>
-        <Button variant="outline" onClick={() => void session.logout()}>
-          Cerrar sesión
-        </Button>
-      </div>
-    );
-  }
+  if (blocked) return <NoWorkspace reason={blocked} />;
   return <>{children}</>;
 }
 

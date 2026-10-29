@@ -184,14 +184,17 @@ en cuanto se libera un lugar, así que un trabajo lento no detiene a los demás.
 
 ## Tiempo real
 
-El navegador abre un Socket.IO con su cookie (se valida la sesión) y entra al espacio con
-`join`. El servidor decide sus salas: `ws:{id}` (ve todo), `ws:{id}:admins` (dueños,
+El navegador abre un Socket.IO con su cookie (se valida la sesión: `unauthorized` si ya
+no sirve, `unavailable` si no se pudo comprobar y el navegador debe reintentar) y entra al
+espacio con `join`. Cada socket está además en `user:{usuario}` y `sid:{sesión}`. El servidor decide sus salas: `ws:{id}` (ve todo), `ws:{id}:admins` (dueños,
 administradores y el operador: eventos `broadcast:*`), o, para agentes limitados a "sus
 conversaciones", `ws:{id}:restricted` + `ws:{id}:u:{usuario}`, que solo reciben eventos
 de sus chats y de los no asignados. Cuando un chat que un agente limitado veía pasa a
 otra persona, ese agente recibe `contact:revoked { id }` para quitarlo de su bandeja.
-`session:refresh` pide volver a entrar (cambió el rol, la visibilidad o se perdió el
-acceso) y `session:revoked` manda a iniciar sesión.
+`session:refresh` pide volver a entrar y releer los permisos (cambió el rol, la
+visibilidad o se perdió el acceso); los cambios de permisos de una persona se envían a su
+sala `user:{usuario}`, así llegan a todas sus pestañas aunque estén en otro espacio.
+`session:revoked` manda a iniciar sesión.
 
 ## Código
 

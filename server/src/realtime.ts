@@ -8,7 +8,8 @@ import type { Server } from 'socket.io';
  *  - ws:{id}:admins      owners, admins and the instance operator (broadcast:* events)
  *  - ws:{id}:restricted  agents limited to their own + unassigned conversations
  *  - ws:{id}:u:{userId}  one restricted agent
- * Per connection: user:{userId} and sid:{sessionId}, used to end sessions and re-check rights.
+ * Per connection: user:{userId} and sid:{sessionId}, used to end sessions and re-check rights
+ * ('session:refresh' goes to user:{userId}, so every tab hears of it, whatever workspace it shows).
  * Contact/message events reach restricted agents only for conversations they may see.
  *
  * Rooms live in this process's memory: the app must run as a single replica (see docs/04).
@@ -17,8 +18,11 @@ export class Realtime {
   io: Server | null = null;
   readonly history: { room: string; event: string; data: unknown }[] = [];
   recordHistory = false;
-  /** Returns the assigned user of a contact (set by the app; used only when restricted agents are online). */
-  resolveAssignee: ((contactId: string) => Promise<string | null>) | null = null;
+  /**
+   * Returns the assigned user of a contact, null when unassigned and undefined when it does not
+   * exist (set by the app; used only when restricted agents are online).
+   */
+  resolveAssignee: ((contactId: string) => Promise<string | null | undefined>) | null = null;
   /** Last assignee seen per contact, to tell restricted agents when a conversation leaves them. */
   private assignees = new Map<string, string | null>();
   /**
@@ -78,18 +82,24 @@ export class Realtime {
   /**
    * Drops a member's (or everyone's) sockets from the workspace rooms and asks the client
    * to join again, so permission changes (removal, deactivation, visibility) apply at once.
+   * The member's other tabs (and those of `alsoUsers`) are told to reload their rights too:
+   * a role changed here shows wherever they look next.
    */
-  async evict(workspaceId: string, userId?: string): Promise<void> {
+  async evict(workspaceId: string, userId?: string, alsoUsers: string[] = []): Promise<void> {
     this.bump(userId ? `ws:${workspaceId}:u:${userId}` : `ws:${workspaceId}`);
     if (!this.io) return;
+    const targets = new Set<string>();
     for (const room of [`ws:${workspaceId}`, `ws:${workspaceId}:restricted`]) {
       const sockets = await this.io.in(room).fetchSockets();
       for (const s of sockets) {
         if (userId && s.data.userId !== userId) continue;
         for (const r of s.rooms) if (r.startsWith(`ws:${workspaceId}`)) s.leave(r);
-        s.emit('session:refresh', { workspaceId });
+        targets.add(s.id);
       }
     }
+    for (const u of userId ? [userId, ...alsoUsers] : alsoUsers) targets.add(`user:${u}`);
+    // One emit to every room: a socket in several of them still gets the event once.
+    if (targets.size) this.io.to([...targets]).emit('session:refresh', { workspaceId });
   }
 
   /** Same as evict() for every workspace a user's sockets joined (e.g. superadmin rights removed). */
@@ -97,14 +107,45 @@ export class Realtime {
     this.bump(`user:${userId}`);
     if (!this.io) return;
     for (const s of await this.io.in(`user:${userId}`).fetchSockets()) {
-      const workspaces = new Set<string>();
+      let workspaceId: string | null = null;
       for (const r of s.rooms) {
         if (!r.startsWith('ws:')) continue;
-        workspaces.add(r.split(':')[1]);
+        workspaceId = r.split(':')[1];
         s.leave(r);
       }
-      for (const workspaceId of workspaces) s.emit('session:refresh', { workspaceId });
+      // Also a tab that joined no workspace (e.g. one on the "suspended" screen).
+      s.emit('session:refresh', { workspaceId });
     }
+  }
+
+  /**
+   * Rights that only widen or that live outside any room (promotion to instance operator, a
+   * reactivated workspace, a new membership): every tab of these users reloads them.
+   */
+  refreshUsers(userIds: string[], workspaceId: string | null = null): void {
+    for (const u of userIds) this.bump(`user:${u}`);
+    if (!this.io || !userIds.length) return;
+    this.io.to(userIds.map((u) => `user:${u}`)).emit('session:refresh', { workspaceId });
+  }
+
+  /**
+   * Contacts deleted or archived at once ('contacts:bulk'). Members who see every conversation
+   * get all the ids; a restricted agent only those of conversations it could see (its own and
+   * unassigned ones), with each contact's assignee as it was when the change was made.
+   */
+  emitContactsBulk(workspaceId: string, action: 'delete' | 'archive', contacts: { id: string; assigned_user_id: string | null }[]): void {
+    if (!contacts.length) return;
+    const room = `ws:${workspaceId}`;
+    const data = { action, ids: contacts.map((c) => c.id) };
+    if (this.recordHistory) this.history.push({ room, event: 'contacts:bulk', data });
+    if (action === 'delete') for (const c of contacts) this.assignees.delete(c.id);
+    if (!this.io) return;
+    this.io.to(room).emit('contacts:bulk', data);
+    const restricted = `${room}:restricted`;
+    if (!this.io.sockets.adapter.rooms.get(restricted)?.size) return;
+    const byOwner = new Map<string | null, string[]>();
+    for (const c of contacts) byOwner.set(c.assigned_user_id, [...(byOwner.get(c.assigned_user_id) ?? []), c.id]);
+    for (const [owner, ids] of byOwner) this.io.to(owner ? `${room}:u:${owner}` : restricted).emit('contacts:bulk', { action, ids });
   }
 
   /** Tells the sockets of ended sessions to log out ('session:revoked') and disconnects them. */
@@ -121,7 +162,9 @@ export class Realtime {
 
   private async emitRestricted(workspaceId: string, event: string, data: any) {
     const restricted = `ws:${workspaceId}:restricted`;
-    const scoped = /^(contact|message|scheduled):/.test(event);
+    // Anything about contacts is scoped: one that names no contact this can place is not sent
+    // (contacts:bulk goes through emitContactsBulk, which knows each contact's assignee).
+    const scoped = /^(contacts?|message|scheduled):/.test(event);
     if (!scoped) {
       this.io!.to(restricted).emit(event, data);
       return;

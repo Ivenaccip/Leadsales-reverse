@@ -6,7 +6,7 @@ import { api, ApiError, errorMessage, qs } from '../lib/api';
 import { defaultChannel, useChannels, useFunnels, useMembers, useTags, useTemplates } from '../lib/queries';
 import { useRealtime } from '../lib/realtime';
 import { CATEGORY_LABEL, MARKET_LABEL, credits, dateTime, formatPhone, number } from '../lib/format';
-import type { Audience, Broadcast, BroadcastParams, Estimate, Template } from '../lib/types';
+import type { Audience, Broadcast, BroadcastParams, Channel, Estimate, Template } from '../lib/types';
 import { useDebounced } from '../components/crm/hooks';
 import { MemberSelect, StagePills, TagMultiSelect } from '../components/pickers';
 import {
@@ -224,21 +224,79 @@ export function editableBroadcast(status: Broadcast['status']): boolean {
 }
 
 /**
+ * Its number was deleted (channel_id null). The server never falls back to the default number:
+ * saving it without a number, sending or resuming it is refused (NO_CHANNEL) until one is chosen.
+ */
+export function broadcastLostNumber(b: Pick<Broadcast, 'channel_id'> | undefined): boolean {
+  return !!b && b.channel_id == null;
+}
+
+/**
  * Body of the save request. A paused broadcast already chose its recipients at launch: the server
- * refuses any audience for it (AUDIENCE_LOCKED), and its number and schedule stay as they were.
+ * refuses any audience for it (AUDIENCE_LOCKED), and its schedule stays as it was. So does its
+ * number, unless that number was deleted (`numberGone`): then the one chosen here goes with it.
  */
 export function broadcastSaveBody(
   status: Broadcast['status'] | undefined,
   f: { name: string; channelId: string; template: Pick<Template, 'name' | 'language'>; params: BroadcastParams; audience: Audience; scheduledAt: string | null },
+  numberGone = false,
 ) {
   const message = { name: f.name, template_name: f.template.name, template_language: f.template.language, params: f.params };
-  if (status === 'paused') return message;
+  if (status === 'paused') return numberGone ? { ...message, channel_id: f.channelId || undefined } : message;
   return { ...message, channel_id: f.channelId || undefined, audience: f.audience, scheduled_at: f.scheduledAt };
 }
 
 /** The broadcast changed state while it was being edited: the editor reloads it. */
 export function broadcastChangedMeanwhile(err: unknown): boolean {
   return err instanceof ApiError && (err.code === 'BROADCAST_CHANGED' || err.code === 'AUDIENCE_LOCKED');
+}
+
+/**
+ * After NO_CHANNEL the broadcast and the numbers are read again. The editor reloads (and its number
+ * is chosen again) only if the broadcast lost its number or changed state meanwhile. NO_CHANNEL also
+ * means the chosen number is disabled, or none can send: then the edits stay, and the refreshed list
+ * shows which numbers can. A number picked here and deleted since falls back to the default one.
+ */
+export function afterNoChannel(
+  before: Pick<Broadcast, 'channel_id' | 'status'> | undefined,
+  now: Pick<Broadcast, 'channel_id' | 'status'> | undefined,
+  chosen: string,
+  channels: Pick<Channel, 'id'>[] | undefined,
+): { reload: boolean; resetNumber: boolean } {
+  const reload = !!before && !!now && (now.status !== before.status || (!broadcastLostNumber(before) && broadcastLostNumber(now)));
+  return { reload, resetNumber: reload || (!!chosen && !channels?.some((c) => c.id === chosen)) };
+}
+
+/**
+ * "Número que envía". Hidden with a single number, and fixed for a paused broadcast, except when
+ * the broadcast's number was deleted: then it must be chosen again, even if only one is left.
+ */
+export function BroadcastNumberField({
+  channels,
+  value,
+  onChange,
+  paused,
+  numberGone,
+}: {
+  channels: Channel[];
+  value: string;
+  onChange: (id: string) => void;
+  paused: boolean;
+  numberGone: boolean;
+}) {
+  if (!channels.length || (channels.length === 1 && !numberGone)) return null;
+  return (
+    <Field label="Número que envía" hint={numberGone ? 'Se eliminó el número con el que se creó esta difusión: elige el que la enviará.' : undefined}>
+      <Select value={value} disabled={paused && !numberGone} onChange={(e) => onChange(e.target.value)}>
+        {channels.map((c) => (
+          <option key={c.id} value={c.id} disabled={c.status === 'disabled' && c.id !== value}>
+            {c.name} {c.display_phone ? `(${c.display_phone})` : ''}
+            {c.status === 'disabled' ? ' · deshabilitado' : ''}
+          </option>
+        ))}
+      </Select>
+    </Field>
+  );
 }
 
 /**
@@ -281,6 +339,7 @@ function BroadcastWizard() {
   const [scheduledAt, setScheduledAt] = useState('');
   const [loaded, setLoaded] = useState(!id);
   const paused = existingQ.data?.status === 'paused';
+  const numberGone = broadcastLostNumber(existingQ.data);
 
   const effectiveChannel = channelId || defaultChannel(channels)?.id || '';
   const templatesQ = useTemplates(effectiveChannel || undefined);
@@ -330,14 +389,18 @@ function BroadcastWizard() {
   const save = useMutation({
     mutationFn: async (launch: boolean) => {
       if (!template) throw new Error('Elige una plantilla');
-      const body = broadcastSaveBody(existingQ.data?.status, {
-        name: name.trim(),
-        channelId: effectiveChannel,
-        template,
-        params: toBroadcastParams(template, value),
-        audience: audienceClean,
-        scheduledAt: when === 'later' && scheduledAt ? new Date(scheduledAt).toISOString() : null,
-      });
+      const body = broadcastSaveBody(
+        existingQ.data?.status,
+        {
+          name: name.trim(),
+          channelId: effectiveChannel,
+          template,
+          params: toBroadcastParams(template, value),
+          audience: audienceClean,
+          scheduledAt: when === 'later' && scheduledAt ? new Date(scheduledAt).toISOString() : null,
+        },
+        numberGone,
+      );
       const saved = id
         ? (await api.patch<{ broadcast: Broadcast }>(`/api/broadcasts/${id}`, body)).broadcast
         : (await api.post<{ broadcast: Broadcast }>('/api/broadcasts', body)).broadcast;
@@ -364,6 +427,17 @@ function BroadcastWizard() {
       void qc.invalidateQueries({ queryKey: ['broadcasts'] });
       // Launched, paused or resumed elsewhere: show what it is now (or that it can no longer be edited).
       if (id && broadcastChangedMeanwhile(err)) void existingQ.refetch().then(() => setLoaded(false));
+      // A number deleted or disabled meanwhile. If it was the broadcast's own, it is chosen again
+      // from the current list in the reloaded editor.
+      else if (id && err instanceof ApiError && err.code === 'NO_CHANNEL') {
+        const before = existingQ.data;
+        const chosen = channelId;
+        void Promise.all([existingQ.refetch(), qc.refetchQueries({ queryKey: ['channels'] })]).then(([now]) => {
+          const next = afterNoChannel(before, now.data, chosen, qc.getQueryData<Channel[]>(['channels']));
+          if (next.resetNumber) setChannelId('');
+          if (next.reload) setLoaded(false);
+        });
+      }
     },
   });
 
@@ -400,6 +474,14 @@ function BroadcastWizard() {
         </div>
       )}
 
+      {numberGone && channels.length > 0 && (
+        <div className="mb-4">
+          <Alert tone="warning" title="Se eliminó el número de esta difusión">
+            Elige en “Número que envía” el número que la enviará y guarda los cambios{paused ? '; después podrás reanudarla' : ''}.
+          </Alert>
+        </div>
+      )}
+
       {paused ? (
         <div className="mb-4">
           <Alert tone="info" title="Difusión en pausa">
@@ -425,25 +507,16 @@ function BroadcastWizard() {
                 <Field label="Nombre interno de la difusión">
                   <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Ej. Promo Buen Fin clientes VIP" autoFocus />
                 </Field>
-                {channels.length > 1 && (
-                  <Field label="Número que envía">
-                    <Select
-                      value={effectiveChannel}
-                      disabled={paused}
-                      onChange={(e) => {
-                        setChannelId(e.target.value);
-                        setTemplateKey('');
-                      }}
-                    >
-                      {channels.map((c) => (
-                        <option key={c.id} value={c.id} disabled={c.status === 'disabled' && c.id !== effectiveChannel}>
-                          {c.name} {c.display_phone ? `(${c.display_phone})` : ''}
-                          {c.status === 'disabled' ? ' · deshabilitado' : ''}
-                        </option>
-                      ))}
-                    </Select>
-                  </Field>
-                )}
+                <BroadcastNumberField
+                  channels={channels}
+                  value={effectiveChannel}
+                  paused={paused}
+                  numberGone={numberGone}
+                  onChange={(channel) => {
+                    setChannelId(channel);
+                    setTemplateKey('');
+                  }}
+                />
                 <Field
                   label="Plantilla"
                   hint={

@@ -274,6 +274,14 @@ export async function syncTemplates(ctx: AppContext, channel: ChannelRow): Promi
     for (const t of remote) {
       await upsertTemplate(q, channel, { ...t, meta_id: t.id });
     }
+    // What was just read is Meta's current state: the next status or category event applies,
+    // whatever time earlier events left (a business that signed its own webhooks could date them
+    // ahead and pin a category Meta changes later).
+    await q.query(
+      `UPDATE templates SET status_event_at = NULL, category_event_at = NULL
+       WHERE channel_id = $1 AND (status_event_at IS NOT NULL OR category_event_at IS NOT NULL)`,
+      [channel.id],
+    );
     if (channel.provider === 'cloud_api') {
       const keep = remote.map((t) => `${t.name}|${t.language}`);
       await q.query(`DELETE FROM templates WHERE channel_id = $1 AND NOT ((name || '|' || language) = ANY($2::text[]))`, [channel.id, keep]);

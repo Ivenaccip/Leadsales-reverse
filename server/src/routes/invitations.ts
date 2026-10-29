@@ -140,6 +140,8 @@ export async function invitationRoutes(app: FastifyInstance, ctx: AppContext) {
       await joinWorkspace(q, inv, user.id);
       return inv.workspace_id;
     });
+    // The account's other open tabs learn about the new workspace too.
+    ctx.realtime.refreshUsers([user.id], workspaceId);
     return { workspace_id: workspaceId };
   });
 

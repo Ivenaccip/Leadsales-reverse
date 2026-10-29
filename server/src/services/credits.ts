@@ -24,6 +24,16 @@ export function normalizeCategory(raw: string | null | undefined): PriceCategory
   return null; // referral_conversion and others are free
 }
 
+/**
+ * What a template send is priced as. Meta bills every template by its category, and templates only
+ * come as marketing, utility or authentication: one stored without a category, or as 'service'
+ * (never Meta's, e.g. forged in a category webhook), is never free but marketing, the dearest.
+ */
+export function templatePriceCategory(raw: string | null | undefined): PriceCategory {
+  const c = normalizeCategory(raw);
+  return c && c !== 'service' ? c : 'marketing';
+}
+
 export async function getRate(q: Queryable, phone: string, category: PriceCategory): Promise<number> {
   const market = marketFromPhone(phone);
   const { rows } = await q.query<{ market: string; price: number }>(

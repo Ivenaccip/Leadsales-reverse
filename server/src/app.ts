@@ -46,7 +46,7 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
     (await createDb({
       databaseUrl: config.databaseUrl,
       dataDir: config.dataDir,
-      onIdleError: (err) => app.log.warn({ err: err.message }, 'idle database connection lost'),
+      onIdleError: (err) => app.log.warn({ err: err.message }, 'database connection lost'),
     }));
   const queue = new Queue(db);
   const realtime = new Realtime();
@@ -122,23 +122,27 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
 
   // Realtime (Socket.IO on the same port). Rooms live in this process: run a single replica.
   const io = new IOServer(app.server, { path: '/socket.io', serveClient: false });
+  // 'unauthorized' means the session is over (the client signs out once /api/auth/me agrees);
+  // 'unavailable' is a passing failure (e.g. the database is restarting) that the client retries.
   io.use(async (socket, next) => {
+    const token = readCookie(socket.handshake.headers.cookie, COOKIE);
+    const payload = token ? verifyToken(config.jwtSecret, token) : null;
+    if (!payload) return next(new Error('unauthorized'));
+    let live: boolean;
     try {
-      const token = readCookie(socket.handshake.headers.cookie, COOKIE);
-      const payload = token ? verifyToken(config.jwtSecret, token) : null;
-      if (!payload) return next(new Error('unauthorized'));
       const { rows } = await db.query(
         `SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id AND u.password_version = s.password_version
          WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL`,
         [payload.sid, payload.uid],
       );
-      if (!rows[0]) return next(new Error('unauthorized'));
-      socket.data.userId = payload.uid;
-      socket.data.sid = payload.sid;
-      next();
+      live = !!rows[0];
     } catch {
-      next(new Error('unauthorized'));
+      return next(new Error('unavailable'));
     }
+    if (!live) return next(new Error('unauthorized'));
+    socket.data.userId = payload.uid;
+    socket.data.sid = payload.sid;
+    next();
   });
   io.on('connection', (socket) => {
     // Lets logout/password changes reach this connection (Realtime.endSessions / evictUser).
@@ -197,7 +201,8 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
   realtime.io = io;
   realtime.resolveAssignee = async (contactId) => {
     const { rows } = await db.query<{ assigned_user_id: string | null }>(`SELECT assigned_user_id FROM contacts WHERE id = $1`, [contactId]);
-    return rows[0] ? rows[0].assigned_user_id : null;
+    // A contact deleted meanwhile is unknown, not unassigned: restricted agents get nothing about it.
+    return rows[0] ? rows[0].assigned_user_id : undefined;
   };
 
   return {

@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
+import type { Queryable } from '../db/index.js';
 import { hashPassword } from '../lib/auth.js';
 import { encrypt } from '../lib/crypto.js';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
@@ -207,24 +208,21 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
       z.object({ role: z.enum(['owner', 'admin', 'agent']).optional(), is_active: z.boolean().optional(), receives_leads: z.boolean().optional() }),
       req.body,
     );
-    const target = await memberOf(ctx, a, id);
-    if ((body.role === 'owner' || target.role === 'owner') && a.role !== 'owner') {
-      throw badRequest('Solo un propietario puede cambiar a otro propietario');
-    }
-    if (target.role === 'owner' && (body.role && body.role !== 'owner' || body.is_active === false)) {
-      const owners = await ctx.db.query<{ n: number }>(
-        `SELECT count(*)::int AS n FROM memberships WHERE workspace_id = $1 AND role = 'owner' AND is_active`,
-        [a.workspaceId],
+    await memberOf(ctx, a, id);
+    await ctx.db.tx(async (q) => {
+      const target = await lockOwnersAnd(q, a.workspaceId, id);
+      if ((body.role === 'owner' || target.role === 'owner') && a.role !== 'owner') {
+        throw badRequest('Solo un propietario puede cambiar a otro propietario');
+      }
+      if ((body.role && body.role !== 'owner') || body.is_active === false) await keepAnActiveOwner(q, a.workspaceId, id, target);
+      await q.query(
+        `UPDATE memberships SET role = COALESCE($3, role), is_active = COALESCE($4, is_active), receives_leads = COALESCE($5, receives_leads)
+         WHERE workspace_id = $1 AND user_id = $2`,
+        [a.workspaceId, id, body.role ?? null, body.is_active ?? null, body.receives_leads ?? null],
       );
-      if (owners.rows[0].n <= 1) throw badRequest('Debe quedar al menos un propietario activo');
-    }
-    await ctx.db.query(
-      `UPDATE memberships SET role = COALESCE($3, role), is_active = COALESCE($4, is_active), receives_leads = COALESCE($5, receives_leads)
-       WHERE workspace_id = $1 AND user_id = $2`,
-      [a.workspaceId, id, body.role ?? null, body.is_active ?? null, body.receives_leads ?? null],
-    );
-    // A pending link from before must not give back a role or access that was just taken away.
-    if (body.role || body.is_active === false) await revokePendingInvitations(ctx.db, a.workspaceId, { userId: id });
+      // A pending link from before must not give back a role or access that was just taken away.
+      if (body.role || body.is_active === false) await revokePendingInvitations(q, a.workspaceId, { userId: id });
+    });
     if (body.role || body.is_active !== undefined) await ctx.realtime.evict(a.workspaceId, id);
     if (body.is_active === false) await endSessionsWithoutWorkspace(ctx, id);
     return { ok: true };
@@ -233,17 +231,17 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
   app.delete('/api/workspace/members/:id', async (req, reply) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const { id } = parse(z.object({ id: uuid }), req.params);
-    const target = await memberOf(ctx, a, id);
-    if (target.role === 'owner') {
-      if (a.role !== 'owner') throw badRequest('Solo un propietario puede quitar a otro propietario');
-      const owners = await ctx.db.query<{ n: number }>(`SELECT count(*)::int AS n FROM memberships WHERE workspace_id = $1 AND role = 'owner'`, [
-        a.workspaceId,
-      ]);
-      if (owners.rows[0].n <= 1) throw badRequest('Debe quedar al menos un propietario');
-    }
-    await ctx.db.query(`UPDATE contacts SET assigned_user_id = NULL WHERE workspace_id = $1 AND assigned_user_id = $2`, [a.workspaceId, id]);
-    await ctx.db.query(`DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2`, [a.workspaceId, id]);
-    await revokePendingInvitations(ctx.db, a.workspaceId, { userId: id });
+    await memberOf(ctx, a, id);
+    await ctx.db.tx(async (q) => {
+      const target = await lockOwnersAnd(q, a.workspaceId, id);
+      if (target.role === 'owner') {
+        if (a.role !== 'owner') throw badRequest('Solo un propietario puede quitar a otro propietario');
+        await keepAnActiveOwner(q, a.workspaceId, id, target);
+      }
+      await q.query(`UPDATE contacts SET assigned_user_id = NULL WHERE workspace_id = $1 AND assigned_user_id = $2`, [a.workspaceId, id]);
+      await q.query(`DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2`, [a.workspaceId, id]);
+      await revokePendingInvitations(q, a.workspaceId, { userId: id });
+    });
     await ctx.realtime.evict(a.workspaceId, id);
     await endSessionsWithoutWorkspace(ctx, id);
     return noContent(reply);
@@ -259,6 +257,30 @@ async function memberOf(ctx: AppContext, a: WsAuth, userId: string) {
   if (!rows[0]) throw notFound('Miembro');
   if (rows[0].is_superadmin && !a.user.is_superadmin) throw forbidden('Solo el administrador de la instancia puede cambiar su propio acceso');
   return rows[0];
+}
+
+/**
+ * Locks the workspace's owner memberships (then the target's): two owners demoting or removing
+ * each other at the same moment are checked one after the other, so they cannot both pass.
+ */
+async function lockOwnersAnd(q: Queryable, workspaceId: string, userId: string) {
+  await q.query(`SELECT user_id FROM memberships WHERE workspace_id = $1 AND role = 'owner' ORDER BY user_id FOR UPDATE`, [workspaceId]);
+  const { rows } = await q.query<{ role: string; is_active: boolean }>(
+    `SELECT role, is_active FROM memberships WHERE workspace_id = $1 AND user_id = $2 FOR UPDATE`,
+    [workspaceId, userId],
+  );
+  if (!rows[0]) throw notFound('Miembro');
+  return rows[0];
+}
+
+/** Demoting, deactivating or removing an active owner needs another active owner to remain. */
+async function keepAnActiveOwner(q: Queryable, workspaceId: string, userId: string, target: { role: string; is_active: boolean }) {
+  if (target.role !== 'owner' || !target.is_active) return;
+  const { rows } = await q.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM memberships WHERE workspace_id = $1 AND role = 'owner' AND is_active AND user_id <> $2`,
+    [workspaceId, userId],
+  );
+  if (rows[0].n === 0) throw badRequest('Debe quedar al menos un propietario activo');
 }
 
 /**

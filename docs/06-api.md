@@ -196,8 +196,9 @@ documentada por el código en `server/src/routes/`. Lo que más conviene saber:
 - `POST /api/auth/logout` revoca esa sesión; sus sockets reciben `session:revoked` y se
   desconectan.
 - `PATCH /api/auth/me { currentPassword, password }` revoca todas las demás sesiones de
-  la cuenta (la actual sigue activa). `400` si `currentPassword` no es correcta; tras 10
-  intentos fallidos en 15 minutos desde la misma sesión, `429 TOO_MANY_REQUESTS` en esa
+  la cuenta (la actual sigue activa). `400 WRONG_PASSWORD` si `currentPassword` no es
+  correcta; tras 10 intentos fallidos en 15 minutos desde la misma sesión (contando los de
+  las acciones del operador que también la piden), `429 TOO_MANY_REQUESTS` en esa
   sesión (aunque la siguiente sea la correcta). El límite es por sesión: quien robó una
   sesión no puede gastar los intentos de las demás, y la dueña siempre puede cambiar la
   contraseña desde su propia sesión para cerrar la robada. `409 PASSWORD_CHANGED` si otra
@@ -246,22 +247,32 @@ documentada por el código en `server/src/routes/`. Lo que más conviene saber:
 - `PATCH`/`DELETE /api/workspace/members/:id`: la membresía del administrador de la
   instancia solo la cambia él mismo (`403`). Desactivar o quitar a alguien de su único
   espacio cierra todas sus sesiones. Cambiar el rol, desactivar o quitar a alguien revoca
-  sus invitaciones pendientes en el espacio.
+  sus invitaciones pendientes en el espacio. Degradar, desactivar o quitar al último
+  propietario **activo** responde `400` ("Debe quedar al menos un propietario activo"):
+  un propietario desactivado no cuenta.
 
 ### Administración de la instancia (solo el administrador de la instancia)
 
 - `GET /api/admin/users` → `{ users: [{ id, email, name, is_superadmin, created_at,
   workspaces, workspace_names }] }`.
-- `POST /api/admin/users/:id/password { password }` pone una contraseña temporal, cierra
-  todas las sesiones de la cuenta (y sus sockets) e invalida sus cookies `ll_device`.
-  `400` para tu propia cuenta o la de otro administrador de la instancia (esas se cambian
-  desde el perfil, con la contraseña actual).
+- `PATCH /api/admin/users/:id { is_superadmin, currentPassword }` da o quita el rol de
+  administrador de la instancia. `currentPassword` es la contraseña actual de quien lo
+  hace: `400 WRONG_PASSWORD` si falta o no es correcta, y `429` tras 10 intentos fallidos
+  en 15 minutos desde la misma sesión (el mismo límite que `PATCH /api/auth/me`). `400`
+  si te quitas el rol a ti mismo.
+- `POST /api/admin/users/:id/password { password, currentPassword }` pone una contraseña
+  temporal, cierra todas las sesiones de la cuenta (y sus sockets) e invalida sus cookies
+  `ll_device`. `currentPassword` como arriba. `400` para tu propia cuenta o la de otro
+  administrador de la instancia (esas se cambian desde el perfil, con la contraseña
+  actual).
 - `DELETE /api/admin/users/:id` → `204`, borra una cuenta que no es miembro de ningún
   espacio (libera el correo). `409 USER_HAS_WORKSPACES` si todavía es miembro de alguno
   (quítala primero desde cada espacio); `400` para administradores de la instancia.
-- `PATCH /api/admin/workspaces/:id { billing_mode, is_active }`: pasar a `prepaid`
-  desactiva los números que el operador no verificó; volver a `meta_direct` reactiva los
-  que se desactivaron solo por eso.
+- `PATCH /api/admin/workspaces/:id { billing_mode, is_active }` →
+  `{ workspace, warnings }`: pasar a `prepaid` desactiva los números que el operador no
+  verificó y vuelve a leer de Meta las plantillas de los verificados (`warnings` si no se
+  pudo); volver a `meta_direct` reactiva los que se desactivaron solo por eso. Todos los
+  miembros reciben `session:refresh`.
 
 ### Canales
 
@@ -274,7 +285,9 @@ documentada por el código en `server/src/routes/`. Lo que más conviene saber:
 - `POST /api/channels/:id/simulate { from, name?, text?, reply_id? }` (sandbox,
   dueño/admin): `from` va con lada; un número de 10 dígitos sin `+` recibe la lada
   predeterminada del espacio, como los contactos creados a mano. `409 REAL_CONTACT` si el
-  número es de un contacto que no está ya en ese canal sandbox.
+  número es de un contacto que no está ya en ese canal sandbox, también escrito de otra
+  forma que llegaría a ese contacto (Brasil con o sin el 9, Argentina con o sin el 9 o el
+  15) o si es el número anterior de un cliente que cambió de número.
 - `POST /api/channels` / `PATCH /api/channels/:id`: `409 WABA_TAKEN` si la WABA ya está
   conectada en otro espacio. `operator_verified` solo es `true` si el operador capturó la
   `app_secret` con el espacio en prepagado (al actualizar, los números no verificados de
@@ -283,9 +296,11 @@ documentada por el código en `server/src/routes/`. Lo que más conviene saber:
   "active" }` de un número no verificado responde `400 OPERATOR_VERIFICATION_REQUIRED`:
   el operador debe enviar `access_token` y `app_secret` de su propia app de Meta (eso marca
   `operator_verified`, suscribe esa app a la WABA —`warnings` si falla— y reactiva el
-  número desactivado al pasar a prepagado). Una `app_secret` que ya está en un número no
-  verificado del espacio (por ejemplo, la que tenía ese mismo número) responde
-  `400 APP_SECRET_NOT_NEW`, también en `POST`.
+  número desactivado al pasar a prepagado). Al quedar verificado, el número vuelve a leer
+  sus plantillas de Meta (`warnings` si no se pudo). Una `app_secret` que ya está en un
+  número no verificado del espacio (por ejemplo, la que tenía ese mismo número) responde
+  `400 APP_SECRET_NOT_NEW`, también en `POST`, salvo la `META_APP_SECRET` de la
+  instancia.
 
 ### Plantillas
 
@@ -389,6 +404,11 @@ Los envíos de plantilla de la bandeja (`POST /api/contacts/:id/messages` con
   reenviar uno recibido) y al guardar una respuesta rápida con adjunto; si Meta rechaza la
   subida, `400 META_ERROR`. Al enviar, estos errores llegan antes de guardar o cobrar el
   mensaje.
+- `GET /api/media/:id` (con `X-Workspace-Id`, o `?ws=<id>` para `<img>`, `<video>` y
+  `<audio>`) responde por rangos de bytes: `Accept-Ranges: bytes`, y con
+  `Range: bytes=inicio-fin` (o `inicio-`, o `-últimos`) responde `206` con
+  `Content-Range`; un rango fuera del archivo responde `416`. Varios rangos en una
+  petición o uno mal formado reciben el archivo completo (`200`).
 - `POST /api/contacts/:id/messages` → `{ message }`, con `{ type: "text", text,
   reply_to_wamid? }`, `{ type: "media", media_file_id, caption? }`, `{ type: "template",
   name, language, params? }` o `{ type: "quick_reply", quick_reply_id }`. `caption` admite
@@ -416,17 +436,36 @@ Los envíos de plantilla de la bandeja (`POST /api/contacts/:id/messages` con
 
 ### Contactos
 
+- `GET /api/contacts?…&sort=recent&limit=30` → `{ items, total, page, limit, next_cursor }`.
+  Con `sort=recent` (el orden de la bandeja, el de omisión), `next_cursor` es un texto
+  opaco, o `null` si no hay más: pide la página siguiente con `cursor=<next_cursor>` (y
+  los mismos filtros). Las páginas por cursor no se saltan ni repiten conversaciones
+  aunque entretanto alguna suba al principio o salga del filtro (con `page` sí podía
+  pasar). `page` sigue funcionando para todos los órdenes; con los demás, `next_cursor` es
+  `null`. Un cursor que no salió de esta ruta, o con otro `sort`, responde
+  `400 INVALID_CURSOR`.
 - `POST /api/contacts`: si el teléfono ya existe responde ese contacto con
   `created: false`; un agente que solo ve sus conversaciones recibe
   `409 CONTACT_EXISTS` si ese contacto está asignado a otra persona.
 - `POST /api/contacts/import { csv, funnel_id?, stage_id?, tag_ids?, lossy? }`
-  (dueño/admin): el texto del CSV, máx. 20,000 filas. El separador (`,`, `;` o tabulador)
-  se detecta en la fila de encabezados. Encabezados reconocidos: `telefono` (o `celular`,
-  `whatsapp`…), `nombre`, `correo`, `empresa`, `etiquetas` (separadas por `;`, `,` o `|`)
-  y `valor`; las demás columnas van a campos personalizados. Responde
+  (dueño/admin): el texto del CSV, máx. 20,000 filas y 200 columnas
+  (`400 CSV_TOO_MANY_COLUMNS`, antes de leer las filas). La fila de encabezados es la
+  primera que no está en blanco; el separador (`,`, `;` o tabulador) se detecta en ella.
+  Encabezados reconocidos: `telefono` (o `celular`, `whatsapp`…), `nombre`, `correo`,
+  `empresa`, `etiquetas` (separadas por `;`, `,` o `|`) y `valor`; las demás columnas van
+  a campos personalizados. Responde
   `{ total, created, existing, errors, error_count }`; una fila sin teléfono, con nombre o
   empresa de más de 120 caracteres, o con una etiqueta nueva de más de 40, va a `errors`
   (con su número de fila) y las demás se importan.
+- Un archivo exportado por LeadLibre (tiene todas las columnas `campos`, `embudo`, `etapa`,
+  `asignado_a`, `origen`, `creado` y `ultimo_mensaje`) vuelve como era: `campos` (un objeto
+  JSON) se convierte otra vez en los campos personalizados del contacto, `embudo` y
+  `etapa` lo colocan en el embudo y la etapa con esos nombres si existen en el espacio (y
+  no elegiste `funnel_id` ni `stage_id`), y `asignado_a`, `origen`, `creado` y
+  `ultimo_mensaje` no se guardan como campos. Una fila cuyo `campos` no es un objeto JSON
+  (editado a mano) guarda todas sus columnas no reconocidas como campos personalizados,
+  igual que en cualquier otro archivo: en otros archivos, toda columna no reconocida
+  (también una llamada `Campos` u `Origen`) va a campos personalizados.
 - El texto debe venir en UTF-8. Un archivo ANSI (como el "CSV (delimitado por comas)" de
   Excel en español) leído como UTF-8 pierde los acentos, que quedan como `�` (U+FFFD), y
   responde `400 CSV_NOT_UTF8`. `lossy` dice cómo convertiste el archivo en texto:
@@ -436,6 +475,9 @@ Los envíos de plantilla de la bandeja (`POST /api/contacts/:id/messages` con
   de encabezados o pegado a una letra dentro de un valor responde `CSV_NOT_UTF8`
   (indicando la fila); uno suelto se importa como dato. La interfaz web convierte sola los
   archivos ANSI y UTF-16 y siempre envía `lossy`.
+- `POST /api/tags { name, color? }` (cualquier miembro): si ya existe una etiqueta con ese
+  nombre, responde esa etiqueta sin cambiarla. Cambiar el nombre o el color de una
+  etiqueta es `PATCH /api/tags/:id` (dueño/admin).
 - Etiquetas: una etiqueta nueva tiene hasta 40 caracteres y su nombre no puede llevar `;`,
   `,` ni `|` (`POST`/`PATCH /api/tags` responden `400`), porque son los separadores de la
   columna `etiquetas`. Las etiquetas creadas antes de esa regla siguen funcionando: al
@@ -471,9 +513,10 @@ Los envíos de plantilla de la bandeja (`POST /api/contacts/:id/messages` con
 
 ### Webhook de Meta (`POST /webhooks/whatsapp`)
 
-- Cuerpo máximo 3 MB (`413`) y como máximo 1000 elementos (entradas, cambios, mensajes y
-  estados) por payload (`413 TOO_MANY_EVENTS`); los lotes reales de Meta son mucho más
-  chicos.
+- Cuerpo máximo 3 MB (`413`) y como máximo 1000 elementos por payload
+  (`413 TOO_MANY_EVENTS`): entradas, cambios y cada elemento de las listas de un cambio
+  (`messages`, `statuses`, `message_echoes`, `contacts`, `errors`…). Los lotes reales de
+  Meta son mucho más chicos.
 - Cada payload firmado se reparte por espacio de trabajo: un trabajo `wa.webhook` por
   espacio, con solo sus eventos (`{ body, channelIds, trustedChannelIds }`), en el carril
   de entrada con reparto justo entre espacios.
@@ -491,3 +534,17 @@ a pedir `/api/credits`), `template:update`; `broadcast:update` (solo dueños y
 administradores); `contact:revoked { id }` (un agente limitado deja de ver ese chat);
 `session:refresh` (vuelve a hacer `join`) y `session:revoked` (sesión terminada: ir a
 iniciar sesión).
+
+- `contacts:bulk { action: "delete"|"archive", ids }`: chats borrados o archivados de una
+  vez. Un agente que solo ve sus conversaciones recibe solo los `ids` de los chats que
+  podía ver (suyos o sin asignar), a veces en varios eventos.
+- `session:refresh { workspaceId }` llega a **todas** las pestañas de la persona (cada
+  socket está en la sala de su usuario), vean el espacio que vean, cuando cambian sus
+  permisos: rol o acceso en cualquier espacio, rol de administrador de la instancia,
+  espacio suspendido o reactivado, invitación aceptada. Vuelve a leer `/api/auth/me`.
+- Conexión rechazada: `connect_error` con `unauthorized` si no hay sesión válida (sin
+  cookie, token inválido, sesión cerrada o contraseña cambiada) y `unavailable` si el
+  servidor no pudo comprobarla (por ejemplo, la base de datos se está reiniciando).
+  Socket.IO no reintenta solo tras un rechazo: el cliente reintenta `unavailable` con
+  espera creciente y, ante `unauthorized`, consulta `/api/auth/me` (solo un `401` cierra
+  la sesión).

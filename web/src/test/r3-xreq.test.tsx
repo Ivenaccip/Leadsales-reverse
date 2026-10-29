@@ -361,14 +361,16 @@ describe('a refused workspace join is retried before reloading the session', () 
     expect(s.joins()).toEqual([WS_A, WS_A]);
     s.ackJoin(true);
     expect(refreshed).not.toHaveBeenCalled();
+    // Joined late: what was sent meanwhile is refetched (r4-web #24).
+    expect(resync).toHaveBeenCalledTimes(1);
     // Joined: a reconnect is a re-join of the same room.
     s.serverConnect();
     s.ackJoin(true);
-    expect(resync).toHaveBeenCalledTimes(1);
+    expect(resync).toHaveBeenCalledTimes(2);
     off();
   });
 
-  it('backs off 0.5 s, 1 s and 2 s, then reloads the session once', () => {
+  it('backs off 0.5 s, 1 s and 2 s, then reloads the session once and keeps retrying (r4-web #24)', () => {
     vi.useFakeTimers();
     const { s, refreshed } = connected();
     for (const wait of JOIN_RETRY_MS) {
@@ -381,7 +383,7 @@ describe('a refused workspace join is retried before reloading the session', () 
     s.ackJoin(false);
     expect(refreshed).toHaveBeenCalledTimes(1);
     vi.runAllTimers();
-    expect(s.joins()).toHaveLength(JOIN_RETRY_MS.length + 1);
+    expect(s.joins()).toHaveLength(JOIN_RETRY_MS.length + 2);
   });
 
   it('a retry follows a workspace switch, and a disconnect cancels it', () => {

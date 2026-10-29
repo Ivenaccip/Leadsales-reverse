@@ -5,6 +5,7 @@ import type { Contact, Message, Paged } from '../../lib/types';
 // ---------- WhatsApp text formatting (safe: builds React nodes, never raw HTML) ----------
 
 const TOKEN = /(```[\s\S]+?```|\*[^*\n]+\*|_[^_\n]+_|~[^~\n]+~|https?:\/\/[^\s<]+)/g;
+const URL_TRAILING = '),.;:!?';
 
 function formatInline(text: string, keyPrefix: string): ReactNode[] {
   const out: ReactNode[] = [];
@@ -28,8 +29,12 @@ function formatInline(text: string, keyPrefix: string): ReactNode[] {
     } else if (tok.startsWith('~')) {
       out.push(<s key={key}>{formatInline(tok.slice(1, -1), key)}</s>);
     } else {
-      // URL: trim trailing punctuation that is usually not part of the link
-      const url = tok.replace(/[),.;:!?]+$/, '');
+      // URL: trim trailing punctuation that is usually not part of the link. A loop, not
+      // /[),.;:!?]+$/: on a long punctuation run that does not end the token (a customer can send
+      // "https://a" + 65,000 dots + "x") that regex backtracks quadratically and freezes the tab.
+      let end = tok.length;
+      while (end > 0 && URL_TRAILING.includes(tok[end - 1])) end--;
+      const url = tok.slice(0, end);
       out.push(
         <a key={key} href={url} target="_blank" rel="noopener noreferrer" className="break-all text-sky-700 underline">
           {url}
@@ -195,7 +200,7 @@ export interface ConversationFilters {
  */
 export const LIVE_QUERY = { refetchOnMount: 'always', refetchOnWindowFocus: 'always' } as const;
 
-export type ConversationsData = InfiniteData<Paged<Contact>, number>;
+export type ConversationsData = InfiniteData<Paged<Contact>, string | null>;
 export type MessagesPage = { messages: Message[]; has_more: boolean };
 export type MessagesData = InfiniteData<MessagesPage, string | undefined>;
 
@@ -276,8 +281,25 @@ function upsertInto(data: ConversationsData, contact: Contact, filters: Conversa
   };
 }
 
-/** Applies a contact change to every cached conversation list (each list knows its own filters). */
-export function patchConversations(qc: QueryClient, contact: Contact, myId: string | undefined) {
+/**
+ * Conversations the server just took away from this user ('contact:revoked'), with when. The
+ * server sends that before answering the request that caused it (a restricted agent handing their
+ * chat to a colleague), so this tab's own late answer must not put the conversation back. A live
+ * event for it, which the server sends only to those who may see it, lists it again.
+ */
+const revokedIds = new WeakMap<QueryClient, Map<string, number>>();
+/** How long a revoke outweighs this tab's own answers: far longer than one can lag behind it. */
+const REVOKED_HOLD_MS = 60_000;
+
+/**
+ * Applies a contact change to every cached conversation list (each list knows its own filters).
+ * `live`: the change came from the server's realtime events, not from this tab's own requests.
+ */
+export function patchConversations(qc: QueryClient, contact: Contact, myId: string | undefined, live = false) {
+  const revoked = revokedIds.get(qc);
+  const at = revoked?.get(contact.id);
+  if (at !== undefined && (live || Date.now() - at > REVOKED_HOLD_MS)) revoked!.delete(contact.id);
+  else if (at !== undefined) return;
   for (const [key, data] of qc.getQueriesData<ConversationsData>({ queryKey: ['conversations'] })) {
     if (!data) continue;
     const filters = key[1] as ConversationFilters;
@@ -295,6 +317,9 @@ export function removeConversations(qc: QueryClient, ids: string[]) {
 
 /** The conversation is no longer visible to this user: drop it from every cache. */
 export function revokeContact(qc: QueryClient, id: string) {
+  let revoked = revokedIds.get(qc);
+  if (!revoked) revokedIds.set(qc, (revoked = new Map()));
+  revoked.set(id, Date.now());
   removeConversations(qc, [id]);
   qc.removeQueries({ queryKey: ['contact', id] });
   qc.removeQueries({ queryKey: ['messages', id] });
@@ -323,6 +348,12 @@ export function findCachedContact(qc: QueryClient, id: string): Contact | undefi
 export function isNewAttempt(cached: Pick<Message, 'status' | 'error' | 'created_at'>, incoming: Pick<Message, 'created_at'>): boolean {
   if (cached.status === 'failed' && cached.error?.auto_retry === true) return true;
   return Date.parse(incoming.created_at) > Date.parse(cached.created_at);
+}
+
+/** Keeps the first row of each id (pages fetched at different times can overlap). */
+export function uniqueById<T extends { id: string }>(rows: T[]): T[] {
+  const seen = new Set<string>();
+  return rows.filter((r) => !seen.has(r.id) && !!seen.add(r.id));
 }
 
 /** Inserts into a chronological page, after every message that is not newer. */
@@ -363,9 +394,26 @@ export function upsertMessage(qc: QueryClient, msg: Message, append = true) {
       pages[0] = { ...pages[0], messages: insertByTime(pages[0].messages, merged) };
     }
     if (merged || !append) return merged ? { ...data, pages } : data;
-    const [first, ...rest] = pages;
-    return { ...data, pages: [{ ...first, messages: [...first.messages, msg] }, ...rest] };
+    const placed = placeByTime(pages, msg);
+    return placed ? { ...data, pages: placed } : data;
   });
+}
+
+/**
+ * Puts a new message where the server lists it, by created_at: a webhook that Meta delivers late
+ * (or out of order) is stored before newer messages, so it does not always go at the bottom.
+ * Pages run newest first, each in chronological order. One older than everything loaded, while
+ * older pages remain, is left out (null): it arrives with those pages, and listing it now would
+ * show it twice.
+ */
+function placeByTime(pages: MessagesPage[], msg: Message): MessagesPage[] | null {
+  const t = Date.parse(msg.created_at);
+  let i = pages.findIndex((p) => p.messages.length > 0 && Date.parse(p.messages[0].created_at) <= t);
+  if (i < 0) {
+    if (pages[pages.length - 1].has_more) return null;
+    i = pages.length - 1;
+  }
+  return pages.map((p, j) => (j === i ? { ...p, messages: insertByTime(p.messages, msg) } : p));
 }
 
 /** Status tick ordering: never downgrade a status we already showed. */

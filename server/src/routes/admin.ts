@@ -5,8 +5,9 @@ import { hashPassword } from '../lib/auth.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { topup } from '../services/credits.js';
 import { newPasswordSchema } from './auth.js';
-import { disableUnverifiedCloudChannels, enableAfterPrepaid } from './channels.js';
-import { noContent, parse, requireSuperadmin, uuid } from './helpers.js';
+import type { ChannelRow } from '../types.js';
+import { disableUnverifiedCloudChannels, enableAfterPrepaid, resyncTemplates } from './channels.js';
+import { noContent, parse, requireSuperadmin, requireSuperadminSession, uuid, verifyCurrentPassword } from './helpers.js';
 
 const MARKETS = ['MX', 'CO', 'BR', 'AR', 'CL', 'PE', 'ES', 'NA', 'LATAM', 'OTHER'];
 
@@ -50,10 +51,23 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
       [id, body.billing_mode ?? null, body.is_active ?? null],
     );
     if (!rows[0]) throw badRequest('Espacio no encontrado');
-    if (body.billing_mode === 'prepaid') await disableUnverifiedCloudChannels(ctx, id);
+    const warnings: string[] = [];
+    if (body.billing_mode === 'prepaid') {
+      await disableUnverifiedCloudChannels(ctx, id);
+      // The numbers still on now price from their template categories: read them from Meta again.
+      const verified = await ctx.db.query<ChannelRow>(
+        `SELECT * FROM channels WHERE workspace_id = $1 AND provider = 'cloud_api' AND operator_verified AND status <> 'disabled'`,
+        [id],
+      );
+      warnings.push(...(await resyncTemplates(ctx, verified.rows)));
+    }
     if (body.billing_mode === 'meta_direct') await enableAfterPrepaid(ctx, id);
-    if (body.is_active === false) await ctx.realtime.evict(id);
-    return { workspace: rows[0] };
+    // Every member's tabs reload the workspace (suspended or back, billing mode), wherever they are.
+    const members = await ctx.db.query<{ user_id: string }>(`SELECT user_id FROM memberships WHERE workspace_id = $1`, [id]);
+    const memberIds = members.rows.map((m) => m.user_id);
+    if (body.is_active === false) await ctx.realtime.evict(id, undefined, memberIds);
+    else ctx.realtime.refreshUsers(memberIds, id);
+    return { workspace: rows[0], warnings };
   });
 
   app.post('/api/admin/workspaces/:id/credits', async (req) => {
@@ -115,14 +129,21 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
     return { users: rows };
   });
 
+  // Operator rights and other accounts' passwords need the operator's current password: a stolen
+  // operator session must not demote an operator (and then reset its password), nor promote an
+  // account of its own into a lasting backdoor.
   app.patch('/api/admin/users/:id', async (req) => {
-    const me = await requireSuperadmin(ctx, req);
+    const s = await requireSuperadminSession(ctx, req);
     const { id } = parse(z.object({ id: uuid }), req.params);
-    const body = parse(z.object({ is_superadmin: z.boolean() }), req.body);
-    if (id === me.id && !body.is_superadmin) throw badRequest('No puedes quitarte a ti mismo el rol de administrador');
+    const body = parse(z.object({ is_superadmin: z.boolean(), currentPassword: z.string().max(1024).optional() }), req.body);
+    if (id === s.user.id && !body.is_superadmin) throw badRequest('No puedes quitarte a ti mismo el rol de administrador');
+    await accountOf(ctx, id);
+    await verifyCurrentPassword(ctx, s, body.currentPassword);
     await ctx.db.query(`UPDATE users SET is_superadmin = $2 WHERE id = $1`, [id, body.is_superadmin]);
     // Open sockets joined foreign workspaces as superadmin: make them re-join with the new rights.
+    // A promotion reaches every tab too (the Administración menu, foreign workspaces).
     if (!body.is_superadmin) await ctx.realtime.evictUser(id);
+    else ctx.realtime.refreshUsers([id]);
     return { ok: true };
   });
 
@@ -130,12 +151,13 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
   // admin too) can create the account for that email; the real person asks the operator, who
   // checks the account's workspaces and sets a temporary password or deletes it.
   app.post('/api/admin/users/:id/password', async (req) => {
-    const me = await requireSuperadmin(ctx, req);
+    const s = await requireSuperadminSession(ctx, req);
     const { id } = parse(z.object({ id: uuid }), req.params);
-    const body = parse(z.object({ password: newPasswordSchema }), req.body);
+    const body = parse(z.object({ password: newPasswordSchema, currentPassword: z.string().max(1024).optional() }), req.body);
     const target = await accountOf(ctx, id);
-    // Without the current password, a stolen operator session must not take over operators' accounts.
-    if (id === me.id || target.is_superadmin) throw badRequest('La contraseña de un administrador de la instancia solo la cambia su dueño, desde su perfil');
+    // Operators change their own password from their profile, with the current one.
+    if (id === s.user.id || target.is_superadmin) throw badRequest('La contraseña de un administrador de la instancia solo la cambia su dueño, desde su perfil');
+    await verifyCurrentPassword(ctx, s, body.currentPassword);
     const hash = await hashPassword(body.password);
     await ctx.db.tx(async (q) => {
       await q.query(`UPDATE users SET password_hash = $2, password_version = password_version + 1 WHERE id = $1`, [id, hash]);

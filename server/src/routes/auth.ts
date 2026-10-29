@@ -4,9 +4,9 @@ import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import type { Queryable } from '../db/index.js';
 import { dummyPasswordHash, hashPassword, knownDevice, rememberDevice, signToken, verifyPassword } from '../lib/auth.js';
-import { badRequest, conflict, forbidden, unauthorized } from '../lib/errors.js';
+import { conflict, forbidden, unauthorized } from '../lib/errors.js';
 import { topup } from '../services/credits.js';
-import { COOKIE, DEVICE_COOKIE, parse, RateLimiter, requireSession, requireUser, tooManyAttempts } from './helpers.js';
+import { COOKIE, DEVICE_COOKIE, parse, RateLimiter, requireSession, requireUser, tooManyAttempts, verifyCurrentPassword } from './helpers.js';
 
 export const DEFAULT_STAGES = [
   { name: 'Nuevo', color: '#3b82f6', kind: 'open' },
@@ -196,9 +196,6 @@ export async function authRoutes(app: FastifyInstance, ctx: AppContext) {
   // - per device cookie: a stolen one is no unlimited pass around the shared buckets
   const deviceLimiter = new RateLimiter(10, WINDOW);
   const registerLimiter = new RateLimiter(10, WINDOW);
-  // - current-password checks, per session: a stolen session is no unlimited password oracle, and
-  // its guesses cannot use up the owner's budget (changing the password is how she ends it)
-  const passwordLimiter = new RateLimiter(10, WINDOW);
   void dummyPasswordHash();
 
   app.get('/api/instance', async () => {
@@ -308,27 +305,15 @@ export async function authRoutes(app: FastifyInstance, ctx: AppContext) {
       req.body,
     );
     if (body.password) {
-      if (passwordLimiter.blocked(sid)) throw tooManyAttempts();
-      const { rows } = await ctx.db.query<{ password_hash: string; password_version: number }>(
-        `SELECT password_hash, password_version FROM users WHERE id = $1`,
-        [user.id],
-      );
-      passwordLimiter.hit(sid);
-      let ok = false;
-      try {
-        ok = !!body.currentPassword && (await verifyPassword(body.currentPassword, rows[0].password_hash));
-      } catch (err) {
-        passwordLimiter.undo(sid);
-        throw err;
-      }
-      if (!ok) throw badRequest('La contraseña actual no es correcta');
-      passwordLimiter.undo(sid);
+      // Per session (shared with the operator's step-up checks): changing the password is how the
+      // owner ends a stolen session, so its guesses must never use up her budget.
+      const verifiedVersion = await verifyCurrentPassword(ctx, { user, sid }, body.currentPassword);
       const hash = await hashPassword(body.password);
       const version = await ctx.db.tx(async (q) => {
         // Only over the version whose password was just verified: of two concurrent changes, one wins.
         const r = await q.query<{ password_version: number }>(
           `UPDATE users SET password_hash = $2, password_version = password_version + 1 WHERE id = $1 AND password_version = $3 RETURNING password_version`,
-          [user.id, hash, rows[0].password_version],
+          [user.id, hash, verifiedVersion],
         );
         if (!r.rows[0]) return null;
         // A new password ends every other session (a stolen cookie stops working); this one stays.

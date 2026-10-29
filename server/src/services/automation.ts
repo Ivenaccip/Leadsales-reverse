@@ -204,10 +204,34 @@ export async function handleInboundAutomation(
 
 const RESET_WORDS = new Set(['0', 'menu', 'menú', 'inicio', 'volver']);
 
+const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/**
+ * The longest start of `text` within `max` UTF-16 units that ends between two characters: a cut
+ * inside an emoji would leave half of it (a lone surrogate), which jsonb refuses (the send could
+ * never be stored) and Meta would get as garbage.
+ */
+export function cutText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = 0;
+  for (const { index, segment } of graphemes.segment(text)) {
+    if (index + segment.length > max) break;
+    end = index + segment.length;
+  }
+  // A single character longer than the limit (a long emoji sequence): cut it between code points.
+  if (!end) {
+    for (const ch of text) {
+      if (end + ch.length > max) break;
+      end += ch.length;
+    }
+  }
+  return text.slice(0, end);
+}
+
 /** WhatsApp limits button (20) and list row (24) titles: cut at a word boundary with an ellipsis. */
 export function fitTitle(label: string, max: number): string {
   if (label.length <= max) return label;
-  const cut = label.slice(0, max - 1);
+  const cut = cutText(label, max - 1);
   const space = cut.lastIndexOf(' ');
   return `${(space > max / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
 }
@@ -326,7 +350,7 @@ async function sendMenu(
         text,
         interactive: {
           type: 'button',
-          body: { text: prompt.slice(0, 1024) },
+          body: { text: cutText(prompt, 1024) },
           action: { buttons: menu.options.map((o, i) => ({ type: 'reply', reply: { id: menuOptionId([...at.indices, i], [...at.labels, o.label]), title: titles[i] } })) },
         },
       },
@@ -336,7 +360,7 @@ async function sendMenu(
     const rows = menu.options.map((o, i) => ({
       id: menuOptionId([...at.indices, i], [...at.labels, o.label]),
       title: titles[i],
-      ...(o.label.length > 24 ? { description: o.label.slice(0, 72) } : {}),
+      ...(o.label.length > 24 ? { description: cutText(o.label, 72) } : {}),
     }));
     if (nested) rows.push({ id: MENU_HOME_ID, title: 'Menú principal' });
     return sendAutomated(ctx, {
@@ -346,7 +370,8 @@ async function sendMenu(
         text,
         interactive: {
           type: 'list',
-          body: { text: prompt.slice(0, 1024) },
+          // Meta allows 1024 characters in a reply-button body but 4096 in a list body.
+          body: { text: cutText(prompt, 4096) },
           action: { button: 'Ver opciones', sections: [{ title: 'Opciones', rows }] },
         },
       },

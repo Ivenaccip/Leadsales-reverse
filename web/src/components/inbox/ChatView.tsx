@@ -7,7 +7,7 @@ import { stageMap, useFunnels, useMembers } from '../../lib/queries';
 import type { Contact, Message } from '../../lib/types';
 import { Avatar, Button, IconButton, Spinner } from '../ui';
 import { Composer } from './Composer';
-import { LIVE_QUERY, messagesPath, olderMessagesCursor, patchConversations, upsertMessage, whenVisible, type MessagesPage } from './helpers';
+import { LIVE_QUERY, messagesPath, olderMessagesCursor, patchConversations, uniqueById, upsertMessage, whenVisible, type MessagesPage } from './helpers';
 import { MessageBubble } from './MessageBubble';
 import { ScheduleModal, SendTemplateModal } from './TemplateModals';
 
@@ -53,8 +53,9 @@ export function ChatView({
     ...LIVE_QUERY,
   });
 
-  // Pages arrive newest-first; each page is in chronological order.
-  const list = useMemo(() => [...(messages.data?.pages ?? [])].reverse().flatMap((p) => p.messages), [messages.data]);
+  // Pages arrive newest-first; each page is in chronological order. Each id is listed once: a late
+  // message stored in the same millisecond as the oldest one loaded may come again with older pages.
+  const list = useMemo(() => uniqueById([...(messages.data?.pages ?? [])].reverse().flatMap((p) => p.messages)), [messages.data]);
 
   // Mark as read when the open chat has unread messages (also when new ones arrive while it is open),
   // once the agent can see it: messages that arrived in a background tab are read on coming back.
