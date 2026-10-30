@@ -294,6 +294,36 @@ WantedBy=multi-user.target
 - Configura **una sola instancia** (sin réplicas ni autoescalado horizontal): ver la nota
   "Una sola réplica" al inicio.
 
+### Fly.io
+
+El repositorio trae `fly.toml` (una máquina siempre encendida, volumen en `/data` con la
+base embebida, archivos y llaves) y `deploy/fly/Dockerfile` (la misma imagen, que le pasa el
+volumen de Fly al usuario `node` al arrancar).
+
+1. Instala `flyctl` (`brew install flyctl`, o `curl -L https://fly.io/install.sh | sh`; en
+   Windows `iwr https://fly.io/install.ps1 -useb | iex`) y entra con `fly auth signup` o
+   `fly auth login`. Fly pide una tarjeta.
+2. Clona el repositorio y entra a la carpeta.
+3. Elige un nombre único (por ejemplo `leadlibre-micomunidad`) y cámbialo en `fly.toml` en
+   `app` y en `PUBLIC_URL` (`https://leadlibre-micomunidad.fly.dev`).
+4. Crea la app y su volumen (en la misma región que `primary_region`):
+   ```bash
+   fly apps create leadlibre-micomunidad
+   fly volumes create leadlibre_data --region dfw --size 3 -a leadlibre-micomunidad
+   ```
+   Responde que sí al aviso de que un solo volumen no tiene réplica: LeadLibre corre en una
+   sola máquina. Fly guarda instantáneas diarias del volumen (`fly volumes snapshots list`).
+5. Opcional: `fly secrets set META_APP_SECRET=... ANTHROPIC_API_KEY=... -a leadlibre-micomunidad`.
+6. Despliega: `fly deploy`.
+7. Abre `https://leadlibre-micomunidad.fly.dev` y crea **en seguida** la primera cuenta: será
+   la administradora de la instancia.
+8. En tu app de Meta, el webhook es `https://leadlibre-micomunidad.fly.dev/webhooks/whatsapp`
+   (sigue `03-conectar-whatsapp-meta.md`).
+
+Para actualizar: `git pull && fly deploy`. Para ver los logs: `fly logs`. Para tu propio
+dominio: `fly certs add crm.tudominio.com` y crea el registro DNS que te indique; luego cambia
+`PUBLIC_URL` en `fly.toml`, vuelve a desplegar y actualiza la URL del webhook en Meta.
+
 ## Probar en local con Meta real
 
 Meta necesita una URL pública. Usa un túnel (por ejemplo `cloudflared tunnel --url
