@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Bot, ChevronDown, ChevronRight, Clock, Hand, MessageSquareText, Plus, Power, Sparkles, Trash2 } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
@@ -23,18 +23,75 @@ const MODES = [
   { id: 'ai', icon: Sparkles, title: 'Agente con IA', text: 'Claude responde en lenguaje natural con la información de tu negocio y pasa a un humano.' },
 ] as const;
 
-function renumber(options: BotMenuOption[]): BotMenuOption[] {
-  return options.map((o, i) => ({ ...o, key: String(i + 1) }));
+/**
+ * An option's key never changes once the menu has it: typed answers ("2") and the saved position of
+ * customers inside a submenu are read by key, against the menu as it is now. Renumbering after a
+ * removal would make a customer who answers the menu they were sent get another option's reply,
+ * stage, tags and handoff. So a removal leaves a gap, and a new option takes a key above every key
+ * the menu has (or had while it was being edited, `high`).
+ */
+export function highestOptionKey(options: Pick<BotMenuOption, 'key'>[]): number {
+  return options.reduce((max, o) => (/^\d+$/.test(o.key) ? Math.max(max, Number(o.key)) : max), 0);
+}
+
+export function removeOption(options: BotMenuOption[], index: number): BotMenuOption[] {
+  return options.filter((_, j) => j !== index);
+}
+
+export function addOption(options: BotMenuOption[], high = 0): BotMenuOption[] {
+  const key = String(Math.max(high, highestOptionKey(options)) + 1);
+  return [...options, { key, label: `Opción ${key}`, handoff: true }];
+}
+
+/**
+ * Highest key each menu of the tree has had, by the path of option keys that leads to it. Kept by
+ * the page, not by each menu's editor: a submenu's editor unmounts when its option is collapsed,
+ * the root's when another mode is picked, and a removed submenu can be added again in its place.
+ */
+export type KeyMarks = Map<string, number>;
+
+export const ROOT_MENU = '';
+export const submenuPath = (path: string, key: string) => `${path}\u0000${key}`;
+
+/** Records every key the tree has now (call it before applying an edit that may remove some). */
+export function markKeys(marks: KeyMarks, menu: BotMenu | null | undefined, path = ROOT_MENU): void {
+  if (!menu?.options) return;
+  marks.set(path, Math.max(marks.get(path) ?? 0, (menu.next_key ?? 1) - 1, highestOptionKey(menu.options)));
+  for (const o of menu.options) markKeys(marks, o.submenu, submenuPath(path, o.key));
+}
+
+/** The highest key a menu has had: new options go above it. */
+export function menuHigh(marks: KeyMarks, menu: Pick<BotMenu, 'next_key'> | null | undefined, path: string): number {
+  return Math.max(marks.get(path) ?? 0, (menu?.next_key ?? 1) - 1);
+}
+
+/** A submenu added where one was removed goes on from its keys (a customer may still be inside it). */
+export function newSubmenu(marks: KeyMarks, path: string): BotMenu {
+  return { prompt: '¿Qué opción prefieres?', options: addOption([], menuHigh(marks, null, path)) };
+}
+
+/** The menu tree to save, each menu with the key its next option takes (for an editor opened after a reload). */
+export function withNextKeys(menu: BotMenu, marks: KeyMarks, path = ROOT_MENU): BotMenu {
+  return {
+    ...menu,
+    next_key: Math.max(menuHigh(marks, menu, path), highestOptionKey(menu.options)) + 1,
+    options: menu.options.map((o) => (o.submenu ? { ...o, submenu: withNextKeys(o.submenu, marks, submenuPath(path, o.key)) } : o)),
+  };
 }
 
 function OptionEditor({
   option,
   depth,
+  path,
+  marks,
   onChange,
   onRemove,
 }: {
   option: BotMenuOption;
   depth: number;
+  /** Path of this option's submenu. */
+  path: string;
+  marks: KeyMarks;
   onChange: (o: BotMenuOption) => void;
   onRemove: () => void;
 }) {
@@ -79,7 +136,7 @@ function OptionEditor({
           )}
           {hasSub ? (
             <div className="rounded-lg bg-slate-50 p-3">
-              <MenuEditor menu={option.submenu!} depth={depth + 1} onChange={(m) => onChange({ ...option, submenu: m })} />
+              <MenuEditor menu={option.submenu!} depth={depth + 1} path={path} marks={marks} onChange={(m) => onChange({ ...option, submenu: m })} />
               <Button type="button" size="sm" variant="ghost" className="mt-2" onClick={() => onChange({ ...option, submenu: null })}>
                 Quitar submenú
               </Button>
@@ -90,7 +147,7 @@ function OptionEditor({
                 type="button"
                 size="sm"
                 variant="outline"
-                onClick={() => onChange({ ...option, handoff: false, submenu: { prompt: '¿Qué opción prefieres?', options: [{ key: '1', label: 'Opción 1', handoff: true }] } })}
+                onClick={() => onChange({ ...option, handoff: false, submenu: newSubmenu(marks, path) })}
                 icon={<Plus className="h-4 w-4" />}
               >
                 Agregar submenú (nivel {depth + 1})
@@ -103,7 +160,20 @@ function OptionEditor({
   );
 }
 
-function MenuEditor({ menu, depth, onChange }: { menu: BotMenu; depth: number; onChange: (m: BotMenu) => void }) {
+export function MenuEditor({
+  menu,
+  depth,
+  path,
+  marks,
+  onChange,
+}: {
+  menu: BotMenu;
+  depth: number;
+  path: string;
+  /** Keys removed while editing are not handed out again either (a customer may still hold them). */
+  marks: KeyMarks;
+  onChange: (m: BotMenu) => void;
+}) {
   return (
     <div className="space-y-3">
       <Field label={depth === 1 ? 'Mensaje del menú principal' : `Mensaje del submenú (nivel ${depth})`}>
@@ -111,11 +181,13 @@ function MenuEditor({ menu, depth, onChange }: { menu: BotMenu; depth: number; o
       </Field>
       {menu.options.map((o, i) => (
         <OptionEditor
-          key={i}
+          key={o.key}
           option={o}
           depth={depth}
+          path={submenuPath(path, o.key)}
+          marks={marks}
           onChange={(next) => onChange({ ...menu, options: menu.options.map((x, j) => (j === i ? next : x)) })}
-          onRemove={() => onChange({ ...menu, options: renumber(menu.options.filter((_, j) => j !== i)) })}
+          onRemove={() => onChange({ ...menu, options: removeOption(menu.options, i) })}
         />
       ))}
       {menu.options.length < 10 && (
@@ -123,7 +195,7 @@ function MenuEditor({ menu, depth, onChange }: { menu: BotMenu; depth: number; o
           type="button"
           size="sm"
           variant="secondary"
-          onClick={() => onChange({ ...menu, options: renumber([...menu.options, { key: '', label: `Opción ${menu.options.length + 1}`, handoff: true }]) })}
+          onClick={() => onChange({ ...menu, options: addOption(menu.options, menuHigh(marks, menu, path)) })}
           icon={<Plus className="h-4 w-4" />}
         >
           Agregar opción
@@ -173,6 +245,7 @@ export default function AutomationPage() {
   const [s, setS] = useState<WorkspaceSettings | null>(null);
   const [apiKey, setApiKey] = useState('');
   const [removeKey, setRemoveKey] = useState(false);
+  const marks = useRef<KeyMarks>(new Map());
 
   useEffect(() => {
     if (ws.data && !s) setS(ws.data.workspace.settings);
@@ -185,7 +258,7 @@ export default function AutomationPage() {
         automation_mode: s!.automation_mode,
         welcome: s!.welcome,
         away: s!.away,
-        bot: s!.bot,
+        bot: { ...s!.bot, menu: withNextKeys(s!.bot.menu, marks.current) },
         ai: { ...ai, ...(apiKey ? { api_key: apiKey } : removeKey ? { api_key: null } : {}) },
       });
     },
@@ -283,7 +356,17 @@ export default function AutomationPage() {
         {s.automation_mode === 'menu' && (
           <div className="grid gap-6 xl:grid-cols-[1fr_340px]">
             <Card title={<span className="flex items-center gap-2"><Bot className="h-4 w-4" /> Menú del bot</span>} description="Como Leadbot: cada opción puede responder, mover de etapa, etiquetar, asignar o pasar a un asesor.">
-              <MenuEditor menu={s.bot.menu} depth={1} onChange={(menu) => set('bot', { ...s.bot, menu })} />
+              <MenuEditor
+                menu={s.bot.menu}
+                depth={1}
+                path={ROOT_MENU}
+                marks={marks.current}
+                onChange={(menu) => {
+                  // Every edit goes through here: what the tree had before it is remembered.
+                  markKeys(marks.current, s.bot.menu);
+                  set('bot', { ...s.bot, menu });
+                }}
+              />
             </Card>
             <div className="space-y-6">
               <Card title="Vista previa">

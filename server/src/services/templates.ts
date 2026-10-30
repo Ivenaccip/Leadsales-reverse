@@ -274,12 +274,15 @@ export async function syncTemplates(ctx: AppContext, channel: ChannelRow): Promi
     for (const t of remote) {
       await upsertTemplate(q, channel, { ...t, meta_id: t.id });
     }
-    // What was just read is Meta's current state: the next status or category event applies,
-    // whatever time earlier events left (a business that signed its own webhooks could date them
-    // ahead and pin a category Meta changes later).
+    // The times of the events applied so far stay: a late or redelivered event older than them is
+    // still stale after a sync. Only a time ahead of this read goes back to just before it (a business
+    // that signed its own webhooks could date one as far ahead as entryTime allows, pinning the
+    // template against the genuine events after it; Meta dates events in whole seconds).
     await q.query(
-      `UPDATE templates SET status_event_at = NULL, category_event_at = NULL
-       WHERE channel_id = $1 AND (status_event_at IS NOT NULL OR category_event_at IS NOT NULL)`,
+      `WITH r AS (SELECT date_trunc('second', now()) - interval '1 second' AS at)
+       UPDATE templates SET status_event_at = CASE WHEN status_event_at > r.at THEN r.at ELSE status_event_at END,
+         category_event_at = CASE WHEN category_event_at > r.at THEN r.at ELSE category_event_at END
+       FROM r WHERE channel_id = $1 AND (status_event_at > r.at OR category_event_at > r.at)`,
       [channel.id],
     );
     if (channel.provider === 'cloud_api') {

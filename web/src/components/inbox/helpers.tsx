@@ -328,6 +328,59 @@ export function revokeContact(qc: QueryClient, id: string) {
   void qc.invalidateQueries({ queryKey: ['board'] });
 }
 
+/** How long an outbound message waits for the contact:update that places its conversation. */
+export const OUTBOUND_PLACE_MS = 2000;
+
+/**
+ * An outbound message of a conversation this tab has nowhere in its cache (sent from another tab,
+ * the API, a broadcast) can only move the lists through the contact:update the server sends after
+ * it. Should that not arrive in time, the lists are refetched (once for a whole burst) instead of
+ * leaving the conversation out of them.
+ * The two events can come in either order: a restricted agent's socket gets the contact:update
+ * first (the message:new waits for an assignee lookup), so a conversation placed shortly before
+ * its message:new counts as placed too.
+ */
+export function createOutboundWatch(onMissed: () => void, ms = OUTBOUND_PLACE_MS) {
+  const pending = new Set<string>();
+  // contact id -> when its last contact:update came in; insertion order is arrival order
+  const placedAt = new Map<string, number>();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  function forgetOld(now: number) {
+    for (const [id, at] of placedAt) {
+      if (now - at < ms) break;
+      placedAt.delete(id);
+    }
+  }
+  return {
+    sent(contactId: string) {
+      const now = Date.now();
+      forgetOld(now);
+      if (placedAt.has(contactId)) return;
+      pending.add(contactId);
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        if (!pending.size) return;
+        pending.clear();
+        onMissed();
+      }, ms);
+    },
+    placed(contactId: string) {
+      pending.delete(contactId);
+      const now = Date.now();
+      placedAt.delete(contactId);
+      placedAt.set(contactId, now);
+      forgetOld(now);
+    },
+    stop() {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      pending.clear();
+      placedAt.clear();
+    },
+  };
+}
+
 /** Finds a contact in any cached list (used to patch previews on new messages). */
 export function findCachedContact(qc: QueryClient, id: string): Contact | undefined {
   for (const [, data] of qc.getQueriesData<ConversationsData>({ queryKey: ['conversations'] })) {

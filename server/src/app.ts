@@ -4,6 +4,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import cookie from '@fastify/cookie';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
+import jwt from 'jsonwebtoken';
 import { Server as IOServer } from 'socket.io';
 import type { Config } from './config.js';
 import type { AppContext } from './context.js';
@@ -21,12 +22,17 @@ import { broadcastRoutes } from './routes/broadcasts.js';
 import { channelRoutes, metaWebhookRoutes } from './routes/channels.js';
 import { contactRoutes } from './routes/contacts.js';
 import { crmRoutes } from './routes/crm.js';
-import { COOKIE } from './routes/helpers.js';
+import { COOKIE, SESSION_DAYS, SESSION_FRESH } from './routes/helpers.js';
 import { integrationRoutes } from './routes/integrations.js';
 import { invitationRoutes } from './routes/invitations.js';
 import { miscRoutes } from './routes/misc.js';
 import { templateRoutes } from './routes/templates.js';
 import { workspaceRoutes } from './routes/workspace.js';
+
+/** Node's timers hold 32-bit delays: a longer one fires at once. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+/** How often open sockets are checked against their sessions (see Realtime.sweepSessions). */
+const SESSION_SWEEP_MS = 60_000;
 
 export interface BuiltApp {
   app: FastifyInstance;
@@ -126,27 +132,40 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
   // 'unavailable' is a passing failure (e.g. the database is restarting) that the client retries.
   io.use(async (socket, next) => {
     const token = readCookie(socket.handshake.headers.cookie, COOKIE);
-    const payload = token ? verifyToken(config.jwtSecret, token) : null;
+    const payload = token && verifyToken(config.jwtSecret, token);
     if (!payload) return next(new Error('unauthorized'));
-    let live: boolean;
+    let rowExpiresAt: number | undefined;
     try {
-      const { rows } = await db.query(
-        `SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id AND u.password_version = s.password_version
-         WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL`,
+      const { rows } = await db.query<{ expires_ms: number }>(
+        `SELECT extract(epoch FROM s.created_at + interval '${SESSION_DAYS} days')::float8 * 1000 AS expires_ms
+         FROM sessions s JOIN users u ON u.id = s.user_id AND u.password_version = s.password_version
+         WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL AND ${SESSION_FRESH}`,
         [payload.sid, payload.uid],
       );
-      live = !!rows[0];
+      rowExpiresAt = rows[0]?.expires_ms;
     } catch {
       return next(new Error('unavailable'));
     }
-    if (!live) return next(new Error('unauthorized'));
+    if (rowExpiresAt === undefined) return next(new Error('unauthorized'));
+    // A connection is no license to outlive the session: it ends when the token or the row does.
+    const exp = (jwt.decode(token) as { exp?: unknown } | null)?.exp;
     socket.data.userId = payload.uid;
     socket.data.sid = payload.sid;
+    socket.data.expiresAt = Math.min(rowExpiresAt, typeof exp === 'number' ? exp * 1000 : Infinity);
     next();
   });
   io.on('connection', (socket) => {
     // Lets logout/password changes reach this connection (Realtime.endSessions / evictUser).
     socket.join([`user:${socket.data.userId}`, `sid:${socket.data.sid}`]);
+    let expiry: ReturnType<typeof setTimeout> | undefined;
+    const armExpiry = () => {
+      const left = socket.data.expiresAt - Date.now();
+      if (left <= 0) return realtime.endSocket(socket);
+      // Longer delays overflow Node's 32-bit timers (they fire at once): wait in steps.
+      expiry = setTimeout(armExpiry, Math.min(left, MAX_TIMER_MS));
+    };
+    socket.on('disconnect', () => clearTimeout(expiry));
+    armExpiry();
     socket.on('join', async (workspaceId: string, rawAck?: unknown) => {
       // Clients choose the arguments: never call something that is not a function.
       const ack = typeof rawAck === 'function' ? (rawAck as (r: { ok: boolean }) => void) : undefined;
@@ -156,20 +175,24 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
         // concerns this join evicted while we were reading, what we read may predate it, so read again.
         const { userId, sid } = socket.data;
         const evictions = realtime.watchEvictions([`ws:${workspaceId}`, `ws:${workspaceId}:u:${userId}`, `user:${userId}`, `sid:${sid}`]);
-        let r: { role: string | null; visibility: string | null; is_superadmin: boolean; ws_active: boolean } | undefined;
+        type Rights = { role: string | null; visibility: string | null; is_superadmin: boolean; ws_exists: boolean; ws_active: boolean | null };
+        let r: Rights | undefined;
+        let settled = false;
         try {
           for (let attempt = 0; ; attempt++) {
             const epoch = evictions.count();
-            const { rows } = await db.query<{ role: string | null; visibility: string | null; is_superadmin: boolean; ws_active: boolean }>(
-              `SELECT m.role, w.settings->>'agent_visibility' AS visibility, u.is_superadmin, w.is_active AS ws_active
+            const { rows } = await db.query<Rights>(
+              `SELECT m.role, w.settings->>'agent_visibility' AS visibility, u.is_superadmin, w.id IS NOT NULL AS ws_exists, w.is_active AS ws_active
                FROM users u JOIN sessions s ON s.id = $3 AND s.user_id = u.id AND s.revoked_at IS NULL AND s.password_version = u.password_version
-               JOIN workspaces w ON w.id = $1
+                 AND ${SESSION_FRESH}
+               LEFT JOIN workspaces w ON w.id = $1
                LEFT JOIN memberships m ON m.workspace_id = w.id AND m.user_id = u.id AND m.is_active
                WHERE u.id = $2`,
               [workspaceId, userId, sid],
             );
             if (evictions.count() === epoch) {
               r = rows[0];
+              settled = true;
               break;
             }
             if (attempt >= 4) break; // rights keep changing: refuse, the client may retry
@@ -179,7 +202,12 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
         }
         // Nothing awaited since the check above: an eviction from now on finds this socket in its rooms.
         if (!socket.connected) return;
-        if (!r || (!r.is_superadmin && (!r.role || !r.ws_active))) {
+        if (settled && !r && !socket.data.renewed) {
+          // The session is over (expired, revoked, deleted) although nothing ended this socket.
+          ack?.({ ok: false });
+          return realtime.endSocket(socket);
+        }
+        if (!r || !r.ws_exists || (!r.is_superadmin && (!r.role || !r.ws_active))) {
           // A refused switch must not leave the socket listening to the previous workspace either.
           for (const room of socket.rooms) if (room.startsWith('ws:')) socket.leave(room);
           return ack?.({ ok: false });
@@ -194,11 +222,24 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
         }
         ack?.({ ok: true });
       } catch {
+        // As a refusal: a failed switch must not leave the socket listening to the previous workspace.
+        for (const room of socket.rooms) if (room.startsWith('ws:')) socket.leave(room);
         ack?.({ ok: false });
       }
     });
   });
   realtime.io = io;
+  realtime.liveSessions = async (sids) => {
+    const { rows } = await db.query<{ id: string }>(
+      `SELECT s.id FROM sessions s JOIN users u ON u.id = s.user_id AND u.password_version = s.password_version
+       WHERE s.id = ANY($1::uuid[]) AND s.revoked_at IS NULL AND ${SESSION_FRESH}`,
+      [sids],
+    );
+    return new Set(rows.map((r) => r.id));
+  };
+  // A database hiccup skips one round: the next one checks again.
+  const sweep = setInterval(() => void realtime.sweepSessions().catch(() => {}), SESSION_SWEEP_MS);
+  sweep.unref();
   realtime.resolveAssignee = async (contactId) => {
     const { rows } = await db.query<{ assigned_user_id: string | null }>(`SELECT assigned_user_id FROM contacts WHERE id = $1`, [contactId]);
     // A contact deleted meanwhile is unknown, not unassigned: restricted agents get nothing about it.
@@ -211,6 +252,7 @@ export async function buildApp(config: Config, opts: { db?: Db; fetch?: typeof f
     worker,
     async close() {
       await worker.stop();
+      clearInterval(sweep);
       io.close();
       await app.close();
       await db.close();

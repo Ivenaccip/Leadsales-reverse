@@ -7,9 +7,9 @@ import { getChannel } from '../whatsapp/provider.js';
 import { isMetaThrottle, type TemplateParams } from '../whatsapp/types.js';
 import { roundMoney, templatePriceCategory } from './credits.js';
 import { dispatchWebhook } from './events.js';
-import { abandonAutoRetry, isNetworkFailure, sendMessage } from './messages.js';
+import { abandonAutoRetry, checkMediaHeader, isNetworkFailure, isNumberUnreachable, sendMessage } from './messages.js';
 import { dayStart, nextDay, workspaceTimezone } from './reports.js';
-import { checkTemplateParams, findTemplate } from './templates.js';
+import { checkTemplateParams, findTemplate, templateSchema } from './templates.js';
 
 export interface Audience {
   funnel_id?: string | null;
@@ -101,10 +101,14 @@ export function renderTemplateParams(
 // Meta throughput limits (isMetaThrottle) are retried later instead of failing the recipient.
 export { isMetaThrottle };
 // Account, number or template problems: every remaining recipient would fail the same way.
-const META_ACCOUNT_CODES = new Set([0, 3, 10, 190, 368, 131005, 131031, 131042, 131045, 131048, 131057, 132000, 132001, 132012, 132015, 132016, 133010]);
+// 131037: the number's display name still awaits Meta's approval.
+const META_ACCOUNT_CODES = new Set([
+  0, 3, 10, 190, 368, 131005, 131031, 131037, 131042, 131045, 131048, 131057, 132000, 132001, 132012, 132015, 132016, 133010,
+]);
 
-export function isMetaAccountError(code: number | null | undefined): boolean {
-  return code != null && (META_ACCOUNT_CODES.has(code) || (code >= 200 && code <= 299));
+/** subcode: Graph's error_subcode, which tells the sending number being unreachable (100/33) from a bad parameter. */
+export function isMetaAccountError(code: number | null | undefined, subcode?: number | null): boolean {
+  return code != null && (META_ACCOUNT_CODES.has(code) || (code >= 200 && code <= 299) || isNumberUnreachable(code, subcode));
 }
 
 type PlaceholderContact = Parameters<typeof renderPlaceholders>[1];
@@ -134,7 +138,14 @@ const SAMPLE_CONTACT: PlaceholderContact = { name: 'Cliente', phone: '0', email:
  * instead of failing every recipient at send time. Throws checkTemplateParams' Spanish errors.
  */
 export function checkBroadcastParams(components: any[], params: BroadcastParams | null | undefined): void {
+  // Every recipient's message stores the params: also checked at launch and resume, for drafts saved before the limit.
+  checkMediaHeader(params?.header);
   checkTemplateParams(components, resolveParams(params ?? {}, SAMPLE_CONTACT));
+  const header = params?.header;
+  if (header && header.type !== 'text' && components.length && templateSchema(components).header?.type !== header.type) {
+    // Meta refuses a header the template does not have; stored once per recipient, it would only take space.
+    throw badRequest('El encabezado de la difusión no corresponde al de la plantilla. Quítalo o usa el tipo que pide la plantilla.', 'TEMPLATE_PARAMS_INVALID');
+  }
 }
 
 /** An audience date as a calendar day (YYYY-MM-DD); older drafts may hold a full timestamp. */
@@ -201,9 +212,13 @@ export async function estimateAudience(
     workspaceId,
     ...where.params,
   ]);
+  const ws = await ctx.db.query<{ billing_mode: string; credit_balance: number; default_country_code: string }>(
+    `SELECT billing_mode, credit_balance, default_country_code FROM workspaces WHERE id = $1`,
+    [workspaceId],
+  );
   const counts = new Map<string, number>();
   for (const r of rows) {
-    const m = marketFromPhone(deliveryNumber(r.phone, r.wa_id));
+    const m = marketFromPhone(deliveryNumber(r.phone, r.wa_id, ws.rows[0].default_country_code));
     counts.set(m, (counts.get(m) ?? 0) + 1);
   }
   const prices = await ctx.db.query<{ market: string; price: number }>(`SELECT market, price FROM rate_card WHERE category = $1`, [category]);
@@ -212,9 +227,6 @@ export async function estimateAudience(
     .map(([market, count]) => ({ market, count, unit_price: roundMoney(priceOf(market)), cost: roundMoney(priceOf(market) * count) }))
     .sort((a, b) => b.count - a.count);
   const cost = roundMoney(by_market.reduce((s, m) => s + m.cost, 0));
-  const ws = await ctx.db.query<{ billing_mode: string; credit_balance: number }>(`SELECT billing_mode, credit_balance FROM workspaces WHERE id = $1`, [
-    workspaceId,
-  ]);
   const { billing_mode, credit_balance } = ws.rows[0];
   return {
     recipients: rows.length,
@@ -226,6 +238,10 @@ export async function estimateAudience(
     sufficient: billing_mode !== 'prepaid' || Number(credit_balance) >= cost,
   };
 }
+
+/** What a launch checks and estimates: it starts the broadcast only if none of it changed meanwhile. */
+const launchSpec = (x: BroadcastRow) =>
+  JSON.stringify([x.status, x.template_name, x.template_language, x.channel_id, x.params, x.audience, x.scheduled_at ? new Date(x.scheduled_at).getTime() : null]);
 
 /** A broadcast whose number was deleted (channel_id set to NULL): it never falls back to another number. */
 export const CHANNEL_GONE = 'Se eliminó el número de WhatsApp de esta difusión. Edítala, elige otro número y vuelve a enviarla o reanúdala.';
@@ -261,8 +277,11 @@ export async function launchBroadcast(ctx: AppContext, workspaceId: string, id: 
     // second update re-checks its channel_id foreign key, which would deadlock with that delete.
     const live = await q.query(`SELECT 1 FROM channels WHERE id = $1 FOR KEY SHARE`, [channel.id]);
     if (!live.rows[0]) throw new AppError(400, 'NO_CHANNEL', 'El número de WhatsApp de la difusión se desconectó. Revisa Ajustes → Canales.');
-    const cur = await q.query<{ status: string }>(`SELECT status FROM broadcasts WHERE id = $1 AND workspace_id = $2 FOR UPDATE`, [id, workspaceId]);
-    if (cur.rows[0]?.status !== b.status) return false;
+    // Everything above was checked and estimated on the row as read before this lock: an edit saved
+    // meanwhile (another admin, another tab) would be launched half-checked, with the old audience,
+    // number or estimate written over it. Launch only the row that was checked.
+    const cur = await q.query<BroadcastRow>(`SELECT * FROM broadcasts WHERE id = $1 AND workspace_id = $2 FOR UPDATE`, [id, workspaceId]);
+    if (!cur.rows[0] || launchSpec(cur.rows[0]) !== launchSpec(b)) return false;
     if (b.status === 'draft' && est) {
       const where = audienceWhere(b.audience, tz);
       await q.query(
@@ -290,7 +309,7 @@ export async function launchBroadcast(ctx: AppContext, workspaceId: string, id: 
     );
     return true;
   });
-  if (!launched) throw badRequest('La difusión cambió de estado mientras la lanzabas. Recarga la página.', 'BROADCAST_CHANGED');
+  if (!launched) throw badRequest('La difusión cambió mientras la lanzabas (alguien la editó o cambió su estado). Recarga la página y revísala.', 'BROADCAST_CHANGED');
   if (!future) ctx.queue.notify(); // the job was queued inside the transaction: start it now
   const updated = await getBroadcast(ctx.db, workspaceId, id);
   ctx.realtime.emit(workspaceId, 'broadcast:update', updated);
@@ -321,6 +340,42 @@ export const withRetryNote = (reason: string) => `${reason.trim().replace(/([^.!
 /** What a run sends: when an edit while paused changes it, a run started before must not keep going. */
 const sendSpec = (x: Pick<BroadcastRow, 'template_name' | 'template_language' | 'channel_id' | 'params'>) =>
   JSON.stringify([x.template_name, x.template_language, x.channel_id, x.params]);
+
+/**
+ * Finishes the recipients a cancelled broadcast still has claimed. Cancelling skips only queued ones
+ * and leaves a live run's batch to its release(), but a run that died mid-batch (a restart, a crash)
+ * never hands its claim back, and no run sends a cancelled broadcast: they would stay "En cola" for
+ * good. Once a claim is as old as one a run may take over (see the claim in processBroadcast), it ends
+ * as its stored message did (that one may have gone out), else skipped. Fresh claims are looked at
+ * again when they expire. Returns how many were finished.
+ */
+export async function settleCancelled(ctx: AppContext, broadcastId: string, q: Queryable = ctx.db): Promise<number> {
+  const done = await q.query(
+    `UPDATE broadcast_recipients br
+       SET status = CASE WHEN m.id IS NULL THEN 'skipped' WHEN m.status = 'failed' THEN 'failed' ELSE 'sent' END,
+           message_id = m.id, claimed_at = NULL, processed_at = now()
+     FROM broadcast_recipients r
+     LEFT JOIN LATERAL (
+       SELECT id, status FROM messages
+       WHERE broadcast_id = r.broadcast_id AND contact_id = r.contact_id AND NOT (status = 'failed' AND wamid IS NULL)
+       ORDER BY created_at DESC LIMIT 1
+     ) m ON true
+     WHERE br.id = r.id AND br.broadcast_id = $1 AND br.status = 'sending' AND br.message_id IS NULL
+       AND br.claimed_at < now() - interval '10 minutes'
+       AND EXISTS (SELECT 1 FROM broadcasts WHERE id = $1 AND status = 'cancelled')`,
+    [broadcastId],
+  );
+  const left = await q.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM broadcast_recipients br
+     WHERE br.broadcast_id = $1 AND br.status = 'sending' AND br.message_id IS NULL AND br.claimed_at IS NOT NULL
+       AND EXISTS (SELECT 1 FROM broadcasts WHERE id = $1 AND status = 'cancelled')`,
+    [broadcastId],
+  );
+  if (left.rows[0].n > 0) {
+    await ctx.queue.enqueue('broadcast.process', { broadcastId }, { delayMs: 11 * 60 * 1000, dedupeKey: `broadcast-watchdog:${broadcastId}` }, q);
+  }
+  return done.rowCount;
+}
 
 async function pauseBroadcast(ctx: AppContext, b: BroadcastRow, reason: string) {
   await ctx.db.query(`UPDATE broadcasts SET status = 'paused', last_error = $2 WHERE id = $1 AND status = 'running'`, [b.id, reason]);
@@ -356,6 +411,10 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
     }
     b.status = 'running';
   }
+  if (b.status === 'cancelled') {
+    if (await settleCancelled(ctx, b.id)) ctx.realtime.emit(b.workspace_id, 'broadcast:update', await getBroadcast(ctx.db, b.workspace_id, b.id));
+    return;
+  }
   if (b.status !== 'running') return;
   if (!b.ws_active) return pauseBroadcast(ctx, b, 'El espacio de trabajo está suspendido');
   // Its number was deleted: stop until someone chooses another (sendMessage would use the default one).
@@ -372,21 +431,27 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
     [b.id, BATCH],
   );
   const pending = new Set(claimed.rows.map((r) => r.id));
+  // Hands claimed recipients back: 'skipped' if the broadcast was cancelled, else 'queued'. Cancelling
+  // skips only 'queued' rows, so the status is read under a share lock on the broadcast: a cancel that
+  // commits in between would otherwise leave these 'queued' in a cancelled broadcast, never sent nor
+  // finished. Cancel locks the same row first, so either it waits for this or this sees 'cancelled'.
+  const handBack = (sql: string, params: (status: string) => unknown[]) =>
+    ctx.db.tx(async (q) => {
+      const st = await q.query<{ status: string }>(`SELECT status FROM broadcasts WHERE id = $1 FOR SHARE`, [b.id]);
+      return q.query<{ status: string }>(sql, params(st.rows[0]?.status === 'cancelled' ? 'skipped' : 'queued'));
+    });
   const release = async () => {
     if (!pending.size) return;
-    const st = await ctx.db.query<{ status: string }>(`SELECT status FROM broadcasts WHERE id = $1`, [b.id]);
-    await ctx.db.query(
-      `UPDATE broadcast_recipients SET status = $2, claimed_at = NULL WHERE id = ANY($1::uuid[]) AND status = 'sending'`,
-      [[...pending], st.rows[0]?.status === 'cancelled' ? 'skipped' : 'queued'],
-    );
+    await handBack(`UPDATE broadcast_recipients SET status = $2, claimed_at = NULL WHERE id = ANY($1::uuid[]) AND status = 'sending'`, (status) => [
+      [...pending],
+      status,
+    ]);
   };
   const requeue = async (rid: string, contactId: string, error: string | null) => {
     pending.delete(rid);
-    const { rows } = await ctx.db.query<{ status: string }>(
-      `UPDATE broadcast_recipients SET claimed_at = NULL, message_id = NULL, error = $2,
-         status = CASE WHEN (SELECT status FROM broadcasts WHERE id = $3) = 'cancelled' THEN 'skipped' ELSE 'queued' END
-       WHERE id = $1 RETURNING status`,
-      [rid, error, b.id],
+    const { rows } = await handBack(
+      `UPDATE broadcast_recipients SET claimed_at = NULL, message_id = NULL, error = $2, status = $3 WHERE id = $1 RETURNING status`,
+      (status) => [rid, error, status],
     );
     // Cancelled while this send was in flight: its failed message will not be retried after all.
     if (rows[0]?.status === 'skipped') await abandonAutoRetry(ctx, { broadcastId: b.id, contactId });
@@ -468,7 +533,7 @@ export async function processBroadcast(ctx: AppContext, p: { broadcastId: string
         networkDown = true;
         break;
       }
-      if (msg.status === 'failed' && isMetaAccountError(code)) {
+      if (msg.status === 'failed' && isMetaAccountError(code, msg.error?.subcode)) {
         // The recipient stays claimed, so release() puts it back in the queue for the resume.
         await pauseBroadcast(ctx, b, `Meta rechazó el envío (código ${code}): ${msg.error?.message ?? 'error desconocido'} Corrige el problema y reanuda la difusión.`);
         await release();

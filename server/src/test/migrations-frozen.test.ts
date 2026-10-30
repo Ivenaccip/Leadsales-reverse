@@ -16,6 +16,7 @@ const SHIPPED: Record<string, string> = {
   '004_hardening': '628ed1af392c95ab32084befc288ac3322f8cfd9e244068743e1dc443dfa249d',
   '005_review_three': 'eddff075995034a5260f0846fefe5717f21824ccdce0d807585e8fbe40843fd9',
   '006_review_four': 'b0226a1d67a392f54ad16df358faed790c9810b619dfae01f11021a141ba0bc8',
+  '007_review_five': '7b764384e6dc783b694dfec120c5e73c72a1b3c9173b4db1b1cc6b624d95bd7a',
 };
 
 describe('migrations', () => {

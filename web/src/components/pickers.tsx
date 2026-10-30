@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Check, Plus, Search } from 'lucide-react';
+import { Check, Plus, Search, X } from 'lucide-react';
 import { errorMessage } from '../lib/api';
 import type { Funnel, Member, Tag } from '../lib/types';
 import { cx, Select, TagChip } from './ui';
@@ -21,17 +21,24 @@ export function TagMultiSelect({
   onChange,
   onCreate,
   placeholder = 'Agregar etiqueta…',
+  showMissing = false,
 }: {
   tags: Tag[];
   value: string[];
   onChange: (ids: string[]) => void;
   onCreate?: (name: string) => Promise<Tag>;
   placeholder?: string;
+  /**
+   * The tag list is loaded and `value` may hold ids of tags deleted since (a saved filter): they are
+   * still applied by the server, so they are shown, marked, and can be removed instead of hidden.
+   */
+  showMissing?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
   const [createError, setCreateError] = useState<string | null>(null);
   const selected = tags.filter((t) => value.includes(t.id));
+  const missing = showMissing ? value.filter((id) => !tags.some((t) => t.id === id)) : [];
   const filtered = tags.filter((t) => t.name.toLowerCase().includes(q.toLowerCase()));
   const exact = tags.some((t) => t.name.toLowerCase() === q.trim().toLowerCase());
   const toggle = (id: string) => onChange(value.includes(id) ? value.filter((x) => x !== id) : [...value, id]);
@@ -42,8 +49,11 @@ export function TagMultiSelect({
         {selected.map((t) => (
           <TagChip key={t.id} name={t.name} color={t.color} onRemove={() => toggle(t.id)} />
         ))}
+        {missing.map((id) => (
+          <TagChip key={id} name="Etiqueta eliminada" color="#64748b" onRemove={() => toggle(id)} />
+        ))}
         <button type="button" onClick={() => setOpen((v) => !v)} className="inline-flex items-center gap-1 rounded px-1 text-xs text-slate-500 hover:text-brand-700">
-          <Plus className="h-3.5 w-3.5" /> {selected.length ? '' : placeholder}
+          <Plus className="h-3.5 w-3.5" /> {selected.length || missing.length ? '' : placeholder}
         </button>
       </div>
       {open && (
@@ -155,16 +165,21 @@ export function MemberSelect({
   emptyLabel?: string;
   className?: string;
 }) {
+  const active = members.filter((m) => m.is_active);
+  // The current value is always listed, even for a member deactivated or removed since: a select
+  // whose value has no option shows its first one ("Cualquier asesor", "Sin asignar") instead, which
+  // hides what is really set. An unknown id is named only once the list is loaded (it is never empty).
+  const current = value && !active.some((m) => m.id === value) ? members.find((m) => m.id === value) : undefined;
+  const orphan = !!value && !active.some((m) => m.id === value) && (!!current || members.length > 0);
   return (
     <Select className={className} value={value ?? ''} onChange={(e) => onChange(e.target.value || null)}>
       <option value="">{emptyLabel}</option>
-      {members
-        .filter((m) => m.is_active)
-        .map((m) => (
-          <option key={m.id} value={m.id}>
-            {m.name}
-          </option>
-        ))}
+      {orphan && <option value={value!}>{current ? `${current.name} (inactivo)` : 'Asesor eliminado'}</option>}
+      {active.map((m) => (
+        <option key={m.id} value={m.id}>
+          {m.name}
+        </option>
+      ))}
     </Select>
   );
 }
@@ -172,8 +187,21 @@ export function MemberSelect({
 /** Multi-select of stages as toggleable pills (used for audiences and filters). */
 export function StagePills({ funnel, value, onChange }: { funnel: Funnel; value: string[]; onChange: (ids: string[]) => void }) {
   const set = useMemo(() => new Set(value), [value]);
+  // Stages deleted since the filter was saved: still applied by the server, so shown and removable.
+  const missing = value.filter((id) => !funnel.stages.some((s) => s.id === id));
   return (
     <div className="flex flex-wrap gap-1.5">
+      {missing.map((id) => (
+        <button
+          key={id}
+          type="button"
+          title="Quitar del filtro"
+          onClick={() => onChange(value.filter((x) => x !== id))}
+          className="flex items-center gap-1 rounded-full border border-dashed border-amber-400 bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-800 hover:bg-amber-100"
+        >
+          Etapa eliminada <X className="h-3 w-3" />
+        </button>
+      ))}
       {funnel.stages.map((s) => {
         const on = set.has(s.id);
         return (

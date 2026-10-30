@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import type { Queryable } from '../db/index.js';
 import { badRequest, notFound } from '../lib/errors.js';
@@ -7,6 +8,58 @@ import { pickAssignee } from './assignment.js';
 import { dispatchWebhook, recordEvent } from './events.js';
 
 export type Contact = ContactRow & { tag_ids: string[] };
+
+/*
+ * Custom fields: one set of limits for every way in (the inbox, the public API, the CSV import).
+ * Every byte is stored, sent with every list page, socket event and webhook of the contact.
+ */
+export const CUSTOM_FIELD_KEY_MAX = 100;
+export const CUSTOM_FIELD_VALUE_MAX = 1000;
+export const CUSTOM_FIELDS_MAX_KEYS = 100;
+export const CUSTOM_FIELDS_MAX_BYTES = 64 * 1024;
+
+const customFieldValue = z.union([z.string().max(CUSTOM_FIELD_VALUE_MAX, `Máximo ${CUSTOM_FIELD_VALUE_MAX} caracteres por campo personalizado`), z.number(), z.boolean(), z.null()], {
+  error: `Cada campo personalizado admite texto (máximo ${CUSTOM_FIELD_VALUE_MAX} caracteres), un número, sí/no o vacío`,
+});
+
+/** Size limits of a whole set of custom fields (also after the public API merges it into the stored one). */
+export function customFieldsTooBig(fields: Record<string, unknown>): string | null {
+  if (Object.keys(fields).length > CUSTOM_FIELDS_MAX_KEYS) return `Máximo ${CUSTOM_FIELDS_MAX_KEYS} campos personalizados por contacto`;
+  if (Buffer.byteLength(JSON.stringify(fields)) > CUSTOM_FIELDS_MAX_BYTES) {
+    return `Los campos personalizados de un contacto admiten máximo ${CUSTOM_FIELDS_MAX_BYTES / 1024} KB`;
+  }
+  return null;
+}
+
+export const customFieldsSchema = z
+  .record(
+    z
+      .string()
+      .min(1, 'El nombre de un campo personalizado no puede estar vacío')
+      .max(CUSTOM_FIELD_KEY_MAX, `El nombre de un campo personalizado admite máximo ${CUSTOM_FIELD_KEY_MAX} caracteres`),
+    customFieldValue,
+    // A bad key: say what is wrong with it, not just that it is invalid.
+    { error: (iss) => (iss.code === 'invalid_key' ? (iss.issues as { message: string }[] | undefined)?.[0]?.message : undefined) },
+  )
+  .superRefine((fields, c) => {
+    const err = customFieldsTooBig(fields);
+    if (err) c.addIssue({ code: 'custom', message: err });
+  });
+
+/** Null when these custom fields can be stored, else why not (in Spanish, for the user). */
+export function customFieldsError(fields: unknown): string | null {
+  const r = customFieldsSchema.safeParse(fields);
+  if (r.success) return null;
+  const first = r.error.issues[0];
+  const key = first?.path?.[0];
+  return key !== undefined && first.code !== 'custom' ? `Campo "${String(key).slice(0, 60)}": ${first.message}` : (first?.message ?? 'Campos personalizados inválidos');
+}
+
+function assertCustomFields(fields: Record<string, unknown> | undefined) {
+  if (fields === undefined) return;
+  const err = customFieldsError(fields);
+  if (err) throw badRequest(err, 'INVALID_CUSTOM_FIELDS');
+}
 
 export const CONTACT_COLUMNS = `c.*,
   COALESCE((SELECT json_agg(ct.tag_id) FROM contact_tags ct WHERE ct.contact_id = c.id), '[]'::json) AS tag_ids`;
@@ -114,6 +167,7 @@ export async function createContact(
   ]);
   const phone = normalizePhone(input.phone, ws.rows[0]?.default_country_code ?? '52');
   if (!isValidPhone(phone)) throw badRequest(`Número de teléfono inválido: ${input.phone}`, 'INVALID_PHONE');
+  assertCustomFields(input.customFields);
 
   const result = await ctx.db.tx(async (q) => {
     let funnelId = input.funnelId ?? null;
@@ -159,7 +213,7 @@ export async function createContact(
     const id = ins.rows[0].id;
     let assigned = input.assignedUserId ?? null;
     if (!assigned && funnel?.auto_assign) {
-      assigned = await pickAssignee(q, workspaceId, funnel.assignee_ids ?? []);
+      assigned = await pickAssignee(q, workspaceId, funnel.assignee_ids ?? [], ctx.log);
       if (assigned) await q.query(`UPDATE contacts SET assigned_user_id = $2 WHERE id = $1`, [id, assigned]);
     }
     if (input.tagIds?.length) await addTags(q, workspaceId, id, input.tagIds);
@@ -203,6 +257,7 @@ export async function updateContact(
   patch: UpdateContactInput,
   actor: { userId?: string | null } = {},
 ): Promise<Contact> {
+  assertCustomFields(patch.customFields);
   const changes = await ctx.db.tx(async (q) => {
     const current = await getContact(q, workspaceId, id);
     const sets: string[] = [];

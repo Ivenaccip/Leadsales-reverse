@@ -1,8 +1,9 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
+import type { Queryable } from '../db/index.js';
 import { hashPassword } from '../lib/auth.js';
-import { badRequest, conflict, notFound } from '../lib/errors.js';
+import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { topup } from '../services/credits.js';
 import { newPasswordSchema } from './auth.js';
 import type { ChannelRow } from '../types.js';
@@ -139,7 +140,16 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
     if (id === s.user.id && !body.is_superadmin) throw badRequest('No puedes quitarte a ti mismo el rol de administrador');
     await accountOf(ctx, id);
     await verifyCurrentPassword(ctx, s, body.currentPassword);
-    await ctx.db.query(`UPDATE users SET is_superadmin = $2 WHERE id = $1`, [id, body.is_superadmin]);
+    await ctx.db.tx(async (q) => {
+      await lockOperators(q, s.user.id);
+      // Two operators demoting each other at once: the second one is no operator any more here.
+      if (!body.is_superadmin) {
+        const others = await q.query<{ n: number }>(`SELECT count(*)::int AS n FROM users WHERE is_superadmin AND id <> $1`, [id]);
+        if (!others.rows[0].n) throw badRequest('La instancia debe conservar al menos un administrador', 'LAST_OPERATOR');
+      }
+      const r = await q.query(`UPDATE users SET is_superadmin = $2 WHERE id = $1 RETURNING id`, [id, body.is_superadmin]);
+      if (!r.rows[0]) throw notFound('Usuario');
+    });
     // Open sockets joined foreign workspaces as superadmin: make them re-join with the new rights.
     // A promotion reaches every tab too (the Administración menu, foreign workspaces).
     if (!body.is_superadmin) await ctx.realtime.evictUser(id);
@@ -160,7 +170,14 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
     await verifyCurrentPassword(ctx, s, body.currentPassword);
     const hash = await hashPassword(body.password);
     await ctx.db.tx(async (q) => {
-      await q.query(`UPDATE users SET password_hash = $2, password_version = password_version + 1 WHERE id = $1`, [id, hash]);
+      // Both checks again, now that nothing can change them: the caller may have been demoted, or
+      // the target promoted, while the password was being verified.
+      await lockOperators(q, s.user.id);
+      const r = await q.query(
+        `UPDATE users SET password_hash = $2, password_version = password_version + 1 WHERE id = $1 AND NOT is_superadmin RETURNING id`,
+        [id, hash],
+      );
+      if (!r.rows[0]) throw badRequest('La contraseña de un administrador de la instancia solo la cambia su dueño, desde su perfil');
       await q.query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [id]);
     });
     await ctx.realtime.endSessions({ userId: id });
@@ -182,6 +199,16 @@ export async function adminRoutes(app: FastifyInstance, ctx: AppContext) {
     await ctx.realtime.endSessions({ userId: id });
     return noContent(reply);
   });
+}
+
+/**
+ * Locks every operator row (in one order) and checks that the caller still is one. Changes to
+ * operator rights then run one at a time: what a request checked before its password step-up
+ * (bcrypt takes a while) may no longer hold.
+ */
+async function lockOperators(q: Queryable, callerId: string) {
+  const { rows } = await q.query<{ id: string }>(`SELECT id FROM users WHERE is_superadmin ORDER BY id FOR UPDATE`);
+  if (!rows.some((r) => r.id === callerId)) throw forbidden('Solo el administrador de la instancia puede hacer esto');
 }
 
 async function accountOf(ctx: AppContext, id: string) {

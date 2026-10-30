@@ -122,6 +122,8 @@ async function outbound(contactId: string, wamid: string, o: { cost?: number; pr
      VALUES ($1, $2, $3, 'out', 'template', 'Plantilla', $4, 'sent', 'user', 'marketing', $5, $6) RETURNING *`,
     [ws, contactId, channelId, wamid, o.cost ?? 0, o.prepaid ?? false],
   );
+  // As a send does: the conversation now has its number.
+  await q(`UPDATE contacts SET channel_id = COALESCE(channel_id, $2) WHERE id = $1`, [contactId, channelId]);
   return rows[0];
 }
 

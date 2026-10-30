@@ -5,3 +5,6 @@ data/
 *.log
 coverage/
 .DS_Store
+
+# Packages downloaded while researching (never part of the project)
+*.whl

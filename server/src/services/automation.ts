@@ -393,20 +393,65 @@ async function saveState(ctx: AppContext, contactId: string, since: string, stat
                        WHERE m.contact_id = $1 AND m.direction = 'out' AND m.sent_by = ANY($5::text[])
                          AND m.created_at > (SELECT l.created_at FROM messages l WHERE l.id = $3))
      RETURNING id`,
-    [contactId, JSON.stringify({ ...state, updated_at: new Date().toISOString() }), since, restart, HUMAN_SENDERS],
+    [contactId, JSON.stringify({ ...state, updated_at: new Date().toISOString(), last_in: since }), since, restart, HUMAN_SENDERS],
   );
   return rows.length > 0;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** True when message `lastIn` comes after message `id` in the chat. */
+async function isLaterInChat(q: Queryable, lastIn: string | undefined, id: string): Promise<boolean> {
+  if (!lastIn || lastIn === id || !UUID.test(lastIn)) return false;
+  const { rows } = await q.query(`SELECT 1 FROM messages l, messages m WHERE l.id = $1 AND m.id = $2 AND l.created_at > m.created_at`, [lastIn, id]);
+  return rows.length > 0;
+}
+
+/**
+ * The parts of a menu option's actions that still point at something: an admin may have deleted the
+ * stage (or its funnel) or removed or deactivated the member since the bot was set up. A stale one is
+ * left out instead of failing the whole update, which would also drop the option's tags.
+ */
+async function optionActions(ctx: AppContext, workspaceId: string, option: BotMenuOption) {
+  const id = (v: string | null | undefined) => (v && UUID.test(v) ? v : null);
+  const { rows } = await ctx.db.query<{ stage: boolean; member: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM stages WHERE id = $2 AND workspace_id = $1) AS stage,
+       EXISTS (SELECT 1 FROM memberships WHERE workspace_id = $1 AND user_id = $3 AND is_active) AS member`,
+    [workspaceId, id(option.stage_id), id(option.assign_user_id)],
+  );
+  const patch: Parameters<typeof updateContact>[3] = {};
+  if (option.stage_id) {
+    if (rows[0]?.stage) patch.stageId = option.stage_id;
+    else ctx.log.warn({ workspaceId, stageId: option.stage_id, option: option.key }, 'bot option points to a stage that no longer exists');
+  }
+  if (option.tag_ids?.length) patch.addTagIds = option.tag_ids;
+  let assignByTurn = false;
+  if (option.assign_user_id) {
+    if (rows[0]?.member) patch.assignedUserId = option.assign_user_id;
+    else {
+      // The person the option hands chats to is gone: the chat goes to whoever is next in turn.
+      ctx.log.warn({ workspaceId, userId: option.assign_user_id, option: option.key }, 'bot option assigns to a member who is no longer active');
+      assignByTurn = true;
+    }
+  }
+  return { patch, assignByTurn };
 }
 
 async function runMenuBot(ctx: AppContext, ws: WorkspaceRow, settings: ReturnType<typeof settingsWithDefaults>, contact: ContactRow, message: MessageRow) {
   const bot = settings.bot;
   if (!bot?.menu?.options?.length) return;
-  if (bot.only_unassigned && contact.assigned_user_id && !contact.bot_state) return;
+  // "Only in unassigned conversations": the bot neither starts nor starts over (a takeover leaves it
+  // done) in a conversation someone owns. One that was mid-menu when it got assigned may finish.
+  if (bot.only_unassigned && contact.assigned_user_id && (!contact.bot_state || contact.bot_state.done)) return;
   const replyId = (message.payload as any)?.reply_id as string | undefined;
   const tap = replyId ? parseMenuTap(bot.menu, replyId) : null;
   const input = (replyId ?? message.body ?? '').trim();
   const resetWord = !tap && RESET_WORDS.has(norm(input));
   const state = contact.bot_state;
+  // A customer message that comes before, in the chat, the last one the bot acted on was delivered
+  // late (Meta keeps no order and retries deliveries): it answered a menu the customer has since
+  // left, so it stays in the chat but changes nothing. The jobs of a contact run one at a time.
+  if (await isLaterInChat(ctx.db, state?.last_in, message.id)) return;
   // Every send and state write stops once a person took over after this message.
   const guard = (ownDone = false) =>
     stillOurTurn({ contactId: contact.id, since: message.id, answeredBy: HUMAN_SENDERS, botDone: !ownDone });
@@ -447,11 +492,11 @@ async function runMenuBot(ctx: AppContext, ws: WorkspaceRow, settings: ReturnTyp
     return;
   }
 
-  const patch: Parameters<typeof updateContact>[3] = {};
-  if (option.stage_id) patch.stageId = option.stage_id;
-  if (option.tag_ids?.length) patch.addTagIds = option.tag_ids;
-  if (option.assign_user_id) patch.assignedUserId = option.assign_user_id;
-  if (Object.keys(patch).length) await updateContact(ctx, ws.id, contact.id, patch).catch((err) => ctx.log.warn({ err: err.message }, 'bot action failed'));
+  if (option.stage_id || option.tag_ids?.length || option.assign_user_id) {
+    const { patch, assignByTurn } = await optionActions(ctx, ws.id, option);
+    if (Object.keys(patch).length) await updateContact(ctx, ws.id, contact.id, patch).catch((err) => ctx.log.warn({ err: err.message }, 'bot action failed'));
+    if (assignByTurn) await assignIfUnassigned(ctx, ws.id, contact.id).catch((err) => ctx.log.warn({ err: err.message }, 'bot action failed'));
+  }
 
   const say = (text: string, ownDone = false) =>
     sendAutomated(ctx, { workspaceId: ws.id, contactId: contact.id, content: { type: 'text', text }, sentBy: 'bot', precondition: guard(ownDone) });
@@ -473,6 +518,6 @@ export async function assignIfUnassigned(ctx: AppContext, workspaceId: string, c
   const contact = await getContact(ctx.db, workspaceId, contactId);
   if (contact.assigned_user_id) return;
   const funnel = await ctx.db.query<{ assignee_ids: string[] }>(`SELECT assignee_ids FROM funnels WHERE id = $1`, [contact.funnel_id]);
-  const userId = await ctx.db.tx((q) => pickAssignee(q, workspaceId, funnel.rows[0]?.assignee_ids ?? []));
+  const userId = await ctx.db.tx((q) => pickAssignee(q, workspaceId, funnel.rows[0]?.assignee_ids ?? [], ctx.log));
   if (userId) await updateContact(ctx, workspaceId, contactId, { assignedUserId: userId });
 }

@@ -9,9 +9,10 @@ import {
   estimateAudience,
   getBroadcast,
   launchBroadcast,
+  settleCancelled,
   type BroadcastRow,
 } from '../services/broadcasts.js';
-import { abandonAutoRetry } from '../services/messages.js';
+import { abandonAutoRetry, MAX_MEDIA_FILENAME, MAX_MEDIA_LINK } from '../services/messages.js';
 import { findTemplate } from '../services/templates.js';
 import { getChannel } from '../whatsapp/provider.js';
 import { ADMIN_ROLES, noContent, parse, requireWs, uuid } from './helpers.js';
@@ -40,7 +41,17 @@ const paramsSchema = z.object({
   header: z
     .union([
       z.object({ type: z.literal('text'), value: z.string().min(1).max(200) }),
-      z.object({ type: z.enum(['image', 'video', 'document']), link: z.string().url(), filename: z.string().optional() }),
+      // Copied into every recipient's message: bounded like the other params (see MAX_MEDIA_LINK).
+      z.object({
+        type: z.enum(['image', 'video', 'document']),
+        link: z
+          .string()
+          .trim()
+          .max(MAX_MEDIA_LINK)
+          .url()
+          .refine((u) => /^https?:\/\//i.test(u), 'El enlace debe empezar con https://'),
+        filename: z.string().trim().max(MAX_MEDIA_FILENAME).optional(),
+      }),
       z.object({
         type: z.literal('location'),
         latitude: z.number().min(-90).max(90),
@@ -210,7 +221,10 @@ export async function broadcastRoutes(app: FastifyInstance, ctx: AppContext) {
          RETURNING id`,
         [id, a.workspaceId],
       );
-      if (r.rows[0]) await q.query(`UPDATE broadcast_recipients SET status = 'skipped' WHERE broadcast_id = $1 AND status = 'queued'`, [id]);
+      if (!r.rows[0]) return;
+      await q.query(`UPDATE broadcast_recipients SET status = 'skipped' WHERE broadcast_id = $1 AND status = 'queued'`, [id]);
+      // A live run hands its claimed batch back as skipped; one that died mid-batch never will.
+      await settleCancelled(ctx, id, q);
     });
     // Messages that were waiting for an automatic retry (throttle, network) will not get it now.
     await abandonAutoRetry(ctx, { broadcastId: id });

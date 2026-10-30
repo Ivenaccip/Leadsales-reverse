@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
 import { parse as parseCsvStream } from 'csv-parse';
 import { stringify } from 'csv-stringify/sync';
@@ -6,15 +7,23 @@ import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { AppError, badRequest, conflict } from '../lib/errors.js';
 import { renderPlaceholders, renderTemplateParams } from '../services/broadcasts.js';
-import { CONTACT_COLUMNS, createContact, getContact, updateContact } from '../services/contacts.js';
+import {
+  CONTACT_COLUMNS,
+  createContact,
+  CUSTOM_FIELD_KEY_MAX,
+  customFieldsError,
+  customFieldsSchema,
+  getContact,
+  updateContact,
+} from '../services/contacts.js';
 import { waTypeForMime } from '../services/media.js';
-import { addNote, isWindowOpen, sendMessage, type SendContent } from '../services/messages.js';
+import { addNote, isWindowOpen, MAX_MEDIA_FILENAME, MAX_MEDIA_LINK, sendingChannelId, sendMessage, type SendContent } from '../services/messages.js';
 import { cancelScheduled, scheduleMessage } from '../services/scheduled.js';
 import { checkTemplateParams, findTemplate } from '../services/templates.js';
 import type { MessageRow } from '../types.js';
 import { getChannel, providerFor } from '../whatsapp/provider.js';
 import type { TemplateParams } from '../whatsapp/types.js';
-import { TAG_NAME_MAX, TAG_SEPARATORS } from './crm.js';
+import { createTagsByName, MAX_TAGS_PER_CONTACT, MAX_TAGS_PER_WORKSPACE, TAG_NAME_MAX, TAG_SEPARATORS, tagLimitReached } from './crm.js';
 import { ADMIN_ROLES, agentRestricted, noContent, parse, requireWs, uuid, type WsAuth } from './helpers.js';
 
 const boolish = z
@@ -116,7 +125,16 @@ const templateParamsSchema = z.object({
   header: z
     .union([
       z.object({ type: z.literal('text'), text: z.string().min(1).max(60) }),
-      z.object({ type: z.enum(['image', 'video', 'document']), link: z.string().url(), filename: z.string().optional() }),
+      z.object({
+        type: z.enum(['image', 'video', 'document']),
+        link: z
+          .string()
+          .trim()
+          .max(MAX_MEDIA_LINK)
+          .url()
+          .refine((u) => /^https?:\/\//i.test(u), 'El enlace debe empezar con https://'),
+        filename: z.string().trim().max(MAX_MEDIA_FILENAME).optional(),
+      }),
       z.object({
         type: z.literal('location'),
         latitude: z.number().min(-90).max(90),
@@ -144,7 +162,7 @@ const MAX_CAPTION = 1024;
 const sendSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string().min(1).max(4096), reply_to_wamid: z.string().optional() }),
   z.object({ type: z.literal('media'), media_file_id: uuid, caption: z.string().max(MAX_CAPTION).optional() }),
-  z.object({ type: z.literal('template'), name: z.string().min(1), language: z.string().min(2), params: templateParamsSchema.optional() }),
+  z.object({ type: z.literal('template'), name: z.string().min(1).max(512), language: z.string().min(2).max(20), params: templateParamsSchema.optional() }),
   z.object({ type: z.literal('quick_reply'), quick_reply_id: uuid }),
 ]);
 
@@ -240,6 +258,57 @@ export function splitTagCell(cell: string, legacy: LegacyTags = new Map()): stri
   return out;
 }
 
+/** Columns of the export (also what marks a file as ours on import, see EXPORT_COLUMNS). */
+const EXPORT_HEADER = ['telefono', 'nombre', 'correo', 'empresa', 'embudo', 'etapa', 'asignado_a', 'etiquetas', 'valor', 'origen', 'creado', 'ultimo_mensaje', 'campos'];
+/** Contacts read per query by the export, and characters sent per chunk. */
+const EXPORT_PAGE = 500;
+const EXPORT_CHUNK = 64 * 1024;
+
+function exportRow(r: Record<string, any>): Record<string, unknown> {
+  return {
+    // Also neutralized: a reader splitting on another separator can glue the next value onto it.
+    telefono: csvCell(`+${r.phone}`),
+    nombre: csvCell(r.name),
+    correo: csvCell(r.email),
+    empresa: csvCell(r.company),
+    embudo: csvCell(r.funnel),
+    etapa: csvCell(r.stage),
+    asignado_a: csvCell(r.assigned_to),
+    etiquetas: csvCell(r.tags),
+    valor: r.deal_value,
+    origen: csvCell(r.source),
+    creado: new Date(r.created_at).toISOString(),
+    ultimo_mensaje: r.last_message_at ? new Date(r.last_message_at).toISOString() : '',
+    // Every cell is quoted, so a ';' or ',' inside a value never splits it in a standard reader.
+    campos: csvCell(JSON.stringify(r.custom_fields ?? {})),
+  };
+}
+
+/**
+ * One page of the export, after the phone parameter `afterParam` holds, if any. Pages follow the
+ * (workspace_id, phone) unique index every workspace already has: each one starts where the last
+ * one ended, instead of sorting what is left of the workspace again for every page.
+ */
+export function exportPageSql(where: string, afterParam: string | null): string {
+  return `SELECT c.phone, c.name, c.email, c.company, c.deal_value, c.source, c.created_at, c.last_message_at, c.custom_fields,
+      f.name AS funnel, s.name AS stage, u.name AS assigned_to,
+      (SELECT string_agg(t.name, ';') FROM contact_tags ct JOIN tags t ON t.id = ct.tag_id WHERE ct.contact_id = c.id) AS tags
+    FROM contacts c LEFT JOIN funnels f ON f.id = c.funnel_id LEFT JOIN stages s ON s.id = c.stage_id LEFT JOIN users u ON u.id = c.assigned_user_id
+    WHERE ${where}${afterParam ? ` AND c.phone > ${afterParam}` : ''}
+    ORDER BY c.phone LIMIT ${EXPORT_PAGE}`;
+}
+
+/** One spelling per tag (the first one): names are matched without case. */
+function uniqueTagNames(names: string[]): string[] {
+  const seen = new Set<string>();
+  return names.filter((n) => {
+    const k = n.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 /** A letter lost by reading a non-UTF-8 file as UTF-8 leaves U+FFFD next to the rest of its word. */
 const LOST_LETTER = /\p{L}\uFFFD|\uFFFD\p{L}/u;
 
@@ -299,6 +368,13 @@ export function detectCsvDelimiter(text: string): string {
 /** Every column of an import becomes a custom field (and work for each row): real files have far fewer. */
 export const MAX_IMPORT_COLUMNS = 200;
 export const MAX_IMPORT_ROWS = 20_000;
+/** Column names become custom-field keys of every row: same limit as those keys. */
+export const MAX_IMPORT_HEADER = CUSTOM_FIELD_KEY_MAX;
+/**
+ * Characters one row (the header too) may hold before parsing stops: a valid row (200 columns of
+ * at most 1,000 characters, or our export's custom fields) is far smaller.
+ */
+export const MAX_IMPORT_RECORD = 256 * 1024;
 /** Bytes parsed between yields to the event loop, so other requests, webhooks and jobs keep running. */
 const CSV_CHUNK = 64 * 1024;
 /** Time an import may hold the event loop before yielding (the loop over rows, the checks). */
@@ -333,9 +409,12 @@ async function parseCsvYielding(
     // is a key of every row, walked for every row.
     columns: (h: string[]) => {
       if (h.length > limits.maxColumns) throw tooManyColumns();
+      const long = h.find((name) => name.length > MAX_IMPORT_HEADER);
+      if (long !== undefined) throw headerTooLong(long);
       return (header = h);
     },
     delimiter,
+    max_record_size: MAX_IMPORT_RECORD,
     skip_empty_lines: true,
     trim: true,
     relax_column_count: true,
@@ -360,6 +439,13 @@ async function parseCsvYielding(
     await done;
   } catch (err) {
     if (err instanceof AppError) throw err;
+    if ((err as { code?: string }).code === 'CSV_MAX_RECORD_SIZE') {
+      const line = (err as { lines?: number }).lines;
+      throw badRequest(
+        `${line ? `La línea ${line}` : 'Una fila'} del archivo supera ${MAX_IMPORT_RECORD / 1024} KB: revisa que sus comillas estén cerradas.`,
+        'CSV_RECORD_TOO_LARGE',
+      );
+    }
     throw badRequest(`No se pudo leer el CSV: ${(err as Error).message}`);
   }
   // The last row only comes out when the parser ends.
@@ -369,6 +455,8 @@ async function parseCsvYielding(
 
 const tooManyRows = () => badRequest(`Máximo ${MAX_IMPORT_ROWS.toLocaleString('en-US')} filas por importación`);
 const tooManyColumns = () => badRequest(`El archivo tiene demasiadas columnas (máximo ${MAX_IMPORT_COLUMNS})`, 'CSV_TOO_MANY_COLUMNS');
+const headerTooLong = (name: string) =>
+  badRequest(`El nombre de columna "${name.slice(0, 40)}…" supera ${MAX_IMPORT_HEADER} caracteres`, 'CSV_HEADER_TOO_LONG');
 
 /**
  * Columns of our own export that are not contact fields: `campos` holds the custom fields (JSON),
@@ -473,7 +561,7 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
         stage_id: uuid.optional(),
         assigned_user_id: uuid.optional(),
         deal_value: z.number().min(0).optional(),
-        custom_fields: z.record(z.string(), z.any()).optional(),
+        custom_fields: customFieldsSchema.optional(),
         tag_ids: z.array(uuid).optional(),
       }),
       req.body,
@@ -508,38 +596,35 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
     const f = parse(listSchema.partial(), req.query);
     const { where, params } = buildWhere(a, { ...f, archived: f.archived }, false);
-    const { rows } = await ctx.db.query(
-      `SELECT c.phone, c.name, c.email, c.company, c.deal_value, c.source, c.created_at, c.last_message_at, c.custom_fields,
-         f.name AS funnel, s.name AS stage, u.name AS assigned_to,
-         (SELECT string_agg(t.name, ';') FROM contact_tags ct JOIN tags t ON t.id = ct.tag_id WHERE ct.contact_id = c.id) AS tags
-       FROM contacts c LEFT JOIN funnels f ON f.id = c.funnel_id LEFT JOIN stages s ON s.id = c.stage_id LEFT JOIN users u ON u.id = c.assigned_user_id
-       WHERE ${where} ORDER BY c.created_at`,
-      params,
-    );
-    const csv = stringify(
-      rows.map((r: any) => ({
-        // Also neutralized: a reader splitting on another separator can glue the next value onto it.
-        telefono: csvCell(`+${r.phone}`),
-        nombre: csvCell(r.name),
-        correo: csvCell(r.email),
-        empresa: csvCell(r.company),
-        embudo: csvCell(r.funnel),
-        etapa: csvCell(r.stage),
-        asignado_a: csvCell(r.assigned_to),
-        etiquetas: csvCell(r.tags),
-        valor: r.deal_value,
-        origen: csvCell(r.source),
-        creado: new Date(r.created_at).toISOString(),
-        ultimo_mensaje: r.last_message_at ? new Date(r.last_message_at).toISOString() : '',
-        campos: csvCell(JSON.stringify(r.custom_fields ?? {})),
-      })),
-      // Every cell is quoted, so a ';' or ',' inside a value never splits it in a standard reader.
-      { header: true, quoted: true },
-    );
     reply.header('Content-Type', 'text/csv; charset=utf-8');
     reply.header('Content-Disposition', `attachment; filename="contactos-${new Date().toISOString().slice(0, 10)}.csv"`);
-    return '﻿' + csv;
+    // Streamed page by page: a large workspace's file is never built (nor held) whole, and the event
+    // loop every tenant shares is given back between pages and rows.
+    return reply.send(Readable.from(exportCsv(where, params)));
   });
+
+  async function* exportCsv(where: string, params: unknown[]): AsyncGenerator<string> {
+    yield '\ufeff' + stringify([], { header: true, quoted: true, columns: EXPORT_HEADER });
+    const pause = yielder();
+    let after: string | null = null;
+    for (;;) {
+      const p = after === null ? params : [...params, after];
+      const { rows }: { rows: Record<string, any>[] } = await ctx.db.query(exportPageSql(where, after === null ? null : `$${p.length}`), p);
+      let chunk = '';
+      for (const r of rows) {
+        chunk += stringify([exportRow(r)], { quoted: true, columns: EXPORT_HEADER });
+        if (chunk.length >= EXPORT_CHUNK) {
+          yield chunk;
+          chunk = '';
+        }
+        await pause();
+      }
+      if (chunk) yield chunk;
+      if (rows.length < EXPORT_PAGE) return;
+      after = rows[rows.length - 1].phone as string;
+      await yieldToEventLoop();
+    }
+  }
 
   app.post('/api/contacts/import', async (req) => {
     const a = await requireWs(ctx, req, ADMIN_ROLES);
@@ -606,6 +691,9 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
     const tagsRes = await ctx.db.query<{ id: string; name: string }>(`SELECT id, name FROM tags WHERE workspace_id = $1`, [a.workspaceId]);
     const tagByName = new Map(tagsRes.rows.map((t) => [t.name.toLowerCase(), t.id]));
     const legacyTags = legacyTagIndex(tagsRes.rows.map((t) => t.name));
+    // Tags this import may still create (the database checks again: this only spares its query to
+    // the rows that cannot fit, every row once the workspace is full).
+    let tagRoom = MAX_TAGS_PER_WORKSPACE - tagsRes.rows.length;
     let created = 0;
     let existing = 0;
     const errors: { row: number; error: string }[] = [];
@@ -621,7 +709,7 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
         const h = header(k);
         if (h.target) mapped[h.target] = v;
         else if (fields && EXPORT_COLUMNS.has(h.norm)) exported[h.norm] = v;
-        else if (v) custom[h.name] = v;
+        else if (v && h.name) custom[h.name] = v; // a column with no name has no field to go to
       }
       if (fields) custom = { ...fields, ...custom };
       const funnelName = exported.embudo?.trim().toLowerCase();
@@ -637,25 +725,32 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
           : (mapped.company?.trim().length ?? 0) > 120
             ? 'La empresa admite máximo 120 caracteres'
             : null;
-      const names = splitTagCell(mapped.tags ?? '', legacyTags);
+      const names = uniqueTagNames(splitTagCell(mapped.tags ?? '', legacyTags));
       const longTag = names.find((n) => n.length > TAG_NAME_MAX && !tagByName.has(n.toLowerCase()));
-      if (tooLong || longTag) {
-        errors.push({ row: i + 2, error: tooLong ?? `La etiqueta "${longTag!.slice(0, 40)}…" supera ${TAG_NAME_MAX} caracteres` });
+      // Same cap as the public API: each tag is work (and rows) for this one request.
+      const tooManyTags = names.length > MAX_TAGS_PER_CONTACT ? `Máximo ${MAX_TAGS_PER_CONTACT} etiquetas por contacto` : null;
+      const badFields = customFieldsError(custom);
+      if (tooLong || tooManyTags || longTag || badFields) {
+        errors.push({ row: i + 2, error: tooLong ?? tooManyTags ?? badFields ?? `La etiqueta "${longTag!.slice(0, 40)}…" supera ${TAG_NAME_MAX} caracteres` });
         continue;
       }
-      const tagIds = [...(body.tag_ids ?? [])];
-      for (const name of names) {
-        let id = tagByName.get(name.toLowerCase());
-        if (!id) {
-          const t = await ctx.db.query<{ id: string }>(
-            `INSERT INTO tags (workspace_id, name) VALUES ($1, $2) ON CONFLICT (workspace_id, name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
-            [a.workspaceId, name],
-          );
-          id = t.rows[0].id;
-          tagByName.set(name.toLowerCase(), id);
+      const missing = names.filter((n) => !tagByName.has(n.toLowerCase()));
+      if (missing.length) {
+        if (missing.length > tagRoom) {
+          errors.push({ row: i + 2, error: tagLimitReached().message });
+          continue;
         }
-        tagIds.push(id);
+        try {
+          for (const [name, id] of await createTagsByName(ctx.db, a.workspaceId, missing)) tagByName.set(name.toLowerCase(), id);
+          tagRoom -= missing.length;
+        } catch (err) {
+          if (!(err instanceof AppError && err.code === 'TAG_LIMIT_REACHED')) throw err;
+          tagRoom = Math.min(tagRoom, missing.length - 1); // others created tags meanwhile
+          errors.push({ row: i + 2, error: err.message });
+          continue;
+        }
       }
+      const tagIds = [...(body.tag_ids ?? []), ...names.map((n) => tagByName.get(n.toLowerCase())!)];
       try {
         const r = await createContact(
           ctx,
@@ -780,7 +875,7 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
         email: z.string().trim().email('Correo inválido').nullable().optional().or(z.literal('')),
         company: z.string().trim().max(120).nullable().optional(),
         deal_value: z.number().min(0).optional(),
-        custom_fields: z.record(z.string(), z.any()).optional(),
+        custom_fields: customFieldsSchema.optional(),
         funnel_id: uuid.optional(),
         stage_id: uuid.optional(),
         assigned_user_id: uuid.nullable().optional(),
@@ -961,7 +1056,7 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
         send_at: z.string().datetime({ offset: true }),
         content: z.discriminatedUnion('type', [
           z.object({ type: z.literal('text'), text: z.string().min(1).max(4096) }),
-          z.object({ type: z.literal('template'), name: z.string().min(1), language: z.string().min(2), params: templateParamsSchema.optional() }),
+          z.object({ type: z.literal('template'), name: z.string().min(1).max(512), language: z.string().min(2).max(20), params: templateParamsSchema.optional() }),
         ]),
       }),
       req.body,
@@ -969,7 +1064,9 @@ export async function contactRoutes(app: FastifyInstance, ctx: AppContext) {
     if (body.content.type === 'template') {
       // Refuse now what would only fail at send time (missing variables, location, coupon…).
       // Checked as the send renders them: a placeholder such as {campo.cupon} is not the coupon itself.
-      const channel = await getChannel(ctx.db, a.workspaceId, contact.channel_id).catch(() => null);
+      // Against the number the send will use: an unbound contact may be answered from another one.
+      const sending = await sendingChannelId(ctx.db, a.workspaceId, contact).catch(() => null);
+      const channel = await getChannel(ctx.db, a.workspaceId, sending).catch(() => null);
       const tpl = channel ? await findTemplate(ctx.db, channel.id, body.content.name, body.content.language) : null;
       if (tpl) checkTemplateParams(tpl.components, renderTemplateParams(body.content.params as TemplateParams | undefined, contact));
     }

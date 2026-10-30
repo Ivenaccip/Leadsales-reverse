@@ -10,7 +10,7 @@ import type { ChannelRow } from '../types.js';
 import { processInboundMessage } from '../whatsapp/inbound.js';
 import { channelCredentials, providerFor } from '../whatsapp/provider.js';
 import { CloudApiProvider } from '../whatsapp/cloud-api.js';
-import { explainMetaError, MetaApiError } from '../whatsapp/types.js';
+import { explainMetaError, MetaApiError, type PhoneInfo } from '../whatsapp/types.js';
 import { ADMIN_ROLES, noContent, parse, requireWs, uuid, type WsAuth } from './helpers.js';
 
 function publicChannel(ctx: AppContext, ch: ChannelRow) {
@@ -55,7 +55,24 @@ async function verifyOwnership(ctx: AppContext, accessToken: string, phoneNumber
   if (!ids.includes(phoneNumberId)) {
     throw badRequest('Ese Phone Number ID no pertenece a la cuenta de WhatsApp (WABA) indicada', 'PHONE_NOT_IN_WABA');
   }
+  const unregistered = notOnCloudApi(info);
+  if (unregistered) throw badRequest(unregistered, 'PHONE_NOT_REGISTERED');
   return info;
+}
+
+/**
+ * Why a number cannot send through the Cloud API yet, from Meta's platform_type: adding and
+ * verifying it in Meta is not enough, it must also be registered (POST /{phone-number-id}/register
+ * with its two-step PIN). Until then every send fails with 133010. Null when it is on the Cloud API
+ * (or Meta did not say).
+ */
+export function notOnCloudApi(info: PhoneInfo): string | null {
+  const platform = info.platform_type?.toUpperCase();
+  if (!platform || platform === 'CLOUD_API') return null;
+  if (platform === 'ON_PREMISE') {
+    return 'Este número está registrado en la API local (On-Premises) o con otro proveedor, no en la Cloud API: no podría enviar mensajes. Migra el número a la Cloud API y regístralo (guía "Conectar WhatsApp", paso 2).';
+  }
+  return 'Este número todavía no está registrado en la Cloud API de WhatsApp (Meta indica "' + info.platform_type + '"): agregarlo y verificarlo no basta y cada envío fallaría (error 133010). Regístralo con tu PIN de verificación en dos pasos —POST /{phone-number-id}/register, ver la guía "Conectar WhatsApp", paso 2— y vuelve a intentarlo.';
 }
 
 async function billingModeOf(ctx: AppContext, workspaceId: string): Promise<string | undefined> {
@@ -352,11 +369,14 @@ export async function channelRoutes(app: FastifyInstance, ctx: AppContext) {
     const ch = await getOwnChannel(ctx, a.workspaceId, id);
     try {
       const info = await providerFor(ctx, ch).getPhoneInfo();
+      // Meta answers for a number that is not registered too: it reads fine and cannot send.
+      const unregistered = notOnCloudApi(info);
       // A test only reports: re-enabling a number is a PATCH (operator-only in prepaid workspaces).
       await ctx.db.query(
-        `UPDATE channels SET display_phone = COALESCE($2, display_phone), last_error = CASE WHEN status = 'disabled' THEN last_error END WHERE id = $1`,
-        [id, info.display_phone_number ?? null],
+        `UPDATE channels SET display_phone = COALESCE($2, display_phone), last_error = CASE WHEN status = 'disabled' THEN last_error ELSE $3 END WHERE id = $1`,
+        [id, info.display_phone_number ?? null, unregistered],
       );
+      if (unregistered) return { ok: false, error: unregistered, info };
       return { ok: true, info };
     } catch (err) {
       const msg = err instanceof MetaApiError ? explainMetaError(err.code, err.message) : (err as Error).message;

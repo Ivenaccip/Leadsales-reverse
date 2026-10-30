@@ -57,6 +57,20 @@ export function setUnauthorizedHandler(fn: () => void) {
   onUnauthorized = fn;
 }
 
+let sessionCheck: Promise<boolean> | null = null;
+/** One GET /api/auth/me at a time; false only on a 401 (a network error says nothing about the session). */
+function sessionStillValid(): Promise<boolean> {
+  sessionCheck ??= fetch('/api/auth/me', { credentials: 'include' })
+    .then(
+      (r) => r.status !== 401,
+      () => true,
+    )
+    .finally(() => {
+      sessionCheck = null;
+    });
+  return sessionCheck;
+}
+
 async function request<T>(method: string, path: string, body?: unknown, init: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = { ...(init.headers as Record<string, string>) };
   const ws = getWorkspaceId();
@@ -73,7 +87,12 @@ async function request<T>(method: string, path: string, body?: unknown, init: Re
   const data = type.includes('application/json') ? await res.json() : await res.text();
   if (!res.ok) {
     const err = (data as any)?.error ?? {};
-    if (res.status === 401 && onUnauthorized && !path.startsWith('/api/auth/login')) onUnauthorized();
+    if (res.status === 401 && onUnauthorized && !path.startsWith('/api/auth/login')) {
+      // A request sent with a cookie the server just replaced (a password change in another tab
+      // rotates the session) is refused although the browser now holds a valid one: sign out only if
+      // the session check, made with whatever cookie the browser holds now, fails too.
+      if ((method === 'GET' && path === '/api/auth/me') || !(await sessionStillValid())) onUnauthorized?.();
+    }
     throw new ApiError(res.status, err.code ?? 'ERROR', err.message ?? `Error ${res.status}`, err.details);
   }
   return data as T;

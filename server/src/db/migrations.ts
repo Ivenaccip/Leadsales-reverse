@@ -494,6 +494,79 @@ ALTER TABLE templates ADD COLUMN IF NOT EXISTS status_event_at timestamptz;
 ALTER TABLE templates ADD COLUMN IF NOT EXISTS category_event_at timestamptz;
 `;
 
+// 007: what 006 still missed on upgraded installs.
+const reviewFive = `
+-- 006 distrusted the numbers 004 marked verified only in workspaces that were prepaid when it ran: one
+-- switched back to meta_direct kept the flag, and trusted the business's own App Secret again once
+-- prepaid. The flag means nothing while paying Meta directly; going prepaid re-checks it.
+UPDATE channels SET operator_verified = false
+  WHERE provider = 'cloud_api' AND operator_verified
+    AND workspace_id IN (SELECT id FROM workspaces WHERE billing_mode <> 'prepaid')
+    AND created_at < (SELECT applied_at FROM schema_migrations WHERE name = '004_hardening');
+-- Versions up to 850282e added the workspace's country code to 10-digit wa_ids (Singapore, Norway,
+-- Denmark...), storing the customer under another country's number: replies now go to the phone, so
+-- fix it back to the real number when no other contact holds it. Only a wa_id Meta reported: those
+-- versions also stored a national number typed into a sandbox simulation as the wa_id of the right phone.
+UPDATE contacts c SET phone = c.wa_id, updated_at = now()
+  FROM workspaces w
+  WHERE w.id = c.workspace_id AND c.wa_id ~ '^[0-9]{10}$' AND c.phone = w.default_country_code || c.wa_id
+    AND EXISTS (SELECT 1 FROM messages m JOIN channels ch ON ch.id = m.channel_id
+                WHERE m.contact_id = c.id AND ch.provider = 'cloud_api' AND (m.direction = 'in' OR m.sent_by = 'phone'))
+    AND NOT EXISTS (SELECT 1 FROM messages m JOIN channels ch ON ch.id = m.channel_id
+                    WHERE m.contact_id = c.id AND ch.provider = 'sandbox' AND m.direction = 'in')
+    AND NOT EXISTS (SELECT 1 FROM contacts o WHERE o.workspace_id = c.workspace_id AND o.phone = c.wa_id);
+-- Ledger entries are stamped in balance order (insertLedger sets clock_timestamp()); any other writer too.
+ALTER TABLE credit_ledger ALTER COLUMN created_at SET DEFAULT clock_timestamp();
+-- Broadcasts cancelled by earlier versions left recipients 'queued' (or 'sending', claimed by a run that
+-- died): settle them from the message each one got, as a cancel now does.
+UPDATE broadcast_recipients br
+  SET status = CASE WHEN m.id IS NULL THEN 'skipped' WHEN m.status = 'failed' THEN 'failed' ELSE 'sent' END,
+      message_id = m.id, claimed_at = NULL, processed_at = COALESCE(br.processed_at, now())
+  FROM broadcast_recipients r
+  JOIN broadcasts b ON b.id = r.broadcast_id AND b.status = 'cancelled'
+  LEFT JOIN LATERAL (
+    SELECT id, status FROM messages
+    WHERE broadcast_id = r.broadcast_id AND contact_id = r.contact_id AND NOT (status = 'failed' AND wamid IS NULL)
+    ORDER BY created_at DESC LIMIT 1
+  ) m ON true
+  WHERE br.id = r.id AND br.message_id IS NULL
+    AND (br.status = 'queued' OR (br.status = 'sending' AND br.claimed_at < now() - interval '10 minutes'));
+-- Funnel teams kept the ids of members removed from the workspace (removing one now drops it).
+UPDATE funnels f SET assignee_ids = ARRAY(
+    SELECT u FROM unnest(f.assignee_ids) AS u
+    WHERE EXISTS (SELECT 1 FROM memberships m WHERE m.workspace_id = f.workspace_id AND m.user_id = u))
+  WHERE EXISTS (SELECT 1 FROM unnest(f.assignee_ids) AS u
+    WHERE NOT EXISTS (SELECT 1 FROM memberships m WHERE m.workspace_id = f.workspace_id AND m.user_id = u));
+-- Fair claims find the workspaces with ready jobs here instead of walking every workspace with a
+-- queued job (one due in a year cost each claim as much as one due now): a row each time a job of a
+-- workspace becomes claimable (enqueued, retried, let through by its serial key, moved earlier), at
+-- its run_at. Claims fold the rows already due (Worker.claimFair).
+CREATE TABLE IF NOT EXISTS job_wakeups (
+  id bigserial PRIMARY KEY,
+  lane text NOT NULL,
+  workspace_id uuid NOT NULL,
+  run_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS job_wakeups_due ON job_wakeups (lane, run_at, id);
+CREATE OR REPLACE FUNCTION job_wakeup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO job_wakeups (lane, workspace_id, run_at) VALUES (NEW.lane, NEW.workspace_id, NEW.run_at); RETURN NULL; END $$;
+DROP TRIGGER IF EXISTS jobs_wakeup_insert ON jobs;
+CREATE TRIGGER jobs_wakeup_insert AFTER INSERT ON jobs FOR EACH ROW
+  WHEN (NEW.status = 'queued' AND NOT NEW.held AND NEW.workspace_id IS NOT NULL)
+  EXECUTE FUNCTION job_wakeup();
+DROP TRIGGER IF EXISTS jobs_wakeup_update ON jobs;
+CREATE TRIGGER jobs_wakeup_update AFTER UPDATE ON jobs FOR EACH ROW
+  WHEN (NEW.status = 'queued' AND NOT NEW.held AND NEW.workspace_id IS NOT NULL
+        AND (OLD.status <> 'queued' OR OLD.held OR NEW.run_at < OLD.run_at OR NEW.lane <> OLD.lane
+             OR OLD.workspace_id IS DISTINCT FROM NEW.workspace_id))
+  EXECUTE FUNCTION job_wakeup();
+INSERT INTO job_wakeups (lane, workspace_id, run_at)
+  SELECT lane, workspace_id, min(run_at) FROM jobs
+  WHERE status = 'queued' AND NOT held AND workspace_id IS NOT NULL
+  GROUP BY lane, workspace_id;
+-- Every claim deletes the wakeups it folds: vacuumed after a thousand of them, not a fifth of the table.
+ALTER TABLE job_wakeups SET (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);
+`;
+
 export const migrations: { name: string; sql: string }[] = [
   { name: '001_init', sql: init },
   { name: '002_rate_card_seed', sql: seedRates },
@@ -501,4 +574,5 @@ export const migrations: { name: string; sql: string }[] = [
   { name: '004_hardening', sql: hardening },
   { name: '005_review_three', sql: reviewThree },
   { name: '006_review_four', sql: reviewFour },
+  { name: '007_review_five', sql: reviewFive },
 ];

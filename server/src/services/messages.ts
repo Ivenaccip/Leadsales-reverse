@@ -92,6 +92,88 @@ export async function abandonAutoRetry(ctx: AppContext, where: { messageId: stri
   }
 }
 
+/** Graph's error_subcode of a send error (kept by the provider as `subcode`, or in the error it passed as details). */
+function metaSubcode(err: unknown): number | null {
+  if (!(err instanceof MetaApiError)) return null;
+  const own = (err as { subcode?: unknown }).subcode;
+  const v = typeof own === 'number' ? own : (err.details as { error_subcode?: unknown } | undefined)?.error_subcode;
+  return typeof v === 'number' ? v : null;
+}
+
+/**
+ * Graph's "object with ID … does not exist, cannot be loaded due to missing permissions" (code 100,
+ * subcode 33). On POST /{phone-number-id}/messages that object is the sending number itself (deleted,
+ * moved to another account, or the token lost access to it), so it never depends on the recipient.
+ */
+export function isNumberUnreachable(code: number | null | undefined, subcode: number | null | undefined): boolean {
+  return code === 100 && subcode === 33;
+}
+
+const NUMBER_UNREACHABLE =
+  'Meta no encuentra este número de WhatsApp o el token ya no tiene acceso a él (se eliminó, se movió a otra cuenta o se quitaron los permisos). Revisa Ajustes → Canales.';
+
+/** explainMetaError, which knows codes only: code 100 alone ("invalid parameter") would hide that the number is unreachable. */
+function explainSendError(code: number | null, subcode: number | null, detail: string): string {
+  if (!isNumberUnreachable(code, subcode)) return explainMetaError(code, detail);
+  const d = detail.trim().slice(0, 500);
+  return d ? `${NUMBER_UNREACHABLE} Detalle de Meta: ${d}` : NUMBER_UNREACHABLE;
+}
+
+/** Longest header media link and document name a template send takes. Every send stores its params, a broadcast once per recipient. */
+export const MAX_MEDIA_LINK = 2000;
+export const MAX_MEDIA_FILENAME = 240;
+
+/** Refuses a template header whose media link or file name is longer than any real one (see MAX_MEDIA_LINK). */
+export function checkMediaHeader(header: { type: string; link?: string; filename?: string } | null | undefined): void {
+  if (!header || (header.type !== 'image' && header.type !== 'video' && header.type !== 'document')) return;
+  if ((header.link?.length ?? 0) > MAX_MEDIA_LINK) {
+    throw badRequest(`El enlace del archivo del encabezado admite como máximo ${MAX_MEDIA_LINK} caracteres.`, 'TEMPLATE_PARAMS_INVALID');
+  }
+  if ((header.filename?.length ?? 0) > MAX_MEDIA_FILENAME) {
+    throw badRequest(`El nombre del documento del encabezado admite como máximo ${MAX_MEDIA_FILENAME} caracteres.`, 'TEMPLATE_PARAMS_INVALID');
+  }
+}
+
+/** A conversation whose number was deleted: it is never answered from another number nobody chose. */
+export const CONVERSATION_NUMBER_GONE =
+  'Se eliminó el número de WhatsApp de esta conversación y no se le responde al cliente desde otro número que nadie eligió (tampoco desde el número de pruebas). El mensaje no se envió: vuelve a conectar ese número en Ajustes → Canales o espera a que el cliente vuelva a escribir.';
+const CONVERSATION_NUMBER_AMBIGUOUS =
+  'Se eliminó el número de WhatsApp de esta conversación y después se conectó más de un número, así que no se sabe desde cuál responderle al cliente. El mensaje no se envió: espera a que el cliente vuelva a escribir (su mensaje une la conversación al número al que escribió).';
+
+/**
+ * The number that sends to a contact when the caller chose none: the one its conversation is on.
+ * A contact bound to none (contacts.channel_id NULL) is told apart by its latest message. No message:
+ * it never talked, so the default number. A message on a number: that one, which never bound it (a
+ * reply typed in the WhatsApp Business app, a WhatsApp notice). A message with no number: that number
+ * was deleted (ON DELETE SET NULL), and the default would be another business line or the sandbox,
+ * whose simulated ticks show as delivered what never reached the customer. Only a number connected
+ * after that message stands in, and only when it is the only one: the same number connected again,
+ * or the one that replaced it. One already connected then is surely another line (a number is in one
+ * channel at a time); with several, nobody chose. The sandbox never answers a real customer.
+ * Returns null for the default number; throws NO_CHANNEL when no number can be told to be its own.
+ */
+export async function sendingChannelId(
+  q: Queryable,
+  workspaceId: string,
+  contact: { id: string; channel_id: string | null },
+  chosen?: string | null,
+): Promise<string | null> {
+  if (chosen || contact.channel_id) return chosen || contact.channel_id;
+  const { rows } = await q.query<{ channel_id: string | null; since: string[] | null }>(
+    `SELECT m.channel_id, CASE WHEN m.channel_id IS NULL THEN ARRAY(
+       SELECT ch.id FROM channels ch WHERE ch.workspace_id = $2 AND ch.provider <> 'sandbox' AND ch.created_at > m.created_at ORDER BY ch.created_at LIMIT 2
+     ) END AS since
+     FROM messages m WHERE m.contact_id = $1 AND m.direction IN ('in', 'out') ORDER BY m.created_at DESC LIMIT 1`,
+    [contact.id, workspaceId],
+  );
+  const m = rows[0];
+  if (!m) return null;
+  if (m.channel_id) return m.channel_id;
+  const since = m.since ?? [];
+  if (since.length === 1) return since[0];
+  throw new AppError(400, 'NO_CHANNEL', since.length ? CONVERSATION_NUMBER_AMBIGUOUS : CONVERSATION_NUMBER_GONE);
+}
+
 /** Meta's own explanation of a send error: its message plus error_data.details when that adds something. */
 function metaDetail(err: unknown): string | null {
   if (!(err instanceof Error)) return null;
@@ -167,19 +249,20 @@ export async function getMessage(ctx: AppContext, workspaceId: string, id: strin
  * the charge is kept and nothing is resent automatically (settleStaleSends ends it).
  */
 export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<MessageRow> {
-  const ws = await ctx.db.query<{ is_active: boolean; billing_mode: string }>(`SELECT is_active, billing_mode FROM workspaces WHERE id = $1`, [
-    o.workspaceId,
-  ]);
+  const ws = await ctx.db.query<{ is_active: boolean; billing_mode: string; default_country_code: string }>(
+    `SELECT is_active, billing_mode, default_country_code FROM workspaces WHERE id = $1`,
+    [o.workspaceId],
+  );
   if (!ws.rows[0]?.is_active) throw new AppError(403, 'WORKSPACE_SUSPENDED', 'Este espacio de trabajo está suspendido');
   // Who pays is fixed at send time (messages.charged_prepaid): refunds and Meta adjustments
   // follow it, so a later billing_mode switch can neither create nor lose credits.
   const prepaid = ws.rows[0].billing_mode === 'prepaid';
   const contact = await getContact(ctx.db, o.workspaceId, o.contactId);
-  const channel = await getChannel(ctx.db, o.workspaceId, o.channelId ?? contact.channel_id);
+  const channel = await getChannel(ctx.db, o.workspaceId, await sendingChannelId(ctx.db, o.workspaceId, contact, o.channelId));
   const provider = providerFor(ctx, channel);
   const c = o.content;
   // The number this message goes to, and is priced by (Meta bills the market of the number it delivers to).
-  const to = deliveryNumber(contact.phone, contact.wa_id);
+  const to = deliveryNumber(contact.phone, contact.wa_id, ws.rows[0].default_country_code);
 
   if (c.type !== 'template' && !isWindowOpen(contact.last_inbound_at)) {
     throw new AppError(
@@ -227,6 +310,7 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
       break;
     }
     case 'template': {
+      checkMediaHeader(c.params?.header);
       const tpl = await findTemplate(ctx.db, channel.id, c.name, c.language);
       if (tpl && tpl.status !== 'APPROVED') {
         throw badRequest(`La plantilla "${c.name}" no está aprobada por Meta (estado: ${tpl.status})`, 'TEMPLATE_NOT_APPROVED');
@@ -252,7 +336,7 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
   const humanTakeover = o.sentBy === 'user';
   let reused = false;
 
-  const msg = await ctx.db.tx(async (q) => {
+  const stored = await ctx.db.tx(async (q) => {
     // The channel row comes first, in the order DELETE /api/channels takes them (the channel, then
     // its contacts and messages through ON DELETE SET NULL): locking the contact first, the message
     // INSERT's foreign-key check on the channel would deadlock with that delete on PostgreSQL.
@@ -326,9 +410,13 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
       [contact.id, previewFor(type, body), humanTakeover, channel.id, reused],
     );
     if (o.onCreated) await o.onCreated(q, m);
-    return m;
+    return { m, fresh: await getContact(q, o.workspaceId, contact.id) };
   });
+  const msg = stored.m;
   ctx.realtime.emit(o.workspaceId, reused ? 'message:update' : 'message:new', msg);
+  // The conversation moved to the top: other inboxes place it from this, also when it is not among
+  // the pages they loaded (a message event only moves conversations a tab already has).
+  if (!reused) ctx.realtime.emit(o.workspaceId, 'contact:update', stored.fresh);
   if (cost > 0) notifyCredits(ctx, o.workspaceId);
 
   // Meta echoes biz_opaque_callback_data in the status webhooks of every message type: if the answer
@@ -361,6 +449,8 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
          WHERE id = $1`,
         [contact.id, final.created_at, previewFor(type, body)],
       );
+      const fresh = await getContact(ctx.db, o.workspaceId, contact.id).catch(() => null);
+      if (fresh) ctx.realtime.emit(o.workspaceId, 'contact:update', fresh);
     }
     // Replies come from the WhatsApp id Meta resolved, which can differ from the typed number
     // (Brazil's 9th digit, Argentina's 9): remember it so inbound matching finds this contact.
@@ -403,6 +493,7 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
     final = rows[0] ?? (await ctx.db.query<MessageRow>(`SELECT * FROM messages WHERE id = $1`, [msg.id])).rows[0];
   } else {
     const code = sendError instanceof MetaApiError ? sendError.code : null;
+    const subcode = metaSubcode(sendError);
     // Nothing reached Meta: callers that send on their own (broadcasts, scheduled) retry these later.
     const network = !(sendError instanceof MetaApiError) && isDefinitiveSendFailure(sendError);
     const cause = (sendError as { cause?: { code?: unknown } } | null)?.cause?.code;
@@ -419,10 +510,11 @@ export async function sendMessage(ctx: AppContext, o: SendOptions): Promise<Mess
         }
       : {
           code,
+          ...(subcode != null ? { subcode } : {}),
           title: sendError?.message ?? 'Error',
           message: autoRetry
             ? `Meta limitó la velocidad de envío de este número, así que el mensaje todavía no se envió. ${RETRY_NOTE}`
-            : explainMetaError(code, metaDetail(sendError) ?? 'No se pudo enviar el mensaje'),
+            : explainSendError(code, subcode, metaDetail(sendError) ?? 'No se pudo enviar el mensaje'),
         };
     if (autoRetry) error.auto_retry = true;
     ctx.log.warn({ err: sendError?.message, code, contactId: contact.id }, 'send failed');

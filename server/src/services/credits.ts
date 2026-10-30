@@ -109,10 +109,16 @@ export async function topup(q: Queryable, workspaceId: string, amount: number, o
   return rows[0].credit_balance;
 }
 
+/**
+ * Runs right after the UPDATE of the workspace's balance, whose row lock is held until commit: stamped
+ * with clock_timestamp() (the time of this insert), entries follow the order in which the balance
+ * changed. now() is when the transaction began: one that waited on a lock (a contact busy with
+ * another send, a message being stored) would be listed before balances it came after.
+ */
 async function insertLedger(q: Queryable, workspaceId: string, amount: number, balanceAfter: number, kind: string, o: LedgerOpts) {
   await q.query(
-    `INSERT INTO credit_ledger (workspace_id, amount, balance_after, kind, description, message_id, broadcast_id, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    `INSERT INTO credit_ledger (workspace_id, amount, balance_after, kind, description, message_id, broadcast_id, created_by, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp())`,
     [workspaceId, amount, balanceAfter, kind, o.description ?? null, o.messageId ?? null, o.broadcastId ?? null, o.userId ?? null],
   );
 }

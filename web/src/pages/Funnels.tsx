@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, type DragEvent } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowDown, ArrowUp, KanbanSquare, MessageCircle, Plus, Search, Settings2, Trash2, Trophy, XCircle } from 'lucide-react';
+import { ArrowDown, ArrowUp, KanbanSquare, MessageCircle, Plus, Search, Settings2, Trash2, Trophy, X, XCircle } from 'lucide-react';
 import { api, errorMessage, qs } from '../lib/api';
 import { useFunnels, useMembers, useTags } from '../lib/queries';
 import { useRealtime } from '../lib/realtime';
@@ -54,7 +54,8 @@ export default function FunnelsPage() {
   const [showCreate, setShowCreate] = useState(false);
   const debouncedSearch = useDebounced(search, 350);
   const tags = useTags().data ?? [];
-  const members = useMembers().data ?? [];
+  const membersQ = useMembers();
+  const members = membersQ.data ?? [];
 
   if (funnelsQ.isLoading) return <PageLoader />;
   if (!funnel) {
@@ -123,7 +124,9 @@ export default function FunnelsPage() {
         </div>
       </div>
       <KanbanBoard funnel={funnel} search={debouncedSearch} tagId={tagId} assigned={assigned} tags={tags} members={members} />
-      {showSettings && <FunnelSettingsModal funnel={funnel} funnels={funnels} members={members} onClose={() => setShowSettings(false)} />}
+      {showSettings && (
+        <FunnelSettingsModal funnel={funnel} funnels={funnels} members={members} membersLoaded={membersQ.isSuccess} onClose={() => setShowSettings(false)} />
+      )}
       {showCreate && (
         <CreateFunnelModal
           onClose={() => setShowCreate(false)}
@@ -355,7 +358,96 @@ function CreateFunnelModal({ onClose, onCreated }: { onClose: () => void; onCrea
   );
 }
 
-function FunnelSettingsModal({ funnel, funnels, members, onClose }: { funnel: Funnel; funnels: Funnel[]; members: Member[]; onClose: () => void }) {
+/**
+ * The funnel's team as chips. Its saved ids can point to members deactivated or removed since: they
+ * never get leads, but they are still in the team (and a deactivated one is back in it if reactivated),
+ * so they are shown, marked, and can be taken out. Hiding them would show "nobody chosen" for a team
+ * that is not empty, with no way to empty it.
+ */
+export function funnelTeamView(team: string[], members: Member[], membersLoaded: boolean) {
+  const active = members.filter((m) => m.is_active);
+  const stale = membersLoaded
+    ? team
+        .filter((id) => !active.some((m) => m.id === id))
+        .map((id) => {
+          const m = members.find((x) => x.id === id);
+          return { id, label: m ? `${m.name} (inactivo)` : 'Miembro eliminado' };
+        })
+    : [];
+  return {
+    chips: active.map((m) => ({ member: m, on: team.includes(m.id) })),
+    stale,
+    // The server then ignores the team: every active member who receives leads takes part.
+    noneActive: membersLoaded && team.length > 0 && !active.some((m) => team.includes(m.id)),
+  };
+}
+
+export function FunnelTeamPicker({
+  team,
+  members,
+  membersLoaded,
+  onChange,
+}: {
+  team: string[];
+  members: Member[];
+  membersLoaded: boolean;
+  onChange: (team: string[]) => void;
+}) {
+  const view = funnelTeamView(team, members, membersLoaded);
+  return (
+    <div className="space-y-2">
+      <p className="text-sm font-medium text-slate-700">Equipo del embudo</p>
+      <p className="text-xs text-slate-500">Si no eliges a nadie, participan todos los miembros que reciben leads.</p>
+      <div className="flex flex-wrap gap-1.5">
+        {view.chips.map(({ member: m, on }) => (
+          <button
+            key={m.id}
+            type="button"
+            onClick={() => onChange(on ? team.filter((x) => x !== m.id) : [...team, m.id])}
+            className={cx(
+              'flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium',
+              on ? 'border-brand-600 bg-brand-600 text-white' : 'border-slate-300 bg-white text-slate-600 hover:bg-slate-50',
+            )}
+          >
+            {m.name}
+          </button>
+        ))}
+        {view.stale.map((x) => (
+          <button
+            key={x.id}
+            type="button"
+            title="Quitar del equipo"
+            onClick={() => onChange(team.filter((id) => id !== x.id))}
+            className="flex items-center gap-1 rounded-full border border-dashed border-amber-400 bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-800 hover:bg-amber-100"
+          >
+            {x.label} <X className="h-3 w-3" />
+          </button>
+        ))}
+      </div>
+      {view.stale.length > 0 && (
+        <p className="text-xs text-amber-700">
+          {view.noneActive
+            ? 'Nadie del equipo elegido sigue activo, así que participan todos los miembros que reciben leads. Quita a los inactivos o elige a otros.'
+            : 'Los miembros inactivos o eliminados no reciben leads. Quítalos del equipo si ya no deben participar.'}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function FunnelSettingsModal({
+  funnel,
+  funnels,
+  members,
+  membersLoaded,
+  onClose,
+}: {
+  funnel: Funnel;
+  funnels: Funnel[];
+  members: Member[];
+  membersLoaded: boolean;
+  onClose: () => void;
+}) {
   const qc = useQueryClient();
   const toast = useToast();
   const confirm = useConfirm();
@@ -431,30 +523,7 @@ function FunnelSettingsModal({ funnel, funnels, members, onClose }: { funnel: Fu
             label="Asignación automática"
             description="Reparte leads nuevos en round-robin entre el equipo de este embudo (solo miembros activos que reciben leads)."
           />
-          <div className="space-y-2">
-            <p className="text-sm font-medium text-slate-700">Equipo del embudo</p>
-            <p className="text-xs text-slate-500">Si no eliges a nadie, participan todos los miembros que reciben leads.</p>
-            <div className="flex flex-wrap gap-1.5">
-              {members
-                .filter((m) => m.is_active)
-                .map((m) => {
-                  const on = team.includes(m.id);
-                  return (
-                    <button
-                      key={m.id}
-                      type="button"
-                      onClick={() => setTeam(on ? team.filter((x) => x !== m.id) : [...team, m.id])}
-                      className={cx(
-                        'flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium',
-                        on ? 'border-brand-600 bg-brand-600 text-white' : 'border-slate-300 bg-white text-slate-600 hover:bg-slate-50',
-                      )}
-                    >
-                      {m.name}
-                    </button>
-                  );
-                })}
-            </div>
-          </div>
+          <FunnelTeamPicker team={team} members={members} membersLoaded={membersLoaded} onChange={setTeam} />
           <div className="flex flex-wrap gap-2">
             <Button onClick={save} loading={saving} disabled={!name.trim()}>
               Guardar cambios

@@ -201,8 +201,8 @@ function CustomFields({ fields, onSave }: { fields: Record<string, unknown>; onS
       ))}
       {adding ? (
         <div className="space-y-2 rounded-lg bg-slate-50 p-2">
-          <Input className="h-8" placeholder="Campo (ej. ciudad)" value={key} onChange={(e) => setKey(e.target.value)} autoFocus />
-          <Input className="h-8" placeholder="Valor" value={val} onChange={(e) => setVal(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && void add()} />
+          <Input className="h-8" placeholder="Campo (ej. ciudad)" maxLength={100} value={key} onChange={(e) => setKey(e.target.value)} autoFocus />
+          <Input className="h-8" placeholder="Valor" maxLength={1000} value={val} onChange={(e) => setVal(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && void add()} />
           <div className="flex justify-end gap-2">
             <Button size="sm" variant="ghost" onClick={() => setAdding(false)}>
               Cancelar

@@ -5,10 +5,10 @@ import { randomToken, sha256Hex } from '../lib/crypto.js';
 import { AppError, badRequest, notFound } from '../lib/errors.js';
 import { normalizePhone } from '../lib/phone.js';
 import { renderPlaceholders } from '../services/broadcasts.js';
-import { CONTACT_COLUMNS, createContact, updateContact, type Contact } from '../services/contacts.js';
+import { CONTACT_COLUMNS, createContact, customFieldsSchema, customFieldsTooBig, updateContact, type Contact } from '../services/contacts.js';
 import { WEBHOOK_EVENTS } from '../services/events.js';
 import { getWorkspace, sendMessage } from '../services/messages.js';
-import { listFunnels, TAG_NAME_MAX, TAG_SEPARATORS } from './crm.js';
+import { createTagsByName, listFunnels, MAX_TAGS_PER_CONTACT, TAG_NAME_MAX, TAG_SEPARATORS } from './crm.js';
 import { ADMIN_ROLES, noContent, parse, requireApiKey, requireWs, uuid } from './helpers.js';
 
 const MAX_WEBHOOKS = 10;
@@ -139,31 +139,31 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
   /**
    * Tag ids by name, creating the missing ones. "VIP, Expo" means two tags, as in a CSV import:
    * names never contain ; , or | (they would not import back whole), except an existing tag
-   * created before that rule, which keeps matching by its exact name.
+   * created before that rule, which keeps matching by its exact name. A fixed number of queries
+   * whatever the input, and at most MAX_TAGS_PER_CONTACT names once split.
    */
   async function tagIdsByName(workspaceId: string, names: string[]): Promise<string[]> {
-    const wanted: string[] = [];
-    for (const raw of names.map((n) => n.trim()).filter(Boolean)) {
-      const existing = TAG_SEPARATORS.test(raw)
-        ? await ctx.db.query(`SELECT 1 FROM tags WHERE workspace_id = $1 AND name = $2`, [workspaceId, raw])
-        : null;
-      wanted.push(...(existing && !existing.rows[0] ? raw.split(TAG_SEPARATORS).map((n) => n.trim()).filter(Boolean) : [raw]));
+    const raws = [...new Set(names.map((n) => n.trim()).filter(Boolean))];
+    const joined = raws.filter((n) => TAG_SEPARATORS.test(n));
+    const legacy = new Set<string>();
+    if (joined.length) {
+      const { rows } = await ctx.db.query<{ name: string }>(`SELECT name FROM tags WHERE workspace_id = $1 AND name = ANY($2::text[])`, [workspaceId, joined]);
+      for (const r of rows) legacy.add(r.name);
     }
-    const ids: string[] = [];
-    for (const name of wanted) {
-      const found = await ctx.db.query<{ id: string }>(`SELECT id FROM tags WHERE workspace_id = $1 AND name = $2`, [workspaceId, name]);
-      if (found.rows[0]) {
-        ids.push(found.rows[0].id);
-        continue;
-      }
-      if (name.length > TAG_NAME_MAX) throw badRequest(`La etiqueta "${name.slice(0, 60)}…" supera ${TAG_NAME_MAX} caracteres`);
-      const t = await ctx.db.query<{ id: string }>(
-        `INSERT INTO tags (workspace_id, name) VALUES ($1, $2) ON CONFLICT (workspace_id, name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
-        [workspaceId, name],
-      );
-      ids.push(t.rows[0].id);
-    }
-    return ids;
+    const wanted = [
+      ...new Set(raws.flatMap((raw) => (TAG_SEPARATORS.test(raw) && !legacy.has(raw) ? raw.split(TAG_SEPARATORS).map((n) => n.trim()).filter(Boolean) : [raw]))),
+    ];
+    if (wanted.length > MAX_TAGS_PER_CONTACT) throw badRequest(`Máximo ${MAX_TAGS_PER_CONTACT} etiquetas por contacto`, 'TOO_MANY_TAGS');
+    const { rows } = await ctx.db.query<{ id: string; name: string }>(`SELECT id, name FROM tags WHERE workspace_id = $1 AND name = ANY($2::text[])`, [
+      workspaceId,
+      wanted,
+    ]);
+    const ids = new Map(rows.map((r) => [r.name, r.id]));
+    const missing = wanted.filter((n) => !ids.has(n));
+    const long = missing.find((n) => n.length > TAG_NAME_MAX);
+    if (long) throw badRequest(`La etiqueta "${long.slice(0, 60)}…" supera ${TAG_NAME_MAX} caracteres`);
+    for (const [name, id] of await createTagsByName(ctx.db, workspaceId, missing)) ids.set(name, id);
+    return wanted.map((n) => ids.get(n)!);
   }
 
   app.get('/api/v1/funnels', async (req) => {
@@ -185,8 +185,8 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
     email: z.string().trim().email().optional(),
     company: z.string().trim().max(120).optional(),
     deal_value: z.number().min(0).optional(),
-    custom_fields: z.record(z.string(), z.any()).optional(),
-    tags: z.array(z.string().max(1000)).max(50).optional(),
+    custom_fields: customFieldsSchema.optional(),
+    tags: z.array(z.string().max(1000)).max(MAX_TAGS_PER_CONTACT).optional(),
     funnel: z.string().max(200).optional(),
     stage: z.string().max(200).optional(),
     source: z.string().max(40).optional(),
@@ -209,12 +209,16 @@ export async function integrationRoutes(app: FastifyInstance, ctx: AppContext) {
       ...placement,
     });
     if (created) return { contact, created };
+    // Merged into the stored fields: the whole result stays within the same limits.
+    const customFields = body.custom_fields ? { ...contact.custom_fields, ...body.custom_fields } : undefined;
+    const tooBig = customFields && customFieldsTooBig(customFields);
+    if (tooBig) throw badRequest(tooBig, 'INVALID_CUSTOM_FIELDS');
     const updated = await updateContact(ctx, k.workspaceId, contact.id, {
       name: body.name ?? undefined,
       email: body.email ?? undefined,
       company: body.company ?? undefined,
       dealValue: body.deal_value,
-      customFields: body.custom_fields ? { ...contact.custom_fields, ...body.custom_fields } : undefined,
+      customFields,
       addTagIds: tagIds,
       stageId: placement.stageId,
       funnelId: placement.funnelId,

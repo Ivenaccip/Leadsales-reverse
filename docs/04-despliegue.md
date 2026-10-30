@@ -147,6 +147,50 @@ Si vienes de una versión sin la migración `006_review_four` (por ejemplo `ef96
 - **Administración de la instancia:** dar o quitar el rol de administrador de la instancia
   y poner una contraseña temporal a una cuenta ahora piden tu contraseña actual.
 
+Si vienes de una versión sin la migración `007_review_five` (por ejemplo `2577b37`):
+
+- **Números "verificados" en espacios que hoy pagan directo a Meta.** La `006` solo
+  desmarcó los números que la `004` dio por verificados en espacios que *en ese momento*
+  eran prepagados. La `007` desmarca también los de espacios que hoy no son prepagados
+  (los conectados antes de aplicar la `004`): mientras el negocio paga a Meta la marca no
+  cambia nada, pero si después pasas uno de esos espacios a prepagado, sus números se
+  desactivan hasta que los verifiques (ver "Verificar los números de espacios
+  prepagados").
+- **Contactos guardados con el número de otro país.** Las versiones hasta `850282e`
+  ponían la lada del espacio delante de los `wa_id` de 10 dígitos (Singapur, Noruega,
+  Dinamarca…), así que el cliente quedaba con un número que no es el suyo. La `007` le
+  devuelve su número real, salvo que otro contacto del mismo espacio ya lo tenga (ese caso
+  queda como estaba: fusiónalos a mano si hace falta). Solo se corrigen los números que
+  vinieron de Meta (mensajes recibidos por un número de la Cloud API), no los escritos en
+  una simulación del sandbox. Los que no se corrigen igual reciben las respuestas en su
+  número real.
+- **Cola de trabajos.** La `007` agrega la tabla `job_wakeups` y un trigger sobre `jobs`
+  con los que el worker encuentra los espacios con trabajos listos. No requiere nada de tu
+  parte; si vuelves a una versión anterior, borra los triggers `jobs_wakeup_insert` y
+  `jobs_wakeup_update` (la versión anterior no lee esa tabla y crecería sin límite).
+- **Limpiezas de datos.** La `007` también termina los destinatarios que quedaron "En
+  cola" en difusiones canceladas, quita de los equipos de los embudos a los miembros que
+  ya no están en el espacio y hace que el historial de créditos se ordene siempre como
+  cambió el saldo.
+- **Sesiones.** Una sesión dura 30 días desde que se abrió también en el servidor, no solo
+  en la cookie: quien inició sesión hace más de 30 días la vuelve a iniciar, y un socket
+  abierto se desconecta cuando su sesión vence. Cambiar la contraseña ahora renueva también
+  la sesión desde la que se cambia (el navegador recibe una cookie nueva y sus pestañas se
+  reconectan solas), así que una copia de la cookie anterior deja de funcionar.
+- **Números sin registrar en la Cloud API.** Conectar un número (o cambiarle el token o la
+  WABA) se rechaza si Meta dice que no está registrado en la Cloud API, y **Probar
+  conexión** lo avisa en los números ya conectados. Si un número tuyo lo muestra, regístralo
+  como se explica en el paso 2 de `03-conectar-whatsapp-meta.md`: hasta entonces todos sus
+  envíos fallan con el error `133010`.
+- **Campos personalizados, etiquetas e importación.** Los campos personalizados de un
+  contacto tienen límites (100 campos, nombres de hasta 100 caracteres, valores de hasta
+  1,000, 64 KB en total; ver `06-api.md`) en la bandeja, la API y la importación CSV. Los
+  contactos que ya los pasaban los conservan, pero al editarlos hay que quedar dentro. Un
+  contacto recibe hasta 50 etiquetas por petición o por fila importada, y un espacio tiene
+  como máximo 2,000 etiquetas (uno que ya tenía más las conserva, pero no crea otras hasta
+  quedar debajo). La exportación CSV se envía por partes, ahora ordenada por teléfono, sin
+  detener la instancia aunque el espacio sea grande.
+
 #### Verificar los números de espacios prepagados
 
 Para cada número desactivado, abre el espacio (**Administración → Abrir**) y, en
@@ -276,10 +320,13 @@ npm run typecheck
   contraseña responden `503` al instante. Una avalancha de intentos desde muchas redes
   solo hace esperar a quienes inician sesión; el resto de la instancia (bandeja, sockets,
   webhooks de Meta, trabajos) sigue respondiendo.
-- Sesiones revocables: cada inicio de sesión es una fila en `sessions`. Cerrar sesión la
-  revoca; cambiar la contraseña revoca todas las demás (una cookie robada deja de
-  funcionar); quitar o desactivar a alguien de su único espacio revoca todas. Los sockets
-  de esas sesiones reciben `session:revoked` y se desconectan. Las cookies anteriores a la
+- Sesiones revocables: cada inicio de sesión es una fila en `sessions` y dura 30 días,
+  lo mismo que su cookie. Cerrar sesión la revoca; cambiar la contraseña revoca todas,
+  también la actual, que sigue en ese navegador con una cookie nueva (una cookie robada,
+  aunque sea una copia de la de ese mismo navegador, deja de funcionar); quitar o
+  desactivar a alguien de su único espacio revoca todas. Los sockets de esas sesiones
+  reciben `session:revoked` y se desconectan, igual que los de una sesión que vence (un
+  socket abierto no la prolonga). Las cookies anteriores a la
   migración `004_hardening` dejan de servir (hay que iniciar sesión una vez). Cada sesión
   queda ligada a la versión de la contraseña: un inicio de sesión con la contraseña
   anterior que coincide con el cambio no sobrevive, y de dos cambios simultáneos solo gana
@@ -290,7 +337,9 @@ npm run typecheck
   Lo mismo piden, con el mismo límite, dar o quitar el rol de administrador de la
   instancia y ponerle una contraseña temporal a una cuenta: una sesión robada del
   operador no puede quitarle el rol a otro operador (para luego cambiarle la contraseña)
-  ni convertir en operador una cuenta suya.
+  ni convertir en operador una cuenta suya. Esos cambios se hacen de uno en uno y la
+  instancia siempre conserva un administrador, también con dos quitándose el rol uno al
+  otro al mismo tiempo.
 - Cada espacio conserva al menos un propietario activo: no se puede degradar, desactivar
   ni quitar al último (un propietario desactivado no cuenta), tampoco con dos propietarios
   quitándose uno al otro al mismo tiempo.
@@ -336,8 +385,13 @@ npm run typecheck
   navegador; el resto (SVG, HTML…) se descarga, con CSP `sandbox`. Se sirven por rangos de
   bytes (`206`), que Safari y el iPhone necesitan para reproducir video y audio.
 - Exportación CSV protegida contra inyección de fórmulas. La importación lee como máximo
-  200 columnas y 20,000 filas, y procesa el archivo por partes, cediendo el turno entre
-  ellas: un archivo grande de un negocio no congela la instancia para los demás.
+  200 columnas (de nombres de hasta 100 caracteres), 20,000 filas de hasta 256 KB y 50
+  etiquetas por fila (un espacio tiene hasta 2,000 etiquetas, que cada lista de etiquetas
+  carga completas), y procesa el archivo por partes, cediendo el turno entre ellas: un
+  archivo grande de un negocio no congela la instancia para los demás. La exportación
+  también se lee y se envía por partes. Los campos personalizados de un contacto tienen el
+  mismo límite (64 KB) venga de donde venga, así que ninguna petición infla la base ni
+  cada página de la bandeja.
 - Límite de intentos fallidos de inicio de sesión (15 min): 50 por red del cliente (una
   IPv6 /64 cuenta como una), 10 por red y cuenta, y 30 por cuenta desde cualquier lugar.
   Los límites por red y por cuenta no frenan a un navegador desde el que ya se inició

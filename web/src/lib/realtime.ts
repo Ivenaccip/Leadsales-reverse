@@ -23,6 +23,8 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempt = 0;
 /** Upper bounds of the (randomized) waits before reopening a socket whose handshake was refused. */
 export const RECONNECT_MS = [1000, 2000, 5000, 10_000, 30_000];
+/** Longest wait for the session reload a reconnect runs before joining (a hung request must not keep the tab out of its room). */
+export const RECONNECT_RELOAD_MAX_MS = 10_000;
 
 // Handlers live here, not on the socket, so they survive a socket being replaced (logout, new user).
 const listeners = new Map<string, Set<Listener>>();
@@ -31,8 +33,11 @@ type SessionHandlers = {
   revoked?: () => void;
   /** The handshake was refused as 'unauthorized': check the session (its 401 signs the tab out). */
   unauthorized?: () => Promise<unknown> | void;
-  /** Rights changed (or a join was refused): the tab's session (role, memberships) must be reloaded. */
-  refreshed?: () => void;
+  /**
+   * Rights changed (or a join was refused, or the socket reconnected): the tab's session (role,
+   * memberships) must be reloaded. A reconnect waits for the returned promise before joining.
+   */
+  refreshed?: () => Promise<unknown> | void;
 };
 let sessionHandlers: SessionHandlers = {};
 
@@ -44,16 +49,40 @@ function ensureSocket(): Socket {
   if (socket) return socket;
   const s = io({ path: '/socket.io', withCredentials: true, transports: ['websocket', 'polling'] });
   socket = s;
-  // A replaced socket (previous user) must never reach the handlers, even with buffered packets.
+  // False once this socket was connected or failed to connect: whatever the server sent meanwhile
+  // was lost, 'session:refresh' (a role, membership or operator change) included.
+  let fresh = true;
   s.onAny((event: string, data: unknown) => {
-    if (socket === s) dispatch(event, data);
+    // A replaced socket (previous user) must never reach the handlers, even with buffered packets.
+    // Nor may a workspace other than the one shown: after a switch, until the new join is confirmed
+    // (and while a refused one is retried), the socket can still be in the previous workspace's rooms.
+    // The re-join's resync refetches what was dropped meanwhile.
+    if (socket !== s || !joined || joined !== getWorkspaceId()) return;
+    const ws = (data as { workspace_id?: unknown } | null)?.workspace_id;
+    if (typeof ws === 'string' && ws !== joined) return;
+    dispatch(event, data);
   });
   s.on('connect', () => {
     if (socket !== s) return;
     clearReconnect();
     reconnectAttempt = 0;
     joined = null;
-    joinCurrent();
+    const missed = !fresh;
+    fresh = false;
+    if (!missed) return joinCurrent();
+    // A reconnect: rights may have changed while the socket was down, and that event is gone. The
+    // session is reloaded first, so the join (and the pages) use the workspace and role it has now.
+    const reload = sessionHandlers.refreshed?.();
+    if (!reload || typeof (reload as Promise<unknown>).then !== 'function') return joinCurrent();
+    let done = false;
+    const join = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (socket === s && s.connected) joinCurrent();
+    };
+    const timer = setTimeout(join, RECONNECT_RELOAD_MAX_MS);
+    (reload as Promise<unknown>).then(join, join);
   });
   // The server re-checks permissions (member removed, role or visibility changed, workspace
   // suspended, operator demoted): the socket re-joins and the session reloads the user's rights.
@@ -75,6 +104,7 @@ function ensureSocket(): Socket {
   // drops this socket. 'unavailable' (the server could not check, e.g. its database is restarting)
   // and a session the check still finds valid are simply retried.
   s.on('connect_error', (err: Error) => {
+    fresh = false;
     if (socket !== s || s.active) return;
     if (err?.message !== 'unauthorized') return scheduleReconnect(s);
     void Promise.resolve(sessionHandlers.unauthorized?.())

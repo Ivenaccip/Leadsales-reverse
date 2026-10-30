@@ -1,5 +1,5 @@
 import { memo } from 'react';
-import { AlertCircle, Check, CheckCheck, Clock, Download, FileText, ImageOff, Loader2, MapPin, StickyNote } from 'lucide-react';
+import { AlertCircle, Ban, Check, CheckCheck, Clock, Download, FileText, ImageOff, Loader2, MapPin, Pencil, StickyNote } from 'lucide-react';
 import { mediaUrl } from '../../lib/api';
 import type { Message } from '../../lib/types';
 import { cx } from '../ui';
@@ -188,6 +188,11 @@ export const MessageBubble = memo(function MessageBubble({ m, senderName }: { m:
   }
   const out = m.direction === 'out';
   const label = out ? (m.sent_by === 'user' ? senderName : SENT_BY_LABEL[m.sent_by ?? '']) : null;
+  // Changes made in WhatsApp (the customer's, or a reply edited in the Business app) update the
+  // original message: the text stays readable for the team's record, marked as such.
+  const deleted = !!m.payload?.deleted_at;
+  const edits: { body?: string | null }[] = Array.isArray(m.payload?.edits) ? m.payload.edits : [];
+  const edited = !deleted && !!m.payload?.edited_at;
   return (
     <div className={cx('flex', out ? 'justify-end' : 'justify-start')}>
       <div
@@ -204,8 +209,23 @@ export const MessageBubble = memo(function MessageBubble({ m, senderName }: { m:
             {m.type === 'template' && <span className="rounded bg-violet-100 px-1.5 py-px text-violet-700">Plantilla{m.payload?.name ? ` · ${m.payload.name}` : ''}</span>}
           </div>
         )}
-        <Content m={m} />
+        {deleted && (
+          <div className="mb-1 flex items-center gap-1 text-[11px] font-medium italic text-slate-500">
+            <Ban className="h-3 w-3" /> {out ? 'Mensaje eliminado' : 'El cliente eliminó este mensaje'}
+          </div>
+        )}
+        <div className={cx(deleted && 'opacity-50')}>
+          <Content m={m} />
+        </div>
         <div className="mt-1 flex items-center justify-end gap-1 text-[10px] text-slate-500">
+          {edited && (
+            <span
+              className="flex items-center gap-0.5 italic"
+              title={edits.length ? `Antes:\n${edits.map((e) => e.body ?? '').join('\n')}` : undefined}
+            >
+              <Pencil className="h-2.5 w-2.5" /> Editado
+            </span>
+          )}
           {out && m.cost > 0 && <span title="Costo estimado en Meta">${m.cost.toFixed(4)}</span>}
           <span>{timeOf(m.created_at)}</span>
           {out && <StatusIcon status={m.status} />}

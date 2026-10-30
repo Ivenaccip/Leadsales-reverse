@@ -29,6 +29,22 @@ intermediarios ni mensualidad.
 3. Copia:
    - **Identificador del número de teléfono** → `Phone Number ID`
    - **Identificador de la cuenta de WhatsApp Business** → `WABA ID`
+4. **Registra el número en la Cloud API.** Agregarlo y verificarlo no basta: hasta
+   registrarlo no puede enviar ni recibir mensajes por la API (cada envío falla con el
+   error `133010`, "Account not registered"), y solo se registra con una llamada a la API.
+   Elige un PIN de 6 dígitos: queda como la verificación en dos pasos del número (si ya
+   tiene una, usa ese PIN). Con el token temporal de esta misma página (o el permanente
+   del paso 3):
+
+   ```bash
+   curl -X POST "https://graph.facebook.com/v23.0/PHONE_NUMBER_ID/register" \
+     -H "Authorization: Bearer TU_TOKEN" -H "Content-Type: application/json" \
+     -d '{"messaging_product": "whatsapp", "pin": "123456"}'
+   ```
+
+   Debe responder `{"success": true}`. Meta limita los intentos (unos 10 cada 72 horas):
+   revisa el PIN antes de repetir. Un número que viene de la API local (On-Premises) o de
+   otro proveedor se migra primero a la Cloud API y luego se registra igual.
 
 > El número de prueba que Meta da por defecto solo puede escribir a 5 números
 > registrados; sirve para probar, no para vender.
@@ -56,8 +72,9 @@ nadie puede inyectar mensajes falsos.
 **Ajustes → Canales de WhatsApp → Conectar WhatsApp API oficial**, pega los 4 datos
 y pulsa **Verificar y conectar**. LeadLibre:
 
-- valida el número con Meta (`GET /{phone-number-id}`) y comprueba que pertenece a tu
-  cuenta (`GET /{waba-id}/phone_numbers`),
+- valida el número con Meta (`GET /{phone-number-id}`), comprueba que pertenece a tu
+  cuenta (`GET /{waba-id}/phone_numbers`) y que está registrado en la Cloud API
+  (`platform_type`: si no lo está, no lo conecta y te dice cómo registrarlo, paso 2),
 - suscribe tu app a la cuenta (`POST /{waba-id}/subscribed_apps`),
 - descarga tus plantillas (`GET /{waba-id}/message_templates`),
 - guarda el token y la clave **cifrados** (AES-256-GCM) en tu servidor.
@@ -98,6 +115,7 @@ que Meta reporta en cada webhook.
 | "El token de acceso expiró" | Usaste el token temporal. Genera uno de usuario del sistema (paso 3). |
 | No llegan mensajes | Webhook sin verificar, campo `messages` sin suscribir, URL sin HTTPS o app no suscrita (botón **Re-suscribir webhook**). |
 | Firma inválida en los logs | La clave secreta del canal no corresponde a la app que envía el webhook. |
+| "No está registrado en la Cloud API" al conectar o probar, o error 133010 al enviar | Falta registrar el número (paso 2, punto 4). |
 | Error 131047 al responder | Pasaron más de 24 h desde el último mensaje del cliente: usa una plantilla. |
 | Error 131030 | Estás usando el número de prueba de Meta y el destinatario no está en la lista permitida. |
 | Error 131042 | Problema con el método de pago en Meta. |

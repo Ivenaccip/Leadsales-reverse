@@ -76,8 +76,9 @@ export interface MessageRow {
   /**
    * network: the send failed before reaching Meta (DNS, connection, TLS), so nothing was sent and it may be retried.
    * auto_retry: the sender (broadcast, scheduled send) will retry it by itself, as this same row.
+   * subcode: Graph's error_subcode, which tells apart errors sharing a code (100 with 33: the number cannot be reached).
    */
-  error: { code?: number | null; title?: string; message?: string; network?: boolean; auto_retry?: boolean } | null;
+  error: { code?: number | null; subcode?: number | null; title?: string; message?: string; network?: boolean; auto_retry?: boolean } | null;
   sent_by: string | null;
   user_id: string | null;
   broadcast_id: string | null;
@@ -98,6 +99,8 @@ export interface BotState {
   path: string[];
   done?: boolean;
   updated_at?: string;
+  /** The customer message the bot last acted on: an older one delivered late changes nothing. */
+  last_in?: string;
 }
 
 export interface BotMenuOption {
@@ -114,6 +117,8 @@ export interface BotMenuOption {
 export interface BotMenu {
   prompt: string;
   options: BotMenuOption[];
+  /** Key the editor gives the next new option (never reuses a removed one); the bot does not read it. */
+  next_key?: number;
 }
 
 export interface WorkspaceSettings {

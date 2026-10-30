@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { FileText, MessagesSquare, SearchX, StickyNote, Zap } from 'lucide-react';
@@ -9,7 +9,15 @@ import type { Contact, Message } from '../lib/types';
 import { ChatView } from '../components/inbox/ChatView';
 import { ContactPanel, type ContactDetail } from '../components/inbox/ContactPanel';
 import { ConversationList } from '../components/inbox/ConversationList';
-import { findCachedContact, LIVE_QUERY, patchConversations, previewFor, removeConversations, upsertMessage } from '../components/inbox/helpers';
+import {
+  createOutboundWatch,
+  findCachedContact,
+  LIVE_QUERY,
+  patchConversations,
+  previewFor,
+  removeConversations,
+  upsertMessage,
+} from '../components/inbox/helpers';
 import { Button, cx, EmptyState, PageLoader, useToast } from '../components/ui';
 
 function NoChatSelected() {
@@ -63,12 +71,17 @@ export default function InboxPage() {
     }, 500);
   }
 
+  const [outbound] = useState(() => createOutboundWatch(() => void qc.invalidateQueries({ queryKey: ['conversations'] })));
+  useEffect(() => () => outbound.stop(), [outbound]);
+
   useRealtime<Contact>('contact:new', (c) => {
+    outbound.placed(c.id);
     patchConversations(qc, c, myId, true);
     refreshCounts();
   });
 
   useRealtime<Contact>('contact:update', (c) => {
+    outbound.placed(c.id);
     patchConversations(qc, c, myId, true);
     const cached = qc.getQueryData<ContactDetail>(['contact', c.id]);
     if (cached) {
@@ -93,10 +106,12 @@ export default function InboxPage() {
 
   useRealtime<Message>('message:new', (m) => {
     upsertMessage(qc, m);
-    // Inbound messages update the list through contact:update; outbound ones only emit message:new.
+    // Inbound messages update the list through contact:update; outbound ones are followed by one too,
+    // which places a conversation this tab does not have yet (a cached one moves at once).
     if (m.direction === 'out') {
       const c = findCachedContact(qc, m.contact_id);
       if (c) patchConversations(qc, { ...c, last_message_at: m.created_at, last_message_preview: previewFor(m.type, m.body) }, myId);
+      else outbound.sent(m.contact_id);
     }
   });
 

@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
+import type { Queryable } from '../db/index.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { assertSendableMedia, type MediaFile } from '../services/media.js';
 import { ADMIN_ROLES, noContent, parse, requireWs, uuid } from './helpers.js';
@@ -10,6 +11,53 @@ const color = z.string().regex(/^#[0-9a-fA-F]{6}$/, 'Color inválido (usa #RRGGB
 export const TAG_NAME_MAX = 40;
 /** Characters a CSV import splits a tags cell on: a name with one would not import back whole. */
 export const TAG_SEPARATORS = /[;,|]/;
+/** Tags one contact may get in one request (the public API, a CSV row): each one is work. */
+export const MAX_TAGS_PER_CONTACT = 50;
+/**
+ * Tags a workspace may hold: every tag list (inbox, contacts, each import) loads them all, so
+ * only this bounds what one import or a loop over the public API leaves behind.
+ */
+export const MAX_TAGS_PER_WORKSPACE = 2_000;
+
+export const tagLimitReached = () =>
+  badRequest(
+    `El espacio ya tiene el máximo de ${MAX_TAGS_PER_WORKSPACE.toLocaleString('en-US')} etiquetas: borra las que ya no uses para crear otras`,
+    'TAG_LIMIT_REACHED',
+  );
+
+/**
+ * Refuses creating the names that do not exist yet when the workspace would go over its cap.
+ * Not locked: requests running at once can each pass it, which overshoots by a few requests' tags.
+ */
+async function assertTagRoom(q: Queryable, workspaceId: string, names: string[]) {
+  const { rows } = await q.query<{ total: number; fresh: number }>(
+    `SELECT (SELECT count(*)::int FROM tags WHERE workspace_id = $1) AS total,
+       (SELECT count(*)::int FROM unnest($2::text[]) AS n
+        WHERE NOT EXISTS (SELECT 1 FROM tags t WHERE t.workspace_id = $1 AND t.name = n)) AS fresh`,
+    [workspaceId, names],
+  );
+  const { total, fresh } = rows[0];
+  if (fresh > 0 && total + fresh > MAX_TAGS_PER_WORKSPACE) throw tagLimitReached();
+}
+
+/**
+ * Creates the tags of these exact names that do not exist yet, all in one insert, and returns the
+ * id of each name (existing or new). TAG_LIMIT_REACHED when they do not fit in the workspace.
+ */
+export async function createTagsByName(q: Queryable, workspaceId: string, names: string[]): Promise<Map<string, string>> {
+  // Sorted: the statement locks its rows (new ones, and existing ones through DO UPDATE) in this
+  // order, so two requests creating the same names in another order cannot deadlock.
+  const unique = [...new Set(names)].sort();
+  if (!unique.length) return new Map();
+  await assertTagRoom(q, workspaceId, unique);
+  const { rows } = await q.query<{ id: string; name: string }>(
+    `INSERT INTO tags (workspace_id, name) SELECT $1, n FROM unnest($2::text[]) AS n
+     ON CONFLICT (workspace_id, name) DO UPDATE SET name = EXCLUDED.name RETURNING id, name`,
+    [workspaceId, unique],
+  );
+  return new Map(rows.map((r) => [r.name, r.id]));
+}
+
 export const tagName = z
   .string()
   .trim()
@@ -195,6 +243,7 @@ export async function crmRoutes(app: FastifyInstance, ctx: AppContext) {
   app.post('/api/tags', async (req) => {
     const a = await requireWs(ctx, req);
     const body = parse(z.object({ name: tagName, color: color.optional() }), req.body);
+    await assertTagRoom(ctx.db, a.workspaceId, [body.name]);
     // Creating a tag that already exists returns it unchanged: editing one (its color too) is
     // PATCH, for admins only. The no-op update only makes RETURNING give the existing row.
     const { rows } = await ctx.db.query(

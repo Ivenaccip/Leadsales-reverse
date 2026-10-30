@@ -6,6 +6,8 @@ import type { Role, User, Workspace, WorkspaceSummary } from './types';
 
 interface SessionValue {
   loading: boolean;
+  /** The session could not be loaded yet (server restarting, database down, no network): it keeps trying. */
+  reconnecting: boolean;
   user: User | null;
   workspaces: WorkspaceSummary[];
   /** The current workspace: a membership, or (instance operator only) any workspace opened from Administración. */
@@ -15,10 +17,31 @@ interface SessionValue {
   setSession: (s: { user: User; workspaces: WorkspaceSummary[] }) => void;
   switchWorkspace: (id: string, summary?: WorkspaceSummary) => void;
   refresh: () => Promise<void>;
+  /** Rejects (and keeps the session) when the server could not confirm it ended the session. */
   logout: () => Promise<void>;
 }
 
 const SessionContext = createContext<SessionValue | null>(null);
+
+/** Waits before loading the session again when the server could not answer. */
+export const SESSION_RETRY_MS = [1000, 2000, 5000, 10_000, 30_000];
+
+export const LOGOUT_FAILED = 'No se pudo cerrar la sesión. Revisa tu conexión e inténtalo de nuevo.';
+
+/**
+ * Every tab of the browser shares the session cookie: signing in (as anyone) or out in one tab
+ * changes who the others act as. A tab that signs in or out writes this key, and the others reload
+ * their session when it changes (the 'storage' event fires only in the other tabs).
+ */
+export const SESSION_SIGNAL_KEY = 'leadlibre.session';
+
+function signalOtherTabs(userId: string | null) {
+  try {
+    localStorage.setItem(SESSION_SIGNAL_KEY, `${userId ?? ''}:${Date.now()}:${Math.random().toString(36).slice(2)}`);
+  } catch {
+    /* storage unavailable */
+  }
+}
 
 /**
  * Cached queries and the realtime socket belong to the user who was signed in when they were
@@ -91,15 +114,24 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const qc = useQueryClient();
   const [client] = useState(() => createClientSession(qc));
   const [loading, setLoading] = useState(true);
+  const [reconnecting, setReconnecting] = useState(false);
   const [user, setUser] = useState<User | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [wsId, setWsId] = useState<string | null>(getWorkspaceId());
   const [foreign, setForeign] = useState<WorkspaceSummary | null>(null);
   // Only the latest /api/auth/me may be applied: rights can change several times in a row.
   const loadSeq = useRef(0);
+  // Whether the tab knows its session (a user, or signed out): until then a failed load is retried.
+  const known = useRef(false);
+  const retry = useRef<{ timer: ReturnType<typeof setTimeout> | null; attempt: number }>({ timer: null, attempt: 0 });
+  const stopRetry = useCallback(() => {
+    if (retry.current.timer) clearTimeout(retry.current.timer);
+    retry.current = { timer: null, attempt: 0 };
+  }, []);
 
   const apply = useCallback(
     (s: { user: User; workspaces: WorkspaceSummary[] }) => {
+      known.current = true;
       client.begin(s.user.id);
       setUser(s.user);
       setWorkspaces(s.workspaces);
@@ -116,11 +148,14 @@ export function SessionProvider({ children }: { children: ReactNode }) {
 
   const signOut = useCallback(() => {
     loadSeq.current++; // a session load still in flight belongs to the signed-out user
+    known.current = true;
+    stopRetry();
     client.end();
     setUser(null);
     setWorkspaces([]);
     setForeign(null);
-  }, [client]);
+    setReconnecting(false);
+  }, [client, stopRetry]);
 
   const loadMe = useCallback(async () => {
     const seq = ++loadSeq.current;
@@ -129,15 +164,40 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }, [apply]);
 
   const refresh = useCallback(async () => {
+    if (retry.current.timer) clearTimeout(retry.current.timer);
+    retry.current.timer = null;
+    const seq = loadSeq.current + 1; // the load started just below
+    // A newer refresh started while the session was still unknown: that one settles it.
+    const superseded = () => seq !== loadSeq.current && !known.current;
     try {
       await loadMe();
-    } catch {
-      setUser(null);
-      setWorkspaces([]);
-    } finally {
+      if (superseded()) return;
+      stopRetry();
+      setReconnecting(false);
       setLoading(false);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        // The session ended (api.ts already signed the tab out).
+        stopRetry();
+        setUser(null);
+        setWorkspaces([]);
+        setReconnecting(false);
+        setLoading(false);
+        return;
+      }
+      if (superseded()) return;
+      // Anything else (the server restarting, its database down, no network) says nothing about the
+      // session, whose cookie may well be valid: the tab keeps what it has, or keeps waiting for it,
+      // and tries again.
+      if (!known.current) setReconnecting(true);
+      const wait = SESSION_RETRY_MS[Math.min(retry.current.attempt++, SESSION_RETRY_MS.length - 1)];
+      if (retry.current.timer) clearTimeout(retry.current.timer);
+      retry.current.timer = setTimeout(() => {
+        retry.current.timer = null;
+        void refresh();
+      }, wait);
     }
-  }, [loadMe]);
+  }, [loadMe, stopRetry]);
 
   useEffect(() => {
     setUnauthorizedHandler(signOut);
@@ -146,12 +206,24 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       // A handshake refused as 'unauthorized' usually means the session ended: a 401 here signs out
       // (see api.ts). Any other answer keeps it, and the socket tries again once this settles.
       unauthorized: () => api.get('/api/auth/me').catch(() => {}),
-      // Rights changed while the tab is open (role, membership, suspension, operator status): reload
-      // them. A passing network error keeps the session; a 401 still signs out (api.ts).
-      refreshed: () => void loadMe().catch(() => {}),
+      // Rights changed while the tab is open (role, membership, suspension, operator status), or the
+      // socket reconnected and may have missed that news: reload them. A passing network error keeps
+      // the session; a 401 still signs out (api.ts).
+      refreshed: () => loadMe().catch(() => {}),
     });
     void refresh();
-  }, [refresh, loadMe, signOut]);
+    return stopRetry;
+  }, [refresh, loadMe, signOut, stopRetry]);
+
+  // Another tab signed in (maybe as someone else) or out: this tab now sends that cookie.
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === SESSION_SIGNAL_KEY) void refresh();
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [refresh]);
 
   // A workspace opened as operator is not in /api/auth/me: load its name and billing mode.
   const foreignId = foreign?.id ?? null;
@@ -194,9 +266,17 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     [qc, workspaces, user, loadMe],
   );
 
+  // Only a logout the server confirmed signs the tab out: if the request failed, the cookie and the
+  // session are still valid, and a login page would only hide that from whoever uses this browser next.
   const logout = useCallback(async () => {
-    await api.post('/api/auth/logout').catch(() => {});
+    try {
+      await api.post('/api/auth/logout');
+    } catch (err) {
+      // 401: the session had already ended.
+      if (!(err instanceof ApiError && err.status === 401)) throw new Error(LOGOUT_FAILED);
+    }
     signOut();
+    signalOtherTabs(null);
   }, [signOut]);
 
   const value = useMemo<SessionValue>(() => {
@@ -205,20 +285,25 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     const role = user?.is_superadmin && wsId ? 'owner' : (workspace?.role ?? null);
     return {
       loading,
+      reconnecting,
       user,
       workspaces,
       workspace,
       role,
       isAdmin: role === 'owner' || role === 'admin',
       setSession: (s) => {
+        loadSeq.current++; // a load still in flight predates this sign-in
+        stopRetry();
         apply(s);
+        setReconnecting(false);
         setLoading(false);
+        signalOtherTabs(s.user.id);
       },
       switchWorkspace,
       refresh,
       logout,
     };
-  }, [loading, user, workspaces, wsId, foreign, apply, switchWorkspace, refresh, logout]);
+  }, [loading, reconnecting, user, workspaces, wsId, foreign, apply, switchWorkspace, refresh, logout, stopRetry]);
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
 }

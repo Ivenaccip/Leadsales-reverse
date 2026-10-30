@@ -66,9 +66,11 @@ async function downloadMedia(ctx: AppContext, p: { messageId: string }, job: Job
 
 /**
  * The webhooks about a template carry no components: read the template from Meta again. Its
- * status stays the one the webhooks set (Meta's list may lag behind its own events).
+ * status stays the one the webhooks set (Meta's list may lag behind its own events), except for
+ * `restore` (UNARCHIVED): an archived template takes the status Meta has for it again, once Meta no
+ * longer says ARCHIVED (until then the job is retried).
  */
-async function refreshTemplate(ctx: AppContext, p: { templateId: string }) {
+async function refreshTemplate(ctx: AppContext, p: { templateId: string; restore?: boolean }) {
   const { rows } = await ctx.db.query<{ id: string; workspace_id: string; channel_id: string; meta_id: string | null; name: string; language: string }>(
     `SELECT id, workspace_id, channel_id, meta_id, name, language FROM templates WHERE id = $1`,
     [p.templateId],
@@ -77,14 +79,22 @@ async function refreshTemplate(ctx: AppContext, p: { templateId: string }) {
   if (!t) return;
   const ch = (await ctx.db.query<ChannelRow>(`SELECT * FROM channels WHERE id = $1`, [t.channel_id])).rows[0];
   if (!ch || ch.provider !== 'cloud_api') return;
-  const remote = (await providerFor(ctx, ch).listTemplates()).find(
-    (r) => (t.meta_id && String(r.id) === t.meta_id) || (r.name === t.name && r.language === t.language),
-  );
+  const provider = providerFor(ctx, ch);
+  // The one template by its id; the whole list (thousands of templates) only when Meta does not know it.
+  const single = t.meta_id && provider instanceof CloudApiProvider ? await provider.getTemplate(t.meta_id) : null;
+  const remote =
+    single ??
+    (await provider.listTemplates()).find((r) => (t.meta_id && String(r.id) === t.meta_id) || (r.name === t.name && r.language === t.language));
   if (!remote || remote.name !== t.name || remote.language !== t.language) return;
   const updated = await ctx.db.tx(async (q) => {
     const cur = await q.query<{ status: string; rejected_reason: string | null }>(`SELECT status, rejected_reason FROM templates WHERE id = $1 FOR UPDATE`, [t.id]);
     if (!cur.rows[0]) return false;
-    await upsertTemplate(q, ch, { ...remote, meta_id: String(remote.id), status: cur.rows[0].status, rejected_reason: cur.rows[0].rejected_reason });
+    // Restored only while still archived here: an event or a sync since then already set its status.
+    const restore = p.restore === true && cur.rows[0].status === 'ARCHIVED';
+    if (restore && String(remote.status).toUpperCase() === 'ARCHIVED') throw new Error('Meta todavía lista la plantilla como archivada; se reintentará');
+    const status = restore ? remote.status : cur.rows[0].status;
+    const rejected = restore ? (remote.rejected_reason ?? null) : cur.rows[0].rejected_reason;
+    await upsertTemplate(q, ch, { ...remote, meta_id: String(remote.id), status, rejected_reason: rejected });
     return true;
   });
   if (updated) ctx.realtime.emit(t.workspace_id, 'template:update', { id: t.id });

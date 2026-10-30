@@ -6,7 +6,17 @@ import type { Queryable } from '../db/index.js';
 import { dummyPasswordHash, hashPassword, knownDevice, rememberDevice, signToken, verifyPassword } from '../lib/auth.js';
 import { conflict, forbidden, unauthorized } from '../lib/errors.js';
 import { topup } from '../services/credits.js';
-import { COOKIE, DEVICE_COOKIE, parse, RateLimiter, requireSession, requireUser, tooManyAttempts, verifyCurrentPassword } from './helpers.js';
+import {
+  COOKIE,
+  DEVICE_COOKIE,
+  parse,
+  RateLimiter,
+  requireSession,
+  requireUser,
+  SESSION_DAYS,
+  tooManyAttempts,
+  verifyCurrentPassword,
+} from './helpers.js';
 
 export const DEFAULT_STAGES = [
   { name: 'Nuevo', color: '#3b82f6', kind: 'open' },
@@ -84,20 +94,30 @@ async function hasUsers(q: Queryable): Promise<boolean> {
  * changed meanwhile, the session is born stale and never works.
  */
 export async function startSession(ctx: AppContext, req: FastifyRequest, reply: FastifyReply, userId: string, passwordVersion: number) {
-  const { rows } = await ctx.db.query<{ id: string }>(
+  const sid = await insertSession(ctx.db, req, userId, passwordVersion);
+  // Old rows only serve to recognize addresses that signed in before (see the login limiter).
+  await ctx.db.query(`DELETE FROM sessions WHERE user_id = $1 AND created_at < now() - interval '90 days'`, [userId]);
+  setSessionCookie(ctx, reply, userId, sid);
+  rememberThisDevice(ctx, req, reply, userId, passwordVersion);
+}
+
+async function insertSession(q: Queryable, req: FastifyRequest, userId: string, passwordVersion: number): Promise<string> {
+  const { rows } = await q.query<{ id: string }>(
     `INSERT INTO sessions (user_id, user_agent, ip, password_version) VALUES ($1, $2, $3, $4) RETURNING id`,
     [userId, String(req.headers['user-agent'] ?? '').slice(0, 300) || null, req.ip, passwordVersion],
   );
-  // Old rows only serve to recognize addresses that signed in before (see the login limiter).
-  await ctx.db.query(`DELETE FROM sessions WHERE user_id = $1 AND created_at < now() - interval '90 days'`, [userId]);
-  reply.setCookie(COOKIE, signToken(ctx.config.jwtSecret, { uid: userId, sid: rows[0].id }), {
+  return rows[0].id;
+}
+
+/** The token is signed once per session row: both end together (SESSION_DAYS). */
+function setSessionCookie(ctx: AppContext, reply: FastifyReply, userId: string, sid: string) {
+  reply.setCookie(COOKIE, signToken(ctx.config.jwtSecret, { uid: userId, sid }), {
     path: '/',
     httpOnly: true,
     sameSite: 'lax',
     secure: ctx.config.publicUrl.startsWith('https://'),
-    maxAge: 30 * 24 * 3600,
+    maxAge: SESSION_DAYS * 24 * 3600,
   });
-  rememberThisDevice(ctx, req, reply, userId, passwordVersion);
 }
 
 const DEVICE_COOKIE_PATH = '/api/auth';
@@ -309,21 +329,27 @@ export async function authRoutes(app: FastifyInstance, ctx: AppContext) {
       // owner ends a stolen session, so its guesses must never use up her budget.
       const verifiedVersion = await verifyCurrentPassword(ctx, { user, sid }, body.currentPassword);
       const hash = await hashPassword(body.password);
-      const version = await ctx.db.tx(async (q) => {
+      const changed = await ctx.db.tx(async (q) => {
         // Only over the version whose password was just verified: of two concurrent changes, one wins.
         const r = await q.query<{ password_version: number }>(
           `UPDATE users SET password_hash = $2, password_version = password_version + 1 WHERE id = $1 AND password_version = $3 RETURNING password_version`,
           [user.id, hash, verifiedVersion],
         );
         if (!r.rows[0]) return null;
-        // A new password ends every other session (a stolen cookie stops working); this one stays.
-        await q.query(`UPDATE sessions SET password_version = $2 WHERE id = $1`, [sid, r.rows[0].password_version]);
-        await q.query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL`, [user.id, sid]);
-        return r.rows[0].password_version;
+        // A new password ends every session, this one included: a stolen cookie is most often a copy
+        // of the very session the owner changes it from. This browser goes on with a new one.
+        const version = r.rows[0].password_version;
+        const newSid = await insertSession(q, req, user.id, version);
+        await q.query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL`, [user.id, newSid]);
+        return { version, newSid };
       });
-      if (version === null) throw conflict('La contraseña acaba de cambiar desde otra sesión. Vuelve a intentarlo.', 'PASSWORD_CHANGED');
+      if (changed === null) throw conflict('La contraseña acaba de cambiar desde otra sesión. Vuelve a intentarlo.', 'PASSWORD_CHANGED');
+      setSessionCookie(ctx, reply, user.id, changed.newSid);
       await ctx.realtime.endSessions({ userId: user.id, exceptSid: sid });
-      rememberThisDevice(ctx, req, reply, user.id, version);
+      // This session's tabs reconnect with the new cookie (they are not signed out); a copy of the
+      // old one is refused at its handshake.
+      ctx.realtime.renewSession(sid);
+      rememberThisDevice(ctx, req, reply, user.id, changed.version);
     }
     if (body.name) await ctx.db.query(`UPDATE users SET name = $2 WHERE id = $1`, [user.id, body.name]);
     const { rows } = await ctx.db.query(`SELECT id, email, name, is_superadmin FROM users WHERE id = $1`, [user.id]);

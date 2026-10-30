@@ -1,4 +1,4 @@
-import type { Server } from 'socket.io';
+import type { Server, Socket } from 'socket.io';
 
 /**
  * Thin wrapper so services can emit without knowing about Socket.IO (and tests can capture events).
@@ -157,6 +157,51 @@ export class Realtime {
       if ('exceptSid' in target && target.exceptSid && s.data.sid === target.exceptSid) continue;
       s.emit('session:revoked', {});
       s.disconnect(true);
+    }
+  }
+
+  /** One socket whose session is over (expired, revoked, deleted): same as endSessions(). */
+  endSocket(s: Socket): void {
+    s.emit('session:revoked', {});
+    s.disconnect(true);
+  }
+
+  /**
+   * The session goes on under a new id (a password change): its sockets leave every room and
+   * their connection is closed, not ended, so the browser reconnects by itself with its new cookie.
+   * A copy of the old cookie reconnects too, and its handshake is refused.
+   */
+  renewSession(sid: string): void {
+    this.bump(`sid:${sid}`);
+    if (!this.io) return;
+    for (const id of [...(this.io.sockets.adapter.rooms.get(`sid:${sid}`) ?? [])]) {
+      const s = this.io.sockets.sockets.get(id);
+      if (!s) continue;
+      s.data.renewed = true;
+      for (const r of [...s.rooms]) if (r !== s.id) s.leave(r);
+      s.conn.close();
+    }
+  }
+
+  /**
+   * Set by the app: which of these sessions are still live (row there, not revoked, current
+   * password, not expired).
+   */
+  liveSessions: ((sids: string[]) => Promise<Set<string>>) | null = null;
+
+  /**
+   * Ends the sockets whose session is over although nobody called endSessions() (it expired, its
+   * row was deleted or changed by hand). Run on a timer by the app.
+   */
+  async sweepSessions(): Promise<void> {
+    if (!this.io || !this.liveSessions) return;
+    const sockets = [...this.io.sockets.sockets.values()].filter((s) => s.connected && !s.data.renewed);
+    const sids = [...new Set(sockets.map((s) => String(s.data.sid)))];
+    const live = new Set<string>();
+    for (let i = 0; i < sids.length; i += 1000) for (const sid of await this.liveSessions(sids.slice(i, i + 1000))) live.add(sid);
+    const now = Date.now();
+    for (const s of sockets) {
+      if (s.connected && !s.data.renewed && (!live.has(s.data.sid) || s.data.expiresAt <= now)) this.endSocket(s);
     }
   }
 

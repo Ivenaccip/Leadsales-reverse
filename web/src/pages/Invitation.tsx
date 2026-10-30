@@ -6,7 +6,7 @@ import { dateTime } from '../lib/format';
 import { useSession } from '../lib/session';
 import type { User, WorkspaceSummary } from '../lib/types';
 import { Alert, Button, Field, Input, PageLoader } from '../components/ui';
-import { AuthShell } from './Login';
+import { AuthShell, SessionReconnecting } from './Login';
 
 /** Public preview of an invitation. It never says whether the email has an account (#51). */
 export interface InvitationInfo {
@@ -140,7 +140,7 @@ export function InvitationSteps({
 export default function InvitationPage() {
   const { token = '' } = useParams();
   const navigate = useNavigate();
-  const { loading, user, logout, refresh, switchWorkspace, setSession } = useSession();
+  const { loading, reconnecting, user, logout, refresh, switchWorkspace, setSession } = useSession();
   const info = useQuery({
     queryKey: ['invitation', token],
     queryFn: () => api.get<InvitationInfo>(`/api/invitations/${encodeURIComponent(token)}`),
@@ -190,6 +190,7 @@ export default function InvitationPage() {
     }
   }
 
+  if (loading && reconnecting) return <SessionReconnecting />;
   if (loading || info.isLoading) return <PageLoader />;
 
   if (!info.data) {
@@ -221,7 +222,7 @@ export default function InvitationPage() {
       onLogout={() => {
         setError(null);
         setBlocked(false);
-        void logout();
+        void logout().catch((err) => setError(errorMessage(err)));
       }}
     />
   );

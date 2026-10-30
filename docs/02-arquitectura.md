@@ -106,10 +106,15 @@
    si el embudo tiene round-robin, se asigna.
 3. Se guarda el mensaje (idempotente), se actualizan no leídos y ventana de 24 h, se
    encola la descarga de multimedia y se emite por Socket.IO.
+   Si el cliente edita o elimina un mensaje (números que también usan la app de WhatsApp
+   Business), se actualiza el mensaje original: no es un mensaje nuevo, no suma no leídos ni
+   dispara respuestas automáticas.
 4. Job `automation.inbound`: horario/ausencia, bienvenida, bot de menú o agente IA
    (con *debounce* de 4 s para juntar mensajes seguidos). Un mensaje de baja (`BAJA`,
    `STOP`…) marca al contacto fuera de las difusiones y no recibe respuesta automática;
-   lo que el contacto escriba después sí la recibe.
+   lo que el contacto escriba después sí la recibe. Si el bot de menú espera una respuesta y el texto escrito es
+   una de sus opciones (p. ej. «Baja» en un menú «Alta / Baja»), cuenta como esa opción y no
+   como baja.
 
 ## Flujo de un envío
 
@@ -153,7 +158,11 @@ en cuanto se libera un lugar, así que un trabajo lento no detiene a los demás.
   dueña de cada espacio) y, dentro de cada cuenta, entre sus espacios: primero la cuenta,
   y luego el espacio, que menos tiempo de carril usó últimamente. Abrir más espacios no da
   más lugares, y un negocio cuyos trabajos se cuelgan gasta su turno en segundos, no en
-  trabajos. Los trabajos sin espacio usan los lugares que sobran.
+  trabajos. Los trabajos sin espacio usan los lugares que sobran. Para saber qué espacios tienen
+  trabajos listos, cada carril lee `job_wakeups` (una fila cada vez que un trabajo de un
+  espacio se puede tomar, escrita por un trigger sobre `jobs`), no todos los espacios con
+  trabajos en cola: los que solo tienen trabajos para más adelante (programados a meses,
+  webhooks esperando su reintento) no le cuestan nada a cada toma.
 - **Un contacto a la vez.** `automation.inbound` y `ai.reply` de un mismo contacto
   comparten `serial_key` (`contact:<id>`) y nunca corren al mismo tiempo: leen el estado
   del bot o la conversación y luego actúan sobre ella. Solo el primer trabajo pendiente de
@@ -167,7 +176,9 @@ en cuanto se libera un lugar, así que un trabajo lento no detiene a los demás.
   PostgreSQL, los trabajos que dejó a medias un proceso que murió vuelven a la cola cuando
   su latido cumple 60 s (en un minuto, más o menos); con PGlite, que vive dentro del
   proceso, vuelven de inmediato al arrancar. Un trabajo que pasa de 10 min libera su
-  lugar y se reintenta. Al recibir `SIGTERM`, LeadLibre deja de tomar trabajos, espera
+  lugar y se reintenta. Un trabajo de un contacto (con `serial_key`) que se recupera así
+  vuelve a la cola sin espera y delante de los que el contacto mandó después, para que el
+  bot los atienda en orden. Al recibir `SIGTERM`, LeadLibre deja de tomar trabajos, espera
   hasta 7 s a los que corren y devuelve los demás a la cola.
 - **Mantenimiento.** Con cada latido el worker también recupera trabajos y libera los
   `held` que se quedaron sin nadie delante. Cada 10 minutos (con PostgreSQL y con PGlite)

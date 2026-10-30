@@ -27,10 +27,18 @@ Los errores tienen la forma `{"error": {"code": "...", "message": "..."}}`.
 - Si el contacto ya existe se actualiza (las etiquetas se agregan, los campos
   personalizados se combinan). Respuesta: `{ "contact": {...}, "created": true|false }`.
 - Límites: `phone` de 6 a 40 caracteres, `name` y `company` hasta 120, `source` hasta 40 y
-  hasta 50 etiquetas por petición. Una etiqueta nueva tiene hasta 40 caracteres y su nombre
-  no puede llevar `;`, `,` ni `|`: `"VIP, Expo"` son dos etiquetas (`VIP` y `Expo`), como
-  en la importación CSV, salvo que ya exista una etiqueta con ese nombre exacto (creada
-  antes de esta regla).
+  hasta 50 etiquetas por petición, contadas ya separadas (`400 TOO_MANY_TAGS`). Un espacio
+  tiene como máximo 2,000 etiquetas: una petición que crearía más responde
+  `400 TAG_LIMIT_REACHED` sin crear el contacto (las etiquetas que ya existen siempre se
+  pueden usar). Una etiqueta nueva tiene hasta 40 caracteres y su nombre no puede llevar
+  `;`, `,` ni `|`:
+  `"VIP, Expo"` son dos etiquetas (`VIP` y `Expo`), como en la importación CSV, salvo que ya
+  exista una etiqueta con ese nombre exacto (creada antes de esta regla).
+- `custom_fields`: hasta 100 campos; cada nombre de 1 a 100 caracteres y cada valor texto
+  (hasta 1,000 caracteres), número, `true`/`false` o `null`; el JSON completo hasta 64 KB.
+  Los mismos límites valen para el resultado de combinarlos con los que el contacto ya
+  tiene (`400 INVALID_CUSTOM_FIELDS`). Son los mismos en la interfaz web y en la
+  importación CSV.
 
 ### `GET /api/v1/contacts?phone=525512345678`
 
@@ -180,7 +188,9 @@ documentada por el código en `server/src/routes/`. Lo que más conviene saber:
 ### Sesiones
 
 - `POST /api/auth/login` y `POST /api/auth/register` abren una sesión (fila en
-  `sessions`) y ponen la cookie `ll_token` (JWT `{ uid, sid }`, 30 días). Las cookies
+  `sessions`) y ponen la cookie `ll_token` (JWT `{ uid, sid }`, 30 días). La sesión dura
+  lo mismo que su token: pasados los 30 días deja de valer también en el servidor, y sus
+  sockets se desconectan (`session:revoked`) en ese momento. Las cookies
   emitidas antes de las sesiones revocables ya no sirven: hay que iniciar sesión otra vez.
   Cada sesión queda ligada a la versión de la contraseña con la que se abrió: si la
   contraseña cambia mientras alguien inicia sesión con la anterior, esa sesión nace
@@ -195,14 +205,19 @@ documentada por el código en `server/src/routes/`. Lo que más conviene saber:
   entrada en su siguiente inicio de sesión.
 - `POST /api/auth/logout` revoca esa sesión; sus sockets reciben `session:revoked` y se
   desconectan.
-- `PATCH /api/auth/me { currentPassword, password }` revoca todas las demás sesiones de
-  la cuenta (la actual sigue activa). `400 WRONG_PASSWORD` si `currentPassword` no es
-  correcta; tras 10 intentos fallidos en 15 minutos desde la misma sesión (contando los de
-  las acciones del operador que también la piden), `429 TOO_MANY_REQUESTS` en esa
-  sesión (aunque la siguiente sea la correcta). El límite es por sesión: quien robó una
-  sesión no puede gastar los intentos de las demás, y la dueña siempre puede cambiar la
-  contraseña desde su propia sesión para cerrar la robada. `409 PASSWORD_CHANGED` si otra
-  sesión cambió la contraseña al mismo tiempo (gana solo una).
+- `PATCH /api/auth/me { currentPassword, password }` revoca todas las sesiones de la
+  cuenta, también aquella desde la que se cambió: ese navegador recibe en la respuesta una
+  cookie `ll_token` nueva (otra sesión), así que una copia de la cookie anterior deja de
+  funcionar. Los sockets de las demás sesiones reciben `session:revoked`; los de la sesión
+  que hizo el cambio se cierran sin ese evento y vuelven a conectarse solos con la cookie
+  nueva (una copia de la anterior recibe `unauthorized`). `400 WRONG_PASSWORD` si
+  `currentPassword` no es correcta; tras 10 intentos fallidos en 15 minutos desde la misma
+  sesión (contando los de las acciones del operador que también la piden),
+  `429 TOO_MANY_REQUESTS` en esa sesión (aunque la siguiente sea la correcta). El límite
+  es por sesión: quien robó una sesión no puede gastar los intentos de las demás, y la
+  dueña siempre puede cambiar la contraseña desde su propia sesión para cerrar la robada.
+  `409 PASSWORD_CHANGED` si otra sesión cambió la contraseña al mismo tiempo (gana solo
+  una).
 - Inicio de sesión: `429 TOO_MANY_REQUESTS` tras demasiados intentos fallidos (ver
   límites en `04-despliegue.md`). Correo máx. 254 caracteres; contraseñas nuevas de 8 a
   200.
@@ -259,12 +274,15 @@ documentada por el código en `server/src/routes/`. Lo que más conviene saber:
   administrador de la instancia. `currentPassword` es la contraseña actual de quien lo
   hace: `400 WRONG_PASSWORD` si falta o no es correcta, y `429` tras 10 intentos fallidos
   en 15 minutos desde la misma sesión (el mismo límite que `PATCH /api/auth/me`). `400`
-  si te quitas el rol a ti mismo.
+  si te quitas el rol a ti mismo o si la instancia se quedaría sin administradores
+  (`LAST_OPERATOR`). Los cambios de este rol se hacen de uno en uno: si a quien lo pide le
+  quitaron el rol mientras se comprobaba su contraseña, responde `403` sin cambiar nada
+  (dos administradores que se quitan el rol al mismo tiempo dejan a uno).
 - `POST /api/admin/users/:id/password { password, currentPassword }` pone una contraseña
   temporal, cierra todas las sesiones de la cuenta (y sus sockets) e invalida sus cookies
   `ll_device`. `currentPassword` como arriba. `400` para tu propia cuenta o la de otro
   administrador de la instancia (esas se cambian desde el perfil, con la contraseña
-  actual).
+  actual), también si la cuenta recibió ese rol mientras se hacía la petición.
 - `DELETE /api/admin/users/:id` → `204`, borra una cuenta que no es miembro de ningún
   espacio (libera el correo). `409 USER_HAS_WORKSPACES` si todavía es miembro de alguno
   (quítala primero desde cada espacio); `400` para administradores de la instancia.
@@ -276,9 +294,16 @@ documentada por el código en `server/src/routes/`. Lo que más conviene saber:
 
 ### Canales
 
+- `POST /api/channels` (y `PATCH /api/channels/:id` con token o WABA nuevos):
+  `400 PHONE_NOT_REGISTERED` si Meta dice que el número no está en la Cloud API
+  (`platform_type` distinto de `CLOUD_API`: agregado y verificado pero sin registrar, o
+  registrado en la API local u otro proveedor). Así ningún envío fallaría después con
+  `133010`; el mensaje explica cómo registrarlo (`03-conectar-whatsapp-meta.md`, paso 2).
 - `POST /api/channels/:id/test` solo informa el estado con Meta: no reactiva un número
-  desactivado (eso es `PATCH { status: "active" }`). En un número desactivado, una prueba
-  fallida no reemplaza el motivo de la desactivación en `last_error`.
+  desactivado (eso es `PATCH { status: "active" }`). Responde `{ ok: false, error, info }`
+  (y lo guarda en `last_error`) si el número no está registrado en la Cloud API. En un
+  número desactivado, una prueba fallida no reemplaza el motivo de la desactivación en
+  `last_error`.
 - `PATCH /api/channels/:id` de un canal sandbox: `400 SANDBOX_NO_CREDENTIALS` si trae
   `waba_id`, `access_token` o `app_secret` (un sandbox no tiene cuenta de Meta). Solo los
   números oficiales cuentan para `WABA_TAKEN`.
@@ -444,19 +469,28 @@ Los envíos de plantilla de la bandeja (`POST /api/contacts/:id/messages` con
   pasar). `page` sigue funcionando para todos los órdenes; con los demás, `next_cursor` es
   `null`. Un cursor que no salió de esta ruta, o con otro `sort`, responde
   `400 INVALID_CURSOR`.
+- `POST /api/contacts` y `PATCH /api/contacts/:id`: `custom_fields` con los mismos
+  límites que en la API pública (`400` si no los cumple; el `PATCH` reemplaza el objeto
+  completo).
 - `POST /api/contacts`: si el teléfono ya existe responde ese contacto con
   `created: false`; un agente que solo ve sus conversaciones recibe
   `409 CONTACT_EXISTS` si ese contacto está asignado a otra persona.
 - `POST /api/contacts/import { csv, funnel_id?, stage_id?, tag_ids?, lossy? }`
   (dueño/admin): el texto del CSV, máx. 20,000 filas y 200 columnas
-  (`400 CSV_TOO_MANY_COLUMNS`, antes de leer las filas). La fila de encabezados es la
-  primera que no está en blanco; el separador (`,`, `;` o tabulador) se detecta en ella.
+  (`400 CSV_TOO_MANY_COLUMNS`, antes de leer las filas). Cada nombre de columna tiene
+  hasta 100 caracteres (`400 CSV_HEADER_TOO_LONG`) y cada fila, el encabezado incluido,
+  hasta 256 KB (`400 CSV_RECORD_TOO_LARGE`, normalmente unas comillas sin cerrar). La fila
+  de encabezados es la primera que no está en blanco; el separador (`,`, `;` o tabulador)
+  se detecta en ella.
   Encabezados reconocidos: `telefono` (o `celular`, `whatsapp`…), `nombre`, `correo`,
   `empresa`, `etiquetas` (separadas por `;`, `,` o `|`) y `valor`; las demás columnas van
   a campos personalizados. Responde
   `{ total, created, existing, errors, error_count }`; una fila sin teléfono, con nombre o
-  empresa de más de 120 caracteres, o con una etiqueta nueva de más de 40, va a `errors`
-  (con su número de fila) y las demás se importan.
+  empresa de más de 120 caracteres, con una etiqueta nueva de más de 40, con más de 50
+  etiquetas, con etiquetas nuevas que ya no caben en el espacio (máximo 2,000 etiquetas
+  por espacio) o con campos personalizados fuera de los límites de `custom_fields` (por
+  ejemplo, un valor de más de 1,000 caracteres) va a `errors` (con su número de fila) y
+  las demás se importan. Una columna sin nombre no se guarda.
 - Un archivo exportado por LeadLibre (tiene todas las columnas `campos`, `embudo`, `etapa`,
   `asignado_a`, `origen`, `creado` y `ultimo_mensaje`) vuelve como era: `campos` (un objeto
   JSON) se convierte otra vez en los campos personalizados del contacto, `embudo` y
@@ -477,14 +511,19 @@ Los envíos de plantilla de la bandeja (`POST /api/contacts/:id/messages` con
   archivos ANSI y UTF-16 y siempre envía `lossy`.
 - `POST /api/tags { name, color? }` (cualquier miembro): si ya existe una etiqueta con ese
   nombre, responde esa etiqueta sin cambiarla. Cambiar el nombre o el color de una
-  etiqueta es `PATCH /api/tags/:id` (dueño/admin).
+  etiqueta es `PATCH /api/tags/:id` (dueño/admin). Un espacio tiene como máximo 2,000
+  etiquetas: crear otra responde `400 TAG_LIMIT_REACHED` hasta que se borre alguna.
 - Etiquetas: una etiqueta nueva tiene hasta 40 caracteres y su nombre no puede llevar `;`,
   `,` ni `|` (`POST`/`PATCH /api/tags` responden `400`), porque son los separadores de la
   columna `etiquetas`. Las etiquetas creadas antes de esa regla siguen funcionando: al
   importar en el mismo espacio, su nombre dentro de la celda `etiquetas` vuelve a esa
   etiqueta completa en lugar de partirse.
 - `GET /api/contacts/export.csv` (dueño/admin; mismos filtros que la lista): UTF-8 con
-  BOM y cada valor entre comillas (las celdas vacías van sin ellas). Una celda que empieza
+  BOM y cada valor entre comillas (las celdas vacías van sin ellas), ordenado por teléfono
+  (la columna `creado` lleva la fecha de creación). Se envía por partes mientras se lee (de
+  500 en 500 contactos, cada parte desde donde terminó la anterior), así que la
+  respuesta no lleva `Content-Length`; la fila de encabezados sale aunque no haya
+  contactos. Una celda que empieza
   con `=`, `+`, `-` o `@` (o un tramo así después de `;`, `,`, tabulador o salto de línea)
   lleva `'` delante para que Excel no la ejecute como fórmula; por eso los teléfonos salen
   como `'+5255…`. Al importar ese mismo archivo se quita cada `'` que agregó la
@@ -542,8 +581,12 @@ iniciar sesión).
   socket está en la sala de su usuario), vean el espacio que vean, cuando cambian sus
   permisos: rol o acceso en cualquier espacio, rol de administrador de la instancia,
   espacio suspendido o reactivado, invitación aceptada. Vuelve a leer `/api/auth/me`.
+- Una conexión dura lo que su sesión: al vencer el token (o la sesión), al revocarse o
+  borrarse la sesión, el socket recibe `session:revoked` y se desconecta (se comprueba al
+  vencer, en cada `join` y cada minuto). Un `join` con la sesión ya terminada responde
+  `ok: false` y desconecta.
 - Conexión rechazada: `connect_error` con `unauthorized` si no hay sesión válida (sin
-  cookie, token inválido, sesión cerrada o contraseña cambiada) y `unavailable` si el
+  cookie, token inválido o vencido, sesión cerrada o contraseña cambiada) y `unavailable` si el
   servidor no pudo comprobarla (por ejemplo, la base de datos se está reiniciando).
   Socket.IO no reintenta solo tras un rechazo: el cliente reintenta `unavailable` con
   espera creciente y, ante `unauthorized`, consulta `/api/auth/me` (solo un `401` cierra

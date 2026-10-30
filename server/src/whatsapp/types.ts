@@ -101,6 +101,7 @@ export function explainMetaError(code: number | null | undefined, detail: string
     131026: 'Mensaje no entregable: el número no tiene WhatsApp o no aceptó los términos recientes.',
     131030: 'El número no está en la lista de destinatarios permitidos (número de prueba de Meta).',
     131031: 'La cuenta de WhatsApp Business está bloqueada o restringida.',
+    131037: 'Meta todavía no aprueba el nombre visible de este número: no se pueden enviar mensajes hasta que lo apruebe.',
     131042: 'Problema con el método de pago de tu cuenta de WhatsApp Business en Meta.',
     131045: 'El número no está registrado correctamente en la Cloud API.',
     131047: 'Pasaron más de 24 h desde el último mensaje del cliente: usa una plantilla.',

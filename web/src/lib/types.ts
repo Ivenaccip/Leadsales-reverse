@@ -31,6 +31,8 @@ export interface BotMenuOption {
 export interface BotMenu {
   prompt: string;
   options: BotMenuOption[];
+  /** Lowest key a new option of this menu may take: keys removed earlier are not handed out again. */
+  next_key?: number;
 }
 
 export interface WorkspaceSettings {

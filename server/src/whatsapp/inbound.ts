@@ -3,11 +3,12 @@ import type { Queryable } from '../db/index.js';
 import type { Job } from '../jobs/queue.js';
 import { AppError, notFound } from '../lib/errors.js';
 import { deliveryNumber, digitsOnly, isValidPhone, lineForms, normalizePhone, phoneVariants } from '../lib/phone.js';
+import { matchOption, resolveMenu, settingsWithDefaults } from '../services/automation.js';
 import { createContact, getContact, type Contact } from '../services/contacts.js';
-import { notifyCredits, reconcilePricing, refund } from '../services/credits.js';
+import { charge, notifyCredits, reconcilePricing, refund, roundMoney } from '../services/credits.js';
 import { dispatchWebhook, recordEvent } from '../services/events.js';
 import { previewFor } from '../services/messages.js';
-import type { ChannelRow, MessageRow } from '../types.js';
+import type { BotState, ChannelRow, MessageRow, WorkspaceSettings } from '../types.js';
 import { explainMetaError } from './types.js';
 
 const STATUS_RANK: Record<string, number> = { pending: 0, sent: 1, delivered: 2, read: 3 };
@@ -28,7 +29,8 @@ const OPT_OUT_WORDS = new Set([...OPT_OUT_PHRASES, 'baja', 'alto']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // message_template_status_update events that are real template statuses. REINSTATED means the
-// template can be sent again; FLAGGED, LOCKED and UNLOCKED are notices that leave it sendable.
+// template can be sent again; FLAGGED, LOCKED and UNLOCKED are notices that leave it sendable;
+// UNARCHIVED restores the status it had before it was archived (see restoreTemplates).
 const TEMPLATE_STATUSES = new Set(['APPROVED', 'REJECTED', 'PENDING', 'PAUSED', 'DISABLED', 'IN_APPEAL', 'PENDING_DELETION', 'DELETED', 'ARCHIVED', 'LIMIT_EXCEEDED']);
 // The only template categories Meta has: anything else in a category update is not Meta's (a
 // 'service' template would be sent for free).
@@ -38,6 +40,9 @@ const TEMPLATE_CATEGORIES = new Set(['marketing', 'utility', 'authentication']);
 const MOVED_NUMBER_DAYS = 30;
 // How far ahead of our clock Meta's may run: a time further ahead in a payload is not Meta's.
 const META_CLOCK_SKEW_S = 300;
+// The ledger description of the charge given back for a message Meta did not deliver (also written
+// by reconcilePricing): a delivery reported after it takes exactly these back.
+const UNDELIVERED_REFUND = 'Reembolso: mensaje no entregado';
 
 class RetryLater extends Error {}
 
@@ -283,26 +288,32 @@ async function processMessagesChange(
     return;
   }
   let failure: unknown = null;
+  let missing = false;
+  const recent = (ts: unknown) => Date.now() / 1000 - Number(ts ?? 0) < 300;
   const messages: any[] = value.messages ?? [];
   for (let i = 0; i < messages.length; i++) {
     if (i) await yieldToEventLoop();
     const msg = messages[i];
     const profile = (value.contacts ?? []).find((c: any) => c.wa_id === msg.from) ?? value.contacts?.[0];
     try {
+      if (isMessageChange(msg)) {
+        // The original may be in a payload Meta delivers right after this one.
+        const found = await applyMessageChange(ctx, channel, msg, 'in');
+        if (!found && recent(msg.timestamp) && (job?.attempts ?? 99) < 3) missing = true;
+        continue;
+      }
       await processInboundMessage(ctx, channel, msg, profile, await receivedAt(), nextSeq());
     } catch (err) {
       const e = keepTransient(ctx, err, { channel: channel.id, wamid: msg?.id });
       failure ??= e;
     }
   }
-  let missing = false;
   const settles = billingTrusted(channel, trust);
   for (const st of value.statuses ?? []) {
     await yieldToEventLoop();
     try {
       const found = await processStatus(ctx, channel, st, settles);
-      const recent = Date.now() / 1000 - Number(st.timestamp ?? 0) < 300;
-      if (!found && recent && (job?.attempts ?? 99) < 3) missing = true;
+      if (!found && recent(st.timestamp) && (job?.attempts ?? 99) < 3) missing = true;
     } catch (err) {
       const e = keepTransient(ctx, err, { channel: channel.id, wamid: st?.id });
       failure ??= e;
@@ -379,6 +390,8 @@ export function parseInboundContent(msg: any): ParsedContent {
 export function optOutKeyword(parsed: ParsedContent): string | null {
   const norm = (v: unknown) => String(v ?? '').trim().toLowerCase();
   if (parsed.type === 'text') {
+    // Typed as the answer to the bot's menu (see menuOptionTyped): a choice, like a tap on it.
+    if (parsed.payload?.menu_option != null) return null;
     const word = norm(parsed.body);
     return OPT_OUT_WORDS.has(word) ? word : null;
   }
@@ -390,6 +403,107 @@ export function optOutKeyword(parsed: ParsedContent): string | null {
     if (OPT_OUT_PHRASES.has(word)) return word;
   }
   return null;
+}
+
+/**
+ * The key of the option a typed text picks in the menu the bot is waiting on ("1. Alta / 2. Baja"):
+ * in a text menu typing the label is the only way to choose it, so it is an answer, not an opt-out.
+ * Only while the bot runs and has sent its menu (bot_state, not done): the menu bot answers it then.
+ */
+async function menuOptionTyped(q: Queryable, workspaceId: string, botState: BotState | null, text: string | null): Promise<string | null> {
+  if (!botState || botState.done || !text?.trim()) return null;
+  const { rows } = await q.query<{ settings: WorkspaceSettings | null }>(`SELECT settings FROM workspaces WHERE id = $1`, [workspaceId]);
+  const settings = settingsWithDefaults(rows[0]?.settings);
+  const menu = settings.bot?.menu;
+  if (settings.automation_mode !== 'menu' || !menu?.options?.length) return null;
+  return matchOption(resolveMenu(menu, botState.path ?? []), text)?.key ?? null;
+}
+
+/** Whether a stored customer message gets an automatic answer: not a reaction, a WhatsApp notice or a request to stop. */
+function answerable(m: Pick<MessageRow, 'type' | 'body' | 'payload'>): boolean {
+  return m.type !== 'reaction' && m.type !== 'system' && !optOutKeyword({ type: m.type, body: m.body, media: null, payload: m.payload ?? null });
+}
+
+/** Whether `waId` is still the number of the message's contact (not one the customer has since left). */
+async function fromContactNumber(ctx: AppContext, contactId: string, waId: string): Promise<boolean> {
+  const { rows } = await ctx.db.query<{ phone: string; wa_id: string | null }>(`SELECT phone, wa_id FROM contacts WHERE id = $1`, [contactId]);
+  const c = rows[0];
+  return !!c && !!waId && (c.wa_id === waId || lineForms(waId).includes(c.phone));
+}
+
+/**
+ * A customer editing or deleting a message (messages of type 'edit' and 'revoke', sent for numbers
+ * also used in the WhatsApp Business app; older payloads report an edit as 'unsupported', without
+ * its content). Neither is a new message: nothing is stored, counted as unread or answered.
+ */
+function isMessageChange(msg: any): boolean {
+  return msg?.type === 'edit' || msg?.type === 'revoke' || (msg?.type === 'unsupported' && msg?.unsupported?.type === 'edit');
+}
+
+/**
+ * Applies an edit or a deletion to the message it is about: an edit replaces the text (the earlier
+ * versions are kept in payload.edits), a deletion marks it (payload.deleted_at). `direction`: 'in'
+ * for the customer's messages, 'out' for the business app's echoes. False when that message is not
+ * stored (yet).
+ */
+async function applyMessageChange(ctx: AppContext, channel: ChannelRow, msg: any, direction: 'in' | 'out'): Promise<boolean> {
+  const change = msg[msg.type] ?? {};
+  const originalId = change.original_message_id ?? msg.context?.id;
+  if (msg.type === 'unsupported' || !originalId) {
+    ctx.log.debug({ channel: channel.id, wamid: msg.id, type: msg.type }, 'message change without content ignored');
+    return true;
+  }
+  const waId = digitsOnly(String((direction === 'in' ? msg.from : msg.to) ?? ''));
+  const ts = metaSeconds(msg.timestamp) ?? Math.floor(Date.now() / 1000);
+  const at = new Date(ts * 1000).toISOString();
+  const result = await ctx.db.tx(async (q) => {
+    const { rows } = await q.query<MessageRow & { phone: string; contact_wa_id: string | null }>(
+      `SELECT m.*, c.phone, c.wa_id AS contact_wa_id FROM messages m JOIN contacts c ON c.id = m.contact_id
+       WHERE m.workspace_id = $1 AND m.wamid = $2 AND m.direction = $3 FOR UPDATE OF m`,
+      [channel.workspace_id, String(originalId), direction],
+    );
+    const m = rows[0];
+    if (!m) return undefined;
+    // Only that chat's own messages: an id from another conversation changes nothing.
+    if (m.contact_wa_id !== waId && !lineForms(waId).includes(m.phone)) return null;
+    const payload: Record<string, unknown> = { ...(m.payload ?? {}) };
+    let body = m.body;
+    let preview: string;
+    if (msg.type === 'revoke') {
+      if (payload.deleted_at) return null;
+      payload.deleted_at = at;
+      preview = 'Mensaje eliminado';
+    } else {
+      const edited = parseInboundContent(change.message ?? {});
+      // An edit changes a text or a caption, never the kind of message: content of another type (one
+      // this parser does not know reads as a placeholder) leaves it as it is. Edits apply in Meta's
+      // order: one delivered late never undoes a newer one.
+      if (edited.type !== m.type || edited.body == null || edited.body === m.body || ts < Number(payload.edited_ts ?? 0)) return null;
+      const edits = Array.isArray(payload.edits) ? payload.edits : [];
+      payload.edits = [...edits, { body: m.body, until: at }].slice(-20);
+      payload.edited_at = at;
+      payload.edited_ts = ts;
+      body = edited.body;
+      preview = previewFor(m.type, body);
+    }
+    const upd = await q.query<MessageRow>(`UPDATE messages SET body = $2, payload = $3 WHERE id = $1 RETURNING *`, [m.id, body, JSON.stringify(payload)]);
+    // The conversation's preview, when this is its latest message.
+    const c = await q.query(
+      `UPDATE contacts SET last_message_preview = $2, updated_at = now()
+       WHERE id = $1 AND last_message_at = (SELECT created_at FROM messages WHERE id = $3) RETURNING id`,
+      [m.contact_id, preview, m.id],
+    );
+    return { row: upd.rows[0], previewed: !!c.rows[0] };
+  });
+  if (result === undefined) {
+    ctx.log.debug({ channel: channel.id, wamid: msg.id, original: originalId }, 'message change for a message not stored');
+    return false;
+  }
+  if (result) {
+    ctx.realtime.emit(channel.workspace_id, 'message:update', publicRow(result.row));
+    if (result.previewed) ctx.realtime.emit(channel.workspace_id, 'contact:update', await getContact(ctx.db, channel.workspace_id, result.row.contact_id));
+  }
+  return true;
 }
 
 /**
@@ -478,17 +592,23 @@ export async function processInboundMessage(
   receivedUs: number = Date.now() * 1000,
   seq = 0,
 ): Promise<MessageRow | null> {
+  if (isMessageChange(msg)) {
+    await applyMessageChange(ctx, channel, msg, 'in');
+    return null;
+  }
   const parsed = parseInboundContent(msg);
   const isSystem = parsed.type === 'system';
-  const optOut = optOutKeyword(parsed);
-  // Someone asking to stop must not get an automatic answer; WhatsApp notices are not messages.
-  const automate = parsed.type !== 'reaction' && !isSystem && !optOut;
-
-  // A redelivery must not create or update contacts again (the number may have moved since).
-  const stored = await storedMessage(ctx, channel.workspace_id, msg.id);
-  if (stored) return finishDuplicate(ctx, stored, automate);
-
   const waId = digitsOnly(String(msg.from ?? ''));
+
+  // A redelivery must not create or update contacts again (the number may have moved since). What it
+  // still has to do is decided as on the first attempt: by the message as stored, and only while it
+  // came from the number its contact has now.
+  const stored = await storedMessage(ctx, channel.workspace_id, msg.id);
+  if (stored) {
+    if (stored.followups_done !== false) return null;
+    return finishDuplicate(ctx, stored, answerable(stored) && (await fromContactNumber(ctx, stored.contact_id, waId)));
+  }
+
   const profileName: string | null = profile?.profile?.name ?? null;
   const referral = msg.referral ?? null;
   const waTs = metaSeconds(msg.timestamp);
@@ -497,22 +617,26 @@ export async function processInboundMessage(
     name: profileName,
     source: referral ? 'whatsapp_ad' : 'whatsapp',
   });
-  // Sent from the number the customer has since left: kept in the chat, but too old to answer.
-  const answer = automate && !moved;
-
-  const payload = referral ? { ...(parsed.payload ?? {}), referral } : parsed.payload;
+  const basePayload = referral ? { ...(parsed.payload ?? {}), referral } : parsed.payload;
   const preview = previewFor(parsed.type, parsed.body);
 
   let isNew = false;
+  let optOut: string | null = null;
   const inserted = await ctx.db.tx(async (q) => {
     await lockChannel(q, channel.id);
     // The contact row lock comes before the INSERT: messages of one chat handled at once are
     // placed (and counted as the lead's first) one after another. NO KEY UPDATE still lets the
     // INSERT below take its foreign-key share lock on this row.
-    const prev = await q.query<{ opened: boolean }>(
-      `SELECT last_message_at IS NULL AND source LIKE 'whatsapp%' AS opened FROM contacts WHERE id = $1 FOR NO KEY UPDATE`,
+    const prev = await q.query<{ opened: boolean; bot_state: BotState | null }>(
+      `SELECT last_message_at IS NULL AND source LIKE 'whatsapp%' AS opened, bot_state FROM contacts WHERE id = $1 FOR NO KEY UPDATE`,
       [contact.id],
     );
+    // "Baja" typed to a menu offering it picks that option: stored as the answer, no reader of the
+    // message takes it for an opt-out (optOutKeyword), and the bot handles it.
+    const keyword = optOutKeyword(parsed);
+    const option = keyword && parsed.type === 'text' ? await menuOptionTyped(q, channel.workspace_id, prev.rows[0]?.bot_state ?? null, parsed.body) : null;
+    optOut = option ? null : keyword;
+    const payload = option ? { ...(basePayload ?? {}), menu_option: option } : basePayload;
     const createdAt = await chatTime(q, contact.id, messageTime(msg.timestamp, receivedUs, seq), waTs, lateDelivery(msg.timestamp, receivedUs));
     const { rows } = await q.query<MessageRow>(
       `INSERT INTO messages (workspace_id, contact_id, channel_id, direction, type, body, media, payload, wamid,
@@ -538,7 +662,7 @@ export async function processInboundMessage(
     if (isSystem) {
       // The change happened at Meta's time of the notice (one far ahead of our clock is not Meta's).
       const changedAt = Math.min(waTs ?? receivedS, receivedS + META_CLOCK_SKEW_S);
-      await applySystemNotice(q, contact, waId, msg.system, createdAt, preview, changedAt);
+      await applySystemNotice(q, contact, channel.id, waId, msg.system, createdAt, preview, changedAt);
     } else {
       // A lead is new while the conversation it started over WhatsApp has no message yet (read
       // under the lock: of several first messages only one is the first, and a retry after the
@@ -550,6 +674,9 @@ export async function processInboundMessage(
       // stop reaching WhatsApp (the simulate route refuses this too; this guards every other path).
       // The wa_id is only learned for the number the contact has now (read under the lock): a message
       // from a number the customer left, however late, never points the replies back at it.
+      // Replies leave from the business number of the newest message: an older one delivered late to
+      // another of the business's numbers does not move the conversation back to it (values on the
+      // right are the row's before this UPDATE).
       await q.query(
         `UPDATE contacts SET last_message_at = GREATEST(COALESCE(last_message_at, $2), $2), last_inbound_at = GREATEST(COALESCE(last_inbound_at, $2), $2),
            last_message_preview = CASE WHEN last_message_at IS NULL OR $2 >= last_message_at THEN $3 ELSE last_message_preview END,
@@ -557,7 +684,7 @@ export async function processInboundMessage(
              SELECT 1 FROM messages e WHERE e.contact_id = $1 AND e.sent_by = 'phone' AND e.created_at > $2) THEN $4::int ELSE 0 END,
            wa_id = CASE WHEN phone = ANY($9::text[]) THEN $5 ELSE wa_id END,
            channel_id = CASE WHEN $8 AND EXISTS (SELECT 1 FROM channels ch WHERE ch.id = contacts.channel_id AND ch.provider = 'cloud_api')
-             THEN channel_id ELSE $6 END,
+             THEN channel_id WHEN channel_id IS NOT NULL AND last_inbound_at IS NOT NULL AND $2 < last_inbound_at THEN channel_id ELSE $6 END,
            name = COALESCE(name, $7), is_archived = false, updated_at = now()
          WHERE id = $1`,
         [contact.id, createdAt, preview, parsed.type === 'reaction' ? 0 : 1, waId, channel.id, profileName, channel.provider === 'sandbox', lineForms(waId)],
@@ -569,11 +696,13 @@ export async function processInboundMessage(
     }
     return m;
   });
+  // Someone asking to stop must not get an automatic answer; WhatsApp notices are not messages; one
+  // sent from the number the customer has since left is kept in the chat, but too old to answer.
   if (!inserted) {
     const raced = await storedMessage(ctx, channel.workspace_id, msg.id);
-    return raced ? finishDuplicate(ctx, raced, answer) : null;
+    return raced ? finishDuplicate(ctx, raced, answerable(raced) && !moved) : null;
   }
-  await inboundFollowups(ctx, inserted, { isNew, automate: answer });
+  await inboundFollowups(ctx, inserted, { isNew, automate: parsed.type !== 'reaction' && !isSystem && !optOut && !moved });
   return publicRow(inserted);
 }
 
@@ -592,18 +721,20 @@ async function finishDuplicate(ctx: AppContext, m: MessageRow, automate: boolean
 async function applySystemNotice(
   q: Queryable,
   contact: Contact,
+  channelId: string,
   waId: string,
   system: any,
   createdAt: string,
   preview: string,
   changedAt: number,
 ) {
+  // A contact on no number (its number deleted) is answered from the one this notice came through.
   await q.query(
     `UPDATE contacts SET last_message_at = GREATEST(COALESCE(last_message_at, $2), $2),
        last_message_preview = CASE WHEN last_message_at IS NULL OR $2 >= last_message_at THEN $3 ELSE last_message_preview END,
-       updated_at = now()
+       channel_id = COALESCE(channel_id, $4), updated_at = now()
      WHERE id = $1`,
-    [contact.id, createdAt, preview],
+    [contact.id, createdAt, preview, channelId],
   );
   // Meta's reference names the type customer_changed_number; its sample payload user_changed_number.
   if (system?.type !== 'customer_changed_number' && system?.type !== 'user_changed_number') return;
@@ -616,9 +747,13 @@ async function applySystemNotice(
   const { rows: fresh } = await q.query<{ phone: string; wa_id: string | null }>(`SELECT phone, wa_id FROM contacts WHERE id = $1`, [contact.id]);
   const cur = fresh[0];
   if (!cur || (cur.wa_id !== waId && !lineForms(waId).includes(cur.phone))) return;
+  // The new number may already be in the CRM in another of its forms (Brazil's 9th digit, Argentina's
+  // 9 or 15), saved by hand or imported: that contact is the line, as contactForWaId would match it.
   const other = await q.query<{ id: string }>(
-    `SELECT id FROM contacts WHERE workspace_id = $1 AND id <> $2 AND (phone = $3 OR wa_id = $4) ORDER BY created_at LIMIT 1`,
-    [contact.workspace_id, contact.id, newPhone, newWaId],
+    `SELECT id FROM contacts WHERE workspace_id = $1 AND id <> $2
+       AND (phone = $3 OR wa_id = $4 OR (phone = ANY($5::text[]) AND (wa_id IS NULL OR wa_id = phone)))
+     ORDER BY (wa_id = $4) IS TRUE DESC, (phone = $3) DESC, created_at LIMIT 1`,
+    [contact.workspace_id, contact.id, newPhone, newWaId, phoneVariants(newWaId).filter((v) => v !== newPhone)],
   );
   const otherId = other.rows[0]?.id ?? null;
   if (!otherId) await q.query(`UPDATE contacts SET phone = $2, wa_id = $3, updated_at = now() WHERE id = $1`, [contact.id, newPhone, newWaId]);
@@ -707,10 +842,12 @@ function notifyBroadcastProgress(ctx: AppContext, workspaceId: string, broadcast
  * number disconnected and connected again) still get their late statuses; whether a status may
  * move prepaid money is decided apart (billingTrusted), so an orphan is no way into the wallet.
  */
-type StatusTarget = MessageRow & { phone: string; contact_wa_id: string | null };
+type StatusTarget = MessageRow & { phone: string; contact_wa_id: string | null; default_country_code: string | null };
 
 async function statusTarget(ctx: AppContext, channel: ChannelRow, st: any): Promise<StatusTarget | null> {
-  const select = `SELECT m.*, c.phone, c.wa_id AS contact_wa_id FROM messages m JOIN contacts c ON c.id = m.contact_id
+  const select = `SELECT m.*, c.phone, c.wa_id AS contact_wa_id,
+       (SELECT w.default_country_code FROM workspaces w WHERE w.id = m.workspace_id) AS default_country_code
+     FROM messages m JOIN contacts c ON c.id = m.contact_id
      WHERE m.workspace_id = $2 AND (m.channel_id = $3 OR m.channel_id IS NULL) AND m.direction = 'out'`;
   const { rows } = await ctx.db.query<StatusTarget>(`${select} AND m.wamid = $1`, [st.id ?? null, channel.workspace_id, channel.id]);
   if (rows[0]) return rows[0];
@@ -755,7 +892,7 @@ export async function processStatus(ctx: AppContext, channel: ChannelRow, st: an
   const status: string = st.status;
   if (!['sent', 'delivered', 'read', 'failed'].includes(status)) return true;
 
-  let refunded = false;
+  let walletMoved = false;
   const result = await ctx.db.tx(async (q) => {
     // Lock the row: Meta can deliver several statuses of one message at the same time.
     const locked = await q.query<MessageRow>(`SELECT * FROM messages WHERE id = $1 FOR UPDATE`, [msg.id]);
@@ -774,19 +911,56 @@ export async function processStatus(ctx: AppContext, channel: ChannelRow, st: an
     const settles = billingTrusted || !msg.charged_prepaid;
     // Priced by the number the message went to, as the send was: the one Meta names when the status is its word.
     const recipient = digitsOnly(String(st.recipient_id ?? ''));
-    const billedTo = billingTrusted && isValidPhone(recipient) ? recipient : deliveryNumber(msg.phone, msg.contact_wa_id);
+    const billedTo = billingTrusted && isValidPhone(recipient) ? recipient : deliveryNumber(msg.phone, msg.contact_wa_id, msg.default_country_code);
+    // Meta only bills delivered messages. Two facts the status shown cannot keep are kept in the
+    // payload: that it was delivered ('failed' replaces 'delivered', and a delivery processed after
+    // the failure is not shown), and that a failure whose word settles billing was handled. That first
+    // one decides whether the charge goes back; an untrusted copy before it only shows the failure,
+    // and a repeat (redelivered, or run again by a retried job) decides nothing again.
+    const facts = (msg.payload ?? {}) as { delivered?: boolean; failure_settled?: boolean };
+    const isDelivery = status === 'delivered' || status === 'read';
+    const delivered = !!facts.delivered || msg.status === 'delivered' || msg.status === 'read';
+    const settlesFailure = settles && status === 'failed' && !facts.failure_settled;
+    const undelivered = settlesFailure && !delivered;
     if (settles && st.pricing) await reconcilePricing(ctx, q, msg, billedTo, st.pricing);
-    else if (settles && status === 'failed') await reconcilePricing(ctx, q, msg, billedTo, null);
-    // Meta only bills delivered messages: a failure after a billable "sent" gives the charge back.
-    if (settles && status === 'failed' && wasReconciled && msg.status !== 'delivered' && msg.status !== 'read' && Number(msg.cost) > 0) {
+    else if (undelivered) await reconcilePricing(ctx, q, msg, billedTo, null);
+    // A failure after a billable "sent" gives the charge back.
+    if (undelivered && wasReconciled && Number(msg.cost) > 0) {
       await q.query(`UPDATE messages SET cost = 0 WHERE id = $1`, [msg.id]);
       await refund(q, msg.workspace_id, Number(msg.cost), {
         messageId: msg.id,
         broadcastId: msg.broadcast_id,
         prepaid: !!msg.charged_prepaid,
-        description: 'Reembolso: mensaje no entregado',
+        description: UNDELIVERED_REFUND,
       });
-      refunded = true;
+      walletMoved = true;
+    }
+    // Delivered after all: its failure was processed first (statuses of one message may be handled out
+    // of order) and gave the charge back. Meta billed the delivery, so that refund is taken back, once.
+    const billed = isDelivery && st.pricing?.billable !== false;
+    if (settles && billed && msg.status === 'failed' && wasReconciled && Number(msg.cost) === 0) {
+      const given = await q.query<{ amount: string | number }>(
+        `SELECT COALESCE(sum(amount), 0) AS amount FROM credit_ledger WHERE message_id = $1 AND kind = 'refund' AND description = $2`,
+        [msg.id, UNDELIVERED_REFUND],
+      );
+      const back = roundMoney(Number(given.rows[0]?.amount ?? 0));
+      if (back > 0) {
+        await q.query(`UPDATE messages SET cost = $2 WHERE id = $1`, [msg.id, back]);
+        await charge(q, msg.workspace_id, back, {
+          messageId: msg.id,
+          broadcastId: msg.broadcast_id,
+          prepaid: !!msg.charged_prepaid,
+          force: true,
+          description: 'Cargo: mensaje entregado después de reportarse como fallido',
+        });
+        walletMoved = true;
+      }
+    }
+    const learned: Record<string, true> = {};
+    if (!facts.delivered && (delivered || isDelivery) && (status === 'failed' || msg.status === 'failed')) learned.delivered = true;
+    if (settlesFailure) learned.failure_settled = true;
+    if (Object.keys(learned).length) {
+      await q.query(`UPDATE messages SET payload = COALESCE(payload, '{}'::jsonb) || $2::jsonb WHERE id = $1`, [msg.id, JSON.stringify(learned)]);
     }
 
     let error: unknown = null;
@@ -839,7 +1013,7 @@ export async function processStatus(ctx: AppContext, channel: ChannelRow, st: an
     );
     return { row, changed: true };
   });
-  if (refunded) notifyCredits(ctx, channel.workspace_id);
+  if (walletMoved) notifyCredits(ctx, channel.workspace_id);
   // The send already has another wamid: this status is not about it.
   if (!result) return true;
   await rememberRecipient(ctx, msg, st.recipient_id);
@@ -871,6 +1045,10 @@ async function processEchoes(ctx: AppContext, value: any, allowed: string[] | nu
 }
 
 async function processEcho(ctx: AppContext, channel: ChannelRow, echo: any, receivedUs: number, seq: number) {
+  if (isMessageChange(echo)) {
+    await applyMessageChange(ctx, channel, echo, 'out');
+    return;
+  }
   const stored = await storedMessage(ctx, channel.workspace_id, echo.id);
   if (stored) {
     if (stored.followups_done === false) await echoFollowups(ctx, stored);
@@ -912,9 +1090,9 @@ async function processEcho(ctx: AppContext, channel: ChannelRow, echo: any, rece
          last_message_preview = CASE WHEN last_message_at IS NULL OR $2 >= last_message_at THEN $3 ELSE last_message_preview END,
          unread_count = CASE WHEN last_inbound_at IS NULL OR $2 >= last_inbound_at THEN 0 ELSE unread_count END,
          bot_state = jsonb_set(COALESCE(bot_state, '{"path":[]}'::jsonb), '{done}', 'true'),
-         ai_paused = true, updated_at = now()
+         ai_paused = true, channel_id = COALESCE(channel_id, $4), updated_at = now()
        WHERE id = $1`,
-      [contact.id, createdAt, previewFor(parsed.type, parsed.body)],
+      [contact.id, createdAt, previewFor(parsed.type, parsed.body), channel.id],
     );
     return m;
   });
@@ -940,6 +1118,7 @@ async function echoFollowups(ctx: AppContext, m: MessageRow) {
  */
 async function processTemplateStatus(ctx: AppContext, wabaId: string, value: any, allowed: string[] | null, at: string | null) {
   const event = String(value.event ?? '').toUpperCase();
+  if (event === 'UNARCHIVED') return restoreTemplates(ctx, wabaId, value, allowed, at);
   const status = event === 'REINSTATED' ? 'APPROVED' : TEMPLATE_STATUSES.has(event) ? event : null;
   if (!status) {
     ctx.log.debug({ event, template: value.message_template_name }, 'template event leaves the status unchanged');
@@ -968,6 +1147,31 @@ async function processTemplateStatus(ctx: AppContext, wabaId: string, value: any
   // Fixing a rejected template (or editing an approved one) happens in WhatsApp Manager: it
   // keeps its id, name and language and comes back APPROVED with other content.
   if (status === 'APPROVED') await queueTemplateRefresh(ctx, rows);
+}
+
+/**
+ * UNARCHIVED: Meta restored an archived template to the status it had before (not always APPROVED).
+ * The event is dated like a status, so an older ARCHIVED delivered after it changes nothing; the
+ * template.refresh job then adopts the status Meta has for it.
+ */
+async function restoreTemplates(ctx: AppContext, wabaId: string, value: any, allowed: string[] | null, at: string | null) {
+  const { rows } = await ctx.db.query<{ workspace_id: string; id: string }>(
+    `UPDATE templates t SET status_event_at = COALESCE($6::timestamptz, t.status_event_at), updated_at = now()
+     FROM channels ch
+     WHERE ch.id = t.channel_id AND ch.waba_id = $1 AND (t.meta_id = $2 OR (t.name = $3 AND t.language = $4))
+       AND ($5::uuid[] IS NULL OR ch.id = ANY($5::uuid[]))
+       AND ($6::timestamptz IS NULL OR t.status_event_at IS NULL OR t.status_event_at <= $6::timestamptz)
+     RETURNING t.workspace_id, t.id`,
+    [wabaId, String(value.message_template_id ?? ''), value.message_template_name ?? '', value.message_template_language ?? '', allowed, at],
+  );
+  for (const r of rows) {
+    // Its own key: a components refresh already queued keeps the stored status.
+    await ctx.queue.enqueue(
+      'template.refresh',
+      { workspaceId: r.workspace_id, templateId: r.id, restore: true },
+      { dedupeKey: `template.restore:${r.id}`, maxAttempts: 8 },
+    );
+  }
 }
 
 /** Meta changed a template's content (message_template_components_update). */

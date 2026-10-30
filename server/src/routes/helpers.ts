@@ -10,6 +10,14 @@ export const COOKIE = 'll_token';
 /** Signed entries of the accounts that signed in from this browser (see knownDevice). */
 export const DEVICE_COOKIE = 'll_device';
 
+/**
+ * A session lasts as long as its token (signed once, when its row is created): the row itself
+ * stops counting then too, so nothing (a socket, a token re-signed elsewhere) outlives it.
+ */
+export const SESSION_DAYS = 30;
+/** SQL condition: the session row `s` is younger than SESSION_DAYS. */
+export const SESSION_FRESH = `s.created_at > now() - interval '${SESSION_DAYS} days'`;
+
 export interface AuthUser {
   id: string;
   email: string;
@@ -59,7 +67,7 @@ export async function requireSession(ctx: AppContext, req: FastifyRequest): Prom
   const { rows } = await ctx.db.query<AuthUser & { stale: boolean }>(
     `SELECT u.id, u.email, u.name, u.is_superadmin, s.last_seen_at < now() - interval '5 minutes' AS stale
      FROM sessions s JOIN users u ON u.id = s.user_id AND u.password_version = s.password_version
-     WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL`,
+     WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL AND ${SESSION_FRESH}`,
     [payload.sid, payload.uid],
   );
   if (!rows[0]) throw unauthorized();

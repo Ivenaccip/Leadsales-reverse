@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import {
   BarChart3,
   Bot,
@@ -21,6 +21,7 @@ import { connectRealtime, useRealtime, useRealtimeResync } from '../lib/realtime
 import { useCredits } from '../lib/queries';
 import { credits as fmtCredits } from '../lib/format';
 import { api, errorMessage } from '../lib/api';
+import type { Estimate } from '../lib/types';
 import { revokeContact } from './inbox/helpers';
 import { Avatar, Button, Field, Input, Modal, cx, useToast } from './ui';
 
@@ -35,6 +36,30 @@ const NAV = [
   { to: '/creditos', label: 'Créditos', icon: Coins },
   { to: '/ajustes', label: 'Ajustes', icon: Settings },
 ];
+
+/**
+ * The balance changed (a top-up, a charge): the sidebar's balance and any broadcast estimate, whose
+ * "Créditos insuficientes" and disabled "Enviar" come from the balance it was computed with.
+ * Charges come every couple of seconds while a broadcast runs, and an estimate scans its whole
+ * audience: the cached ones get the fresh balance instead of being computed again.
+ */
+export async function refreshCredits(qc: QueryClient) {
+  const before = qc.getQueryState(['credits'])?.dataUpdateCount ?? 0;
+  await qc.invalidateQueries({ queryKey: ['credits'] });
+  const state = qc.getQueryState<{ billing_mode: Estimate['billing_mode']; balance: number }>(['credits']);
+  // A newer update cancelled this reload and is reloading it: that one patches the estimates.
+  if (state?.fetchStatus === 'fetching') return;
+  const fresh = state?.data && state.dataUpdateCount > before ? state.data : null;
+  for (const [key, e] of qc.getQueriesData<Estimate>({ queryKey: ['broadcast-estimate'] })) {
+    if (!e) continue;
+    // The billing mode changed since: the server computes it again.
+    if (fresh && fresh.billing_mode !== e.billing_mode) void qc.invalidateQueries({ queryKey: key, exact: true });
+    else if (e.billing_mode !== 'prepaid') continue; // the balance plays no part in it
+    else if (fresh) qc.setQueryData<Estimate>(key, { ...e, balance: fresh.balance, sufficient: fresh.balance >= e.cost });
+    // The balance could not be reloaded here: ask the server.
+    else void qc.invalidateQueries({ queryKey: key, exact: true });
+  }
+}
 
 /**
  * Whether to offer "Nuevo espacio": the server lets only the instance operator create workspaces
@@ -128,7 +153,10 @@ function WorkspaceMenu() {
             <NavLink to="/ajustes/perfil" onClick={() => setOpen(false)} className="block rounded-lg px-3 py-2 text-sm hover:bg-slate-100">
               Mi perfil
             </NavLink>
-            <button onClick={() => void logout()} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50">
+            <button
+              onClick={() => void logout().catch((err) => toast.error(errorMessage(err)))}
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50"
+            >
               <LogOut className="h-4 w-4" /> Cerrar sesión
             </button>
           </div>
@@ -162,7 +190,7 @@ export function Layout() {
     connectRealtime(workspace?.id ?? null);
   }, [workspace?.id, user?.id]);
 
-  useRealtime('credits:update', () => void qc.invalidateQueries({ queryKey: ['credits'] }));
+  useRealtime('credits:update', () => void refreshCredits(qc));
   // A restricted agent lost access to a conversation (assigned to someone else): forget it everywhere.
   useRealtime<{ id: string }>('contact:revoked', (e) => revokeContact(qc, e.id));
   // After a reconnection, events sent while the socket was down never arrive: refetch what is shown.

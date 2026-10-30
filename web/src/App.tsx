@@ -1,10 +1,11 @@
 import { lazy, Suspense, useEffect, type ReactNode } from 'react';
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { Layout } from './components/Layout';
-import { Button, PageLoader } from './components/ui';
+import { Button, PageLoader, useToast } from './components/ui';
+import { errorMessage } from './lib/api';
 import { listenForSessionChanges } from './lib/realtime';
 import { noWorkspaceReason, useSession } from './lib/session';
-import { LoginPage, RegisterPage } from './pages/Login';
+import { LoginPage, RegisterPage, SessionReconnecting } from './pages/Login';
 
 const InboxPage = lazy(() => import('./pages/Inbox'));
 const FunnelsPage = lazy(() => import('./pages/Funnels'));
@@ -20,6 +21,7 @@ const InvitationPage = lazy(() => import('./pages/Invitation'));
 
 function NoWorkspace({ reason }: { reason: string }) {
   const session = useSession();
+  const toast = useToast();
   const userId = session.user?.id;
   // Rights changes reach the user's socket: the operator reactivating the workspace then reloads
   // the session and lets them in without a page reload.
@@ -29,7 +31,7 @@ function NoWorkspace({ reason }: { reason: string }) {
   return (
     <div className="space-y-4 p-10 text-center text-slate-600">
       <p>{reason}</p>
-      <Button variant="outline" onClick={() => void session.logout()}>
+      <Button variant="outline" onClick={() => void session.logout().catch((err) => toast.error(errorMessage(err)))}>
         Cerrar sesión
       </Button>
     </div>
@@ -39,7 +41,8 @@ function NoWorkspace({ reason }: { reason: string }) {
 function RequireAuth({ children }: { children: ReactNode }) {
   const session = useSession();
   const location = useLocation();
-  if (session.loading) return <PageLoader />;
+  // Not loaded yet is not signed out: a server that could not answer is retried, not sent to /login.
+  if (session.loading) return session.reconnecting ? <SessionReconnecting /> : <PageLoader />;
   if (!session.user) return <Navigate to="/login" state={{ from: location.pathname }} replace />;
   const blocked = noWorkspaceReason(session);
   if (blocked) return <NoWorkspace reason={blocked} />;

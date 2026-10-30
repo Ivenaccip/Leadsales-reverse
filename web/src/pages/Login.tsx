@@ -5,7 +5,7 @@ import { CheckCircle2 } from 'lucide-react';
 import { api, errorMessage } from '../lib/api';
 import { useSession } from '../lib/session';
 import type { User, WorkspaceSummary } from '../lib/types';
-import { Alert, Button, Field, Input, Select } from '../components/ui';
+import { Alert, Button, Field, Input, Select, Spinner } from '../components/ui';
 
 interface Instance {
   allowSignup: boolean;
@@ -42,6 +42,20 @@ export function AuthShell({ children }: { children: React.ReactNode }) {
       <div className="flex flex-1 items-center justify-center px-6 py-10">
         <div className="w-full max-w-sm">{children}</div>
       </div>
+    </div>
+  );
+}
+
+/** The session could not be loaded (the server is restarting, its database is down, no network): it is retried. */
+export function SessionReconnecting() {
+  const { refresh } = useSession();
+  return (
+    <div className="flex h-full min-h-[40vh] flex-col items-center justify-center gap-4 p-10 text-center text-slate-600">
+      <Spinner className="h-7 w-7" />
+      <p>No se pudo conectar con el servidor. Reintentando…</p>
+      <Button variant="outline" onClick={() => void refresh()}>
+        Reintentar ahora
+      </Button>
     </div>
   );
 }

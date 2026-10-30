@@ -33,6 +33,7 @@ const menuSchema: z.ZodType<any> = z
   .object({
     prompt: z.string().trim().min(1).max(1024),
     options: z.array(optionSchema).min(1).max(10),
+    next_key: z.number().int().min(1).max(9_999_999_999).optional(),
   })
   .superRefine((menu, issues) => {
     const seen = new Set<string>();
@@ -240,6 +241,10 @@ export async function workspaceRoutes(app: FastifyInstance, ctx: AppContext) {
       }
       await q.query(`UPDATE contacts SET assigned_user_id = NULL WHERE workspace_id = $1 AND assigned_user_id = $2`, [a.workspaceId, id]);
       await q.query(`DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2`, [a.workspaceId, id]);
+      await q.query(`UPDATE funnels SET assignee_ids = array_remove(assignee_ids, $2::uuid) WHERE workspace_id = $1 AND $2::uuid = ANY(assignee_ids)`, [
+        a.workspaceId,
+        id,
+      ]);
       await revokePendingInvitations(q, a.workspaceId, { userId: id });
     });
     await ctx.realtime.evict(a.workspaceId, id);

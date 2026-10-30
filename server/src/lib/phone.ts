@@ -96,14 +96,35 @@ export function countryFromPhone(phone: string): string | null {
   return null;
 }
 
+// Countries none of whose international numbers has 10 digits (+1 numbers have 11): a 10-digit
+// "wa_id" starting with their code is no WhatsApp id.
+const NEVER_TEN_DIGITS = new Set([
+  'MX', 'CO', 'BR', 'AR', 'CL', 'VE', 'EC', 'BO', 'UY', 'GT', 'SV', 'HN', 'NI', 'CR', 'HT',
+  'ES', 'PT', 'GB', 'FR', 'NL', 'CH', 'IN', 'CN', 'JP', 'AU',
+]);
+
+/** Whether a 10-digit number can be a whole international one (Singapore 65, Norway 47, Peru 51...). */
+function tenDigitInternational(d: string): boolean {
+  if (!/^\d{10}$/.test(d) || d.startsWith('1')) return false;
+  const country = countryFromPhone(d);
+  return !country || !NEVER_TEN_DIGITS.has(country);
+}
+
 /**
  * The number a message to this contact goes to (and is priced by): the WhatsApp id Meta resolved
  * when it is another form of the phone (Brazil's 9th digit, Argentina's 9, Mexico's 1), otherwise
  * the phone, which Meta resolves itself. Any other wa_id is not this line: one forged abroad, or the
  * number the customer left, which an earlier version learned from a late status.
+ * One exception, given the workspace's default country code: versions up to 850282e stored a
+ * 10-digit wa_id (Singapore, Norway...) as that code + the wa_id, so the phone is not the customer's
+ * number and the wa_id is (migration 007 fixed the phone wherever no other contact held the number).
+ * Those versions also stored a national number typed into a sandbox simulation as the wa_id of the
+ * right phone (55 1234 5678 -> 525512345678): a wa_id no country has is not the customer's.
  */
-export function deliveryNumber(phone: string, waId: string | null | undefined): string {
-  return waId && lineForms(waId).includes(phone) ? waId : phone;
+export function deliveryNumber(phone: string, waId: string | null | undefined, defaultCountryCode?: string | null): string {
+  if (!waId) return phone;
+  if (lineForms(waId).includes(phone)) return waId;
+  return defaultCountryCode && phone === `${defaultCountryCode}${waId}` && tenDigitInternational(waId) ? waId : phone;
 }
 
 /** Pricing market used in the rate card for a phone number. */

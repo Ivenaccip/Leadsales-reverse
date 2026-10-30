@@ -67,6 +67,10 @@ interface Lane {
   pumping: boolean;
   again: boolean;
   rotate: number;
+  /** Where the next fair claim goes on reading the due wakeups, after a window that was full (see claimFair). */
+  wakeFrom: { at: string; id: string } | null;
+  /** The last fair claim left due wakeups beyond its window and folded some away: read on now. */
+  more: boolean;
 }
 
 type ClaimedRow = Job & { locked_by?: string | null };
@@ -89,6 +93,8 @@ const yieldToEventLoop = () => new Promise<void>((r) => setImmediate(r));
 // Waits between tries of a job's final write, so a short database blip does not strand the job.
 const RECORD_RETRY_MS = [250, 1000, 3000];
 const USAGE_HALF_LIFE_MS = 60_000;
+// Most due wakeups one fair claim reads (see claimFair).
+const FAIR_WINDOW = 256;
 const decayed = (u: { ms: number; at: number } | undefined, now: number) => (u ? u.ms * 0.5 ** ((now - u.at) / USAGE_HALF_LIFE_MS) : 0);
 
 /**
@@ -107,6 +113,8 @@ export class Worker {
   private lastCleanup = 0;
   private lastAnalyze = 0;
   private lastVacuumAll = 0;
+  /** Wakeups this process folded away since job_wakeups was last vacuumed (PGlite). */
+  private wakeupsFolded = 0;
   /** Jobs whose handler or final write is still in progress in this process. */
   private active = new Set<number>();
 
@@ -124,6 +132,8 @@ export class Worker {
       pumping: false,
       again: false,
       rotate: 0,
+      wakeFrom: null,
+      more: false,
     }));
     ctx.queue.onEnqueue(() => this.kick());
   }
@@ -226,7 +236,7 @@ export class Worker {
           break;
         }
         for (const job of jobs) this.launch(lane, job);
-        if (jobs.length) lane.again = true;
+        if (jobs.length || lane.more) lane.again = true;
       } while (lane.again && !this.stopped);
     } catch (err: any) {
       if (err?.code === '23505') {
@@ -310,23 +320,58 @@ export class Worker {
    */
   private async claimFair(lane: Lane, slots: number): Promise<Claimed[]> {
     const cap = lane.opts.perWorkspace!;
-    // Distinct workspaces with queued jobs, read with one index probe each (loose index scan).
-    const { rows: owners } = await this.ctx.db.query<{ id: string; running: number; account: string | null }>(
-      `WITH RECURSIVE ws AS (
-         (SELECT workspace_id FROM jobs WHERE lane = $1 AND status = 'queued' AND NOT held AND workspace_id IS NOT NULL ORDER BY workspace_id LIMIT 1)
-         UNION ALL
-         SELECT (SELECT j.workspace_id FROM jobs j
-                 WHERE j.lane = $1 AND j.status = 'queued' AND NOT j.held AND j.workspace_id > ws.workspace_id ORDER BY j.workspace_id LIMIT 1)
-         FROM ws WHERE ws.workspace_id IS NOT NULL
+    // The workspaces with ready jobs come from their wakeups (job_wakeups: a row each time one of
+    // their jobs becomes claimable, at its run_at, written by a trigger on jobs), never from a walk
+    // over every workspace with a queued job: the ones whose jobs are only due later (messages
+    // scheduled months ahead, deliveries in backoff), which anyone can pile up, cost a claim nothing,
+    // and neither does a backlog that cannot run (a tenant at its cap). The due wakeups read are
+    // folded: one stays for each workspace that still has ready jobs, and a workspace whose ready
+    // jobs are gone gets one at its next job's run_at. A claim reads at most FAIR_WINDOW of them,
+    // going on where the last full one stopped, so every workspace with ready jobs is reached in turn.
+    const from = lane.wakeFrom;
+    const { rows: found } = await this.ctx.db.query<{
+      read: number;
+      folded: number;
+      last: { at: string; id: string } | null;
+      owners: { id: string; running: number; account: string | null }[] | null;
+    }>(
+      `WITH due AS (
+         SELECT id, workspace_id, run_at FROM job_wakeups
+         WHERE lane = $1 AND run_at <= now() AND (run_at, id) > ($2::timestamptz, $3::bigint)
+         ORDER BY run_at, id LIMIT $4
+         FOR UPDATE SKIP LOCKED
+       ),
+       heads AS (SELECT DISTINCT ON (workspace_id) id, workspace_id FROM due ORDER BY workspace_id, run_at, id),
+       ws AS (
+         SELECT h.id AS wakeup, h.workspace_id AS id,
+           (SELECT j.run_at FROM jobs j WHERE j.lane = $1 AND j.status = 'queued' AND NOT j.held AND j.workspace_id = h.workspace_id
+            ORDER BY j.run_at LIMIT 1) AS next
+         FROM heads h
+       ),
+       folded AS (
+         DELETE FROM job_wakeups WHERE id = ANY(ARRAY(SELECT id FROM due EXCEPT SELECT wakeup FROM ws WHERE next <= now())) RETURNING id
+       ),
+       later AS (
+         INSERT INTO job_wakeups (lane, workspace_id, run_at) SELECT $1, id, next FROM ws WHERE next > now()
        )
-       SELECT ws.workspace_id AS id,
-         (SELECT count(*)::int FROM jobs r WHERE r.lane = $1 AND r.status = 'running' AND r.workspace_id = ws.workspace_id) AS running,
-         (SELECT m.user_id::text FROM memberships m WHERE m.workspace_id = ws.workspace_id AND m.role = 'owner' ORDER BY m.created_at LIMIT 1) AS account
-       FROM ws
-       WHERE ws.workspace_id IS NOT NULL
-         AND EXISTS (SELECT 1 FROM jobs j WHERE j.lane = $1 AND j.status = 'queued' AND NOT j.held AND j.workspace_id = ws.workspace_id AND j.run_at <= now())`,
-      [lane.name],
+       SELECT (SELECT count(*)::int FROM due) AS read,
+         (SELECT count(*)::int FROM folded) AS folded,
+         (SELECT json_build_object('at', run_at::text, 'id', id::text) FROM due ORDER BY run_at DESC, id DESC LIMIT 1) AS last,
+         (SELECT json_agg(json_build_object(
+            'id', w.id,
+            'running', (SELECT count(*) FROM jobs r WHERE r.lane = $1 AND r.status = 'running' AND r.workspace_id = w.id),
+            'account', (SELECT m.user_id FROM memberships m WHERE m.workspace_id = w.id AND m.role = 'owner' ORDER BY m.created_at LIMIT 1)))
+          FROM ws w WHERE w.next <= now()) AS owners`,
+      [lane.name, from?.at ?? '-infinity', from?.id ?? '0', FAIR_WINDOW],
     );
+    // After a full window the next claim reads on from it, and the pump does so right away when this
+    // one folded wakeups away (a burst, or the leftovers of jobs already run): each such pass consumes
+    // some. A window that was not full reached the end: the next claim starts over.
+    const full = (found[0]?.read ?? 0) >= FAIR_WINDOW;
+    lane.wakeFrom = full ? found[0].last : null;
+    lane.more = full && found[0].folded > 0;
+    this.wakeupsFolded += found[0]?.folded ?? 0;
+    const owners = found[0]?.owners ?? [];
     const now = Date.now();
     type Room = { id: string; used: number };
     const accounts = new Map<string, Room & { next: number; workspaces: (Room & { left: number })[] }>();
@@ -387,7 +432,9 @@ export class Worker {
     if (Date.now() - this.lastBeat > (this.opts.heartbeatMs ?? 15_000)) await this.beat();
     const running: Promise<void>[] = [];
     for (const lane of this.lanes) {
-      const jobs = await this.claim(lane, lane.opts.concurrency);
+      let jobs = await this.claim(lane, lane.opts.concurrency);
+      // As the pump does: a full window of wakeups that only folded away, read on.
+      while (!jobs.length && lane.more) jobs = await this.claim(lane, lane.opts.concurrency);
       running.push(...jobs.map((job) => this.runJob(job)));
     }
     await Promise.all(running);
@@ -577,7 +624,10 @@ export class Worker {
       await this.giveBack(job, job.locked_by ?? null, {
         counted: true,
         // At startup the jobs were most likely cut off by the restart itself: run them again now.
-        now: all,
+        // So is any job a dead process was running when it has a serial key (a contact's automation):
+        // with a backoff, the contact's next job would be let through and run before it. Its process
+        // has been gone deadAfterMs, which already spaces out the tries of a job that kills it.
+        now: all || (!mine && !!job.serial_key),
         reason: mine
           ? 'No se pudo guardar el resultado del trabajo por una falla de la base de datos'
           : 'El proceso que ejecutaba el trabajo se detuvo antes de terminarlo',
@@ -622,7 +672,7 @@ export class Worker {
       const changed = rows[0]?.n ?? 0;
       if (changed < 1000 && !(changed > 0 && Date.now() - this.lastAnalyze > 60_000)) return;
     }
-    await this.ctx.db.query(`ANALYZE jobs`);
+    await this.ctx.db.query(`ANALYZE jobs, job_wakeups`);
     this.lastAnalyze = Date.now();
   }
 
@@ -648,6 +698,16 @@ export class Worker {
     } catch (err) {
       this.ctx.log.error({ err }, 'refreshing job statistics failed');
     }
+    if (this.ctx.db.kind === 'pglite' && this.wakeupsFolded >= 1000) {
+      // Claims read the due wakeups with a bitmap scan, which also returns the deleted ones still in
+      // the index: with no autovacuum, every job run since the last VACUUM would cost each claim.
+      try {
+        this.wakeupsFolded = 0;
+        await this.ctx.db.query(`VACUUM job_wakeups`);
+      } catch (err) {
+        this.ctx.log.error({ err }, 'vacuum failed');
+      }
+    }
     const now = Date.now();
     for (const lane of this.lanes) {
       for (const usage of [lane.usage.account, lane.usage.workspace]) for (const [id, u] of usage) if (now - u.at > 10 * USAGE_HALF_LIFE_MS) usage.delete(id);
@@ -662,11 +722,13 @@ export class Worker {
     }
     if (this.ctx.db.kind === 'pglite') {
       // PGlite runs no autovacuum: without VACUUM the space of deleted and updated rows is never
-      // reused, and the jobs table (a few row versions per job) grows with every job ever run. Once a
-      // day the whole database, as autovacuum would (message statuses, contacts, old transaction ids).
+      // reused, and the jobs table (a few row versions per job, and its wakeups) grows with every job
+      // ever run. Once a day the whole database, as autovacuum would (message statuses, contacts, old
+      // transaction ids).
       const all = Date.now() - this.lastVacuumAll >= 24 * 60 * 60_000;
       try {
-        await this.ctx.db.query(all ? `VACUUM` : `VACUUM jobs`);
+        this.wakeupsFolded = 0;
+        await this.ctx.db.query(all ? `VACUUM` : `VACUUM jobs, job_wakeups`);
         if (all) this.lastVacuumAll = Date.now();
       } catch (err) {
         this.ctx.log.error({ err }, 'vacuum failed');

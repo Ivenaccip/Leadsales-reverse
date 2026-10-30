@@ -39,6 +39,10 @@ function isMetaMediaHost(host: string): boolean {
 
 const DEFAULT_MAX_MEDIA_BYTES = 100 * 1024 * 1024;
 
+const TEMPLATE_FIELDS = 'id,name,language,status,category,components,parameter_format,rejected_reason';
+// Meta's limit of 6,000 templates is 60 pages of 100: the guard leaves room for smaller pages.
+const MAX_TEMPLATE_PAGES = 300;
+
 function tooBig(max: number) {
   return permanent(new MetaApiError(`El archivo supera el máximo de ${Math.round(max / 1024 / 1024)} MB`, null, 413));
 }
@@ -104,7 +108,8 @@ export class CloudApiProvider implements WhatsAppProvider {
         e.error_user_msg || e.message || `Meta respondió HTTP ${res.status}`,
         typeof e.code === 'number' ? e.code : null,
         res.status,
-        e.error_data ?? e,
+        // error_data replaces the error as details, but sendMessage still needs the subcode (100/33).
+        e.error_data ? { ...e.error_data, error_subcode: e.error_subcode } : e,
       );
     }
     return json as T;
@@ -249,17 +254,36 @@ export class CloudApiProvider implements WhatsAppProvider {
     await this.call('POST', `${this.requireWaba()}/subscribed_apps`);
   }
 
+  /**
+   * Every template of the WABA: callers take the list as Meta's full state (a sync deletes what it
+   * does not name), so it is followed to its last page or not returned at all. A WABA holds at most
+   * 6,000 templates (each language counts); the page guard only stops a list that never ends.
+   */
   async listTemplates() {
     const out: MetaTemplate[] = [];
-    let path: string | null =
-      `${this.requireWaba()}/message_templates?limit=100&fields=id,name,language,status,category,components,parameter_format,rejected_reason`;
-    for (let page = 0; path && page < 50; page++) {
+    let path: string | null = `${this.requireWaba()}/message_templates?limit=100&fields=${TEMPLATE_FIELDS}`;
+    for (let page = 0; path; page++) {
+      if (page >= MAX_TEMPLATE_PAGES) {
+        throw new MetaApiError('Meta no terminó de listar las plantillas de la cuenta: no se sincronizó nada. Inténtalo de nuevo más tarde.', null, 502);
+      }
       const r: { data: MetaTemplate[]; paging?: { next?: string } } = await this.call('GET', path);
-      out.push(...r.data);
+      out.push(...(r.data ?? []));
       const next = r.paging?.next;
       path = next ? next.slice(next.indexOf(this.o.version) + this.o.version.length + 1) : null;
     }
     return out;
+  }
+
+  /** One template by its Meta id; null when Meta does not have it (or the id is not one of Meta's). */
+  async getTemplate(id: string): Promise<MetaTemplate | null> {
+    if (!/^\d{1,32}$/.test(id)) return null;
+    try {
+      return await this.call<MetaTemplate>('GET', `${id}?fields=${TEMPLATE_FIELDS}`);
+    } catch (err) {
+      // Not found (deleted at Meta, or an id of another kind): the caller falls back to the list.
+      if (err instanceof MetaApiError && (err.httpStatus === 400 || err.httpStatus === 404) && err.code === 100) return null;
+      throw err;
+    }
   }
 
   async createTemplate(input: CreateTemplateInput) {

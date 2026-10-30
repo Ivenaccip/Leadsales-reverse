@@ -513,9 +513,12 @@ describe('#36 CSV import and the shared event loop', () => {
     // Lines end in CRLF from the first one on, so the parser reads "x\n" as the start of a wide
     // header that a look at the first line alone takes for one column.
     files.push(`\r\nx\n${wide}\r\n+525500000001\r\n`);
-    for (const csv of files) {
+    for (const [i, csv] of files.entries()) {
       const { out, maxMs } = await blocked(() => env.api('POST', '/api/contacts/import', { csv, lossy: false }, op));
-      expect(out.body.error.code).toBe('CSV_TOO_MANY_COLUMNS');
+      // The last one's header record is also over the parser's record size limit (round 5), which
+      // may stop it first: refused either way, before its columns are walked.
+      if (i === files.length - 1) expect(['CSV_TOO_MANY_COLUMNS', 'CSV_RECORD_TOO_LARGE']).toContain(out.body.error.code);
+      else expect(out.body.error.code).toBe('CSV_TOO_MANY_COLUMNS');
       expect(maxMs).toBeLessThan(400);
     }
     // Millions of blank lines are skipped in linear time (no 500).

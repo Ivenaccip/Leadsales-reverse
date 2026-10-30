@@ -120,6 +120,11 @@ async function lastJobId() {
 }
 
 /** Runs `hook` once, right after the first query whose SQL matches, before its result is returned. */
+/** The ll_token a response set, as a Cookie header. */
+function sessionCookie(headers: any): string {
+  return String([headers['set-cookie']].flat().find((c) => String(c).startsWith('ll_token='))).split(';')[0];
+}
+
 function interceptQuery(match: (sql: string) => boolean, hook: () => Promise<void>, when: 'before' | 'after' = 'after') {
   const db = env.built.ctx.db as any;
   const original = db.query;
@@ -365,7 +370,8 @@ describe('current-password guessing on PATCH /api/auth/me (r3 #11)', () => {
     const change = await env.api('PATCH', '/api/auth/me', { currentPassword: 'correcta123', password: 'nueva-segura-123' }, mine);
     expect(change.status).toBe(200);
     expect((await env.api('GET', '/api/auth/me', undefined, stolen)).status).toBe(401);
-    expect((await env.api('GET', '/api/auth/me', undefined, mine)).status).toBe(200);
+    // her browser goes on with the new cookie the change set
+    expect((await env.api('GET', '/api/auth/me', undefined, { cookie: sessionCookie(change.headers), ws: null })).status).toBe(200);
   });
 });
 
@@ -613,12 +619,14 @@ describe('password changes racing a login (r3 #29)', () => {
   it('a login that verified the old password while it changed gets a dead session', async () => {
     await member(owner.workspaceId, 'carrera@r3.com', 'agent', 'vieja123456');
     const mine = await login('carrera@r3.com', 'vieja123456');
+    let changed: { headers: any } | undefined;
     // the attacker's login has checked the old password; the owner's change commits before its session row
     const restore = interceptQuery(
       (sql) => sql.startsWith('INSERT INTO sessions'),
       async () => {
         const r = await env.api('PATCH', '/api/auth/me', { currentPassword: 'vieja123456', password: 'nueva1234567' }, { cookie: mine.cookie, ws: null });
         expect(r.status).toBe(200);
+        changed = r;
       },
       'before',
     );
@@ -628,12 +636,13 @@ describe('password changes racing a login (r3 #29)', () => {
     } finally {
       restore();
     }
+    expect(changed).toBeDefined();
     expect(attacker.status).toBe(200);
     expect((await env.api('GET', '/api/auth/me', undefined, { cookie: attacker.cookie, ws: null })).status).toBe(401);
     const rt = socketFor(attacker.cookie);
     expect((await new Promise<Error>((r) => rt.s.on('connect_error', r))).message).toBe('unauthorized');
-    // the owner's own session survives its change
-    expect((await env.api('GET', '/api/auth/me', undefined, { cookie: mine.cookie, ws: null })).status).toBe(200);
+    // the owner's own session goes on, under the new cookie the change set
+    expect((await env.api('GET', '/api/auth/me', undefined, { cookie: sessionCookie(changed!.headers), ws: null })).status).toBe(200);
   });
 
   it('of two concurrent password changes only one wins', async () => {

@@ -207,7 +207,7 @@ describe('the instance operator in tenant workspaces (#67, #73)', () => {
 });
 
 describe('sessions (#51)', () => {
-  it('logout ends that session only; a password change ends the others and their sockets', async () => {
+  it('logout ends that session only; a password change ends the others and their sockets, and renews its own', async () => {
     await env.api('POST', '/api/workspace/members', { email: 'victima@tenant.com', name: 'Víctima', password: 'victima1234', role: 'admin' }, { cookie: op.cookie, ws: tenant.workspaceId });
     const a = await login('victima@tenant.com', 'victima1234');
     const b = await login('victima@tenant.com', 'victima1234');
@@ -222,22 +222,29 @@ describe('sessions (#51)', () => {
 
     const stolenRt = await joined(stolen.cookie, tenant.workspaceId);
     const bRt = await joined(b.cookie, tenant.workspaceId);
+    const bClosed = new Promise<string>((r) => bRt.s.on('disconnect', r));
     const changed = await env.api('PATCH', '/api/auth/me', { currentPassword: 'victima1234', password: 'nuevaClave123' }, asB);
     expect(changed.status).toBe(200);
     await sleep(200);
     expect(stolenRt.events.map((e) => e.event)).toContain('session:revoked');
     expect(stolenRt.s.connected).toBe(false);
-    expect(bRt.s.connected).toBe(true);
+    // B's own session goes on under a new cookie: its socket is told to reconnect, not to sign out
+    expect(await bClosed).toBe('transport close');
     expect(bRt.events.map((e) => e.event)).not.toContain('session:revoked');
+    const fresh = String([changed.headers['set-cookie']].flat().find((c) => String(c).startsWith('ll_token='))).split(';')[0];
+    expect(fresh).toMatch(/^ll_token=./);
+    const asFreshB = { cookie: fresh, ws: tenant.workspaceId };
     expect((await env.api('GET', '/api/contacts', undefined, { cookie: stolen.cookie, ws: tenant.workspaceId })).status).toBe(401);
     expect((await env.api('POST', '/api/api-keys', { name: 'robada' }, { cookie: stolen.cookie, ws: tenant.workspaceId })).status).toBe(401);
-    expect((await env.api('GET', '/api/contacts', undefined, asB)).status).toBe(200);
+    expect((await env.api('GET', '/api/contacts', undefined, asB)).status).toBe(401);
+    expect((await env.api('GET', '/api/contacts', undefined, asFreshB)).status).toBe(200);
+    const freshRt = await joined(fresh, tenant.workspaceId);
 
     // logging out also disconnects that session's sockets
-    await env.api('POST', '/api/auth/logout', undefined, asB);
+    await env.api('POST', '/api/auth/logout', undefined, asFreshB);
     await sleep(200);
-    expect(bRt.events.map((e) => e.event)).toContain('session:revoked');
-    expect(bRt.s.connected).toBe(false);
+    expect(freshRt.events.map((e) => e.event)).toContain('session:revoked');
+    expect(freshRt.s.connected).toBe(false);
   });
 
   it('rejects tokens without a session id', async () => {

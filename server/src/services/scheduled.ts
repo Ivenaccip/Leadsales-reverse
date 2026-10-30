@@ -4,7 +4,16 @@ import type { MessageRow } from '../types.js';
 import { isMetaThrottle } from '../whatsapp/types.js';
 import { renderTemplateParams, withRetryNote } from './broadcasts.js';
 import { getContact } from './contacts.js';
-import { abandonAutoRetry, isAwaitingRetry, isNetworkFailure, manualRetryText, sendMessage, type SendContent } from './messages.js';
+import {
+  abandonAutoRetry,
+  checkMediaHeader,
+  isAwaitingRetry,
+  isNetworkFailure,
+  manualRetryText,
+  sendingChannelId,
+  sendMessage,
+  type SendContent,
+} from './messages.js';
 
 export interface ScheduledRow {
   id: string;
@@ -24,6 +33,10 @@ const MAX_THROTTLE_RETRIES = 5;
 
 const INTERNAL_ERROR = 'No se pudo enviar por un error interno. Prográmalo de nuevo.';
 
+/** Meta's longest template name; language codes are a few characters (es_MX, pt_BR). */
+const MAX_TEMPLATE_NAME = 512;
+const MAX_TEMPLATE_LANGUAGE = 20;
+
 export async function scheduleMessage(
   ctx: AppContext,
   workspaceId: string,
@@ -32,8 +45,18 @@ export async function scheduleMessage(
   content: SendContent,
   sendAt: Date,
 ): Promise<ScheduledRow> {
-  await getContact(ctx.db, workspaceId, contactId);
+  const contact = await getContact(ctx.db, workspaceId, contactId);
   if (Number.isNaN(sendAt.getTime()) || sendAt.getTime() < Date.now() - 60_000) throw badRequest('La fecha de envío debe ser futura');
+  if (content.type === 'template') {
+    // The row keeps the content until it is sent, and every agent's list of scheduled messages
+    // returns it: bounded here, whatever the route accepted (the send checks the link only then).
+    if (content.name.length > MAX_TEMPLATE_NAME || content.language.length > MAX_TEMPLATE_LANGUAGE) {
+      throw badRequest('El nombre o el idioma de la plantilla es demasiado largo.', 'TEMPLATE_PARAMS_INVALID');
+    }
+    checkMediaHeader(content.params?.header);
+  }
+  // A conversation whose number was deleted with no number to stand in would only fail at send time.
+  await sendingChannelId(ctx.db, workspaceId, contact);
   // Row and job are stored together: a pending row without a job is an orphan (recoverOrphanedScheduled).
   return ctx.db.tx(async (q) => {
     const { rows } = await q.query<ScheduledRow>(
