@@ -1,7 +1,8 @@
 # LeadLibre en Fly.io: una sola máquina con un volumen en /data (base de datos embebida,
 # archivos y llaves). Paso a paso en docs/04-despliegue.md, "Fly.io".
 #
-# Cambia "leadlibre-tucomunidad" por el nombre de tu app (aquí y en PUBLIC_URL).
+# Cambia "leadlibre-tucomunidad" por el nombre de tu app. La dirección pública es
+# https://<app>.fly.dev; con dominio propio, agrega PUBLIC_URL en [env].
 app = "leadlibre-tucomunidad"
 # Dallas: la región de Fly más cercana a México. Lista: fly platform regions
 primary_region = "dfw"
@@ -10,8 +11,6 @@ primary_region = "dfw"
   dockerfile = "deploy/fly/Dockerfile"
 
 [env]
-  PUBLIC_URL = "https://leadlibre-tucomunidad.fly.dev"
-  PORT = "3000"
   DATA_DIR = "/data"
   ALLOW_SIGNUP = "true"
   BILLING_MODE = "meta_direct"
@@ -21,7 +20,7 @@ primary_region = "dfw"
   destination = "/data"
 
 [http_service]
-  internal_port = 3000
+  internal_port = 8080
   force_https = true
   # Siempre encendida y nunca más de una: el worker procesa los webhooks de Meta y los
   # programados en segundo plano, y el tiempo real (Socket.IO) requiere una sola réplica.

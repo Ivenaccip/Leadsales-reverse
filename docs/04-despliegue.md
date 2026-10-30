@@ -305,7 +305,8 @@ volumen de Fly al usuario `node` al arrancar).
    `fly auth login`. Fly pide una tarjeta.
 2. Clona el repositorio y entra a la carpeta.
 3. Elige un nombre único (por ejemplo `leadlibre-micomunidad`) y cámbialo en `fly.toml` en
-   `app` y en `PUBLIC_URL` (`https://leadlibre-micomunidad.fly.dev`).
+   `app`. La app escucha en el puerto 8080 y toma su dirección (`https://<app>.fly.dev`) del
+   nombre de la app, así que también funciona si la lanzas desde el panel web de Fly.
 4. Crea la app y su volumen (en la misma región que `primary_region`):
    ```bash
    fly apps create leadlibre-micomunidad
@@ -321,8 +322,8 @@ volumen de Fly al usuario `node` al arrancar).
    (sigue `03-conectar-whatsapp-meta.md`).
 
 Para actualizar: `git pull && fly deploy`. Para ver los logs: `fly logs`. Para tu propio
-dominio: `fly certs add crm.tudominio.com` y crea el registro DNS que te indique; luego cambia
-`PUBLIC_URL` en `fly.toml`, vuelve a desplegar y actualiza la URL del webhook en Meta.
+dominio: `fly certs add crm.tudominio.com` y crea el registro DNS que te indique; luego agrega
+`PUBLIC_URL = "https://crm.tudominio.com"` en `[env]` de `fly.toml`, vuelve a desplegar y actualiza la URL del webhook en Meta.
 
 ## Probar en local con Meta real
 
