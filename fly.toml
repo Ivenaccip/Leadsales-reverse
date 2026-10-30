@@ -1,41 +1,39 @@
-# LeadLibre en Fly.io: una sola máquina con un volumen en /data (base de datos embebida,
-# archivos y llaves). Paso a paso en docs/04-despliegue.md, "Fly.io".
+# fly.toml app configuration file generated for leadsales-reverse on 2026-10-30T15:37:28Z
 #
-# Cambia "leadlibre-tucomunidad" por el nombre de tu app (aquí y en PUBLIC_URL).
-app = "leadlibre-tucomunidad"
-# Dallas: la región de Fly más cercana a México. Lista: fly platform regions
-primary_region = "dfw"
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'leadsales-reverse'
+primary_region = 'ams'
 
 [build]
-  dockerfile = "deploy/fly/Dockerfile"
+  dockerfile = 'deploy/fly/Dockerfile'
 
 [env]
-  PUBLIC_URL = "https://leadlibre-tucomunidad.fly.dev"
-  PORT = "3000"
-  DATA_DIR = "/data"
-  ALLOW_SIGNUP = "true"
-  BILLING_MODE = "meta_direct"
+  ALLOW_SIGNUP = 'true'
+  BILLING_MODE = 'meta_direct'
+  DATA_DIR = '/data'
+  PORT = '3000'
+  PUBLIC_URL = 'https://leadlibre-tucomunidad.fly.dev'
 
 [[mounts]]
-  source = "leadlibre_data"
-  destination = "/data"
+  source = 'leadlibre_data'
+  destination = '/data'
 
 [http_service]
-  internal_port = 3000
+  internal_port = 8080
   force_https = true
-  # Siempre encendida y nunca más de una: el worker procesa los webhooks de Meta y los
-  # programados en segundo plano, y el tiempo real (Socket.IO) requiere una sola réplica.
-  auto_stop_machines = "off"
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
 
   [[http_service.checks]]
-    grace_period = "40s"
-    interval = "30s"
-    method = "GET"
-    path = "/health"
-    timeout = "5s"
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '40s'
+    method = 'GET'
+    path = '/health'
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "1gb"
+  size = 'shared-cpu-1x'
+  memory = '1gb'
