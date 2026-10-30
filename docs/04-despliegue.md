@@ -54,6 +54,35 @@ necesitas que los clientes lleguen directo al puerto (sin proxy), define
 `APP_BIND=0.0.0.0` y `TRUST_PROXY=false`; ten en cuenta que entonces los clientes IPv6
 siguen llegando desde la puerta de enlace y comparten los límites: usa el perfil `https`.
 
+### Comprobar una instalación nueva
+
+Antes de abrirla a la comunidad puedes comprobar, sin un número real ni gastar con Meta, que
+la imagen que construiste cobra como debe. `deploy/smoke/creditos.mjs` (Node.js 20+, sin
+dependencias) levanta una Graph API de Meta simulada y recorre el modelo completo: la
+operadora vende créditos a un negocio prepagado y le conecta su número, una clienta escribe,
+las respuestas en la ventana de 24 h no cuestan, una plantilla se cobra a la tarifa de Meta y
+se concilia con su webhook, las fallas se reembolsan una sola vez, otro negocio no puede
+falsificar estados para mover ese saldo, sin créditos no sale ninguna plantilla ni difusión,
+el libro de créditos cuadra con el saldo y un negocio `meta_direct` envía sin saldo.
+
+Córrela en una instancia **vacía** de prueba (crea cuentas de ejemplo; se niega a correr si
+la instancia ya tiene usuarios), nunca en la de producción:
+
+```bash
+docker build -t leadlibre:prueba .
+SECRETO=$(openssl rand -hex 24)
+docker run -d --name leadlibre-prueba --network host -v leadlibre-prueba:/data \
+  -e PORT=3322 -e PUBLIC_URL=http://127.0.0.1:3322 -e ALLOW_SIGNUP=true \
+  -e META_APP_SECRET=$SECRETO -e META_GRAPH_BASE_URL=http://127.0.0.1:4499 leadlibre:prueba
+node deploy/smoke/creditos.mjs http://127.0.0.1:3322 4499 $SECRETO
+# Opcional: reinicia y comprueba que el saldo y los chats siguen ahí (usa el saldo final que imprimió).
+docker restart leadlibre-prueba && sleep 8
+node deploy/smoke/creditos.mjs http://127.0.0.1:3322 4499 $SECRETO after-restart <saldo final>
+docker rm -f leadlibre-prueba && docker volume rm leadlibre-prueba
+```
+
+Cada paso imprime ✔ o ✘ y al final `TODO BIEN` (código de salida 0) o el número de fallas.
+
 ### Actualizar
 
 ```bash
