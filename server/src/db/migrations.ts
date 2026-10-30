@@ -567,6 +567,12 @@ INSERT INTO job_wakeups (lane, workspace_id, run_at)
 ALTER TABLE job_wakeups SET (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);
 `;
 
+const reviewSix = `
+-- A fair claim folds, besides its window, the due wakeups of the window's workspaces further on
+-- (Worker.claimFair): found per workspace here, never by walking every wakeup.
+CREATE INDEX IF NOT EXISTS job_wakeups_ws ON job_wakeups (lane, workspace_id, run_at);
+`;
+
 export const migrations: { name: string; sql: string }[] = [
   { name: '001_init', sql: init },
   { name: '002_rate_card_seed', sql: seedRates },
@@ -575,4 +581,5 @@ export const migrations: { name: string; sql: string }[] = [
   { name: '005_review_three', sql: reviewThree },
   { name: '006_review_four', sql: reviewFour },
   { name: '007_review_five', sql: reviewFive },
+  { name: '008_review_six', sql: reviewSix },
 ];

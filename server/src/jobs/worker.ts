@@ -93,8 +93,9 @@ const yieldToEventLoop = () => new Promise<void>((r) => setImmediate(r));
 // Waits between tries of a job's final write, so a short database blip does not strand the job.
 const RECORD_RETRY_MS = [250, 1000, 3000];
 const USAGE_HALF_LIFE_MS = 60_000;
-// Most due wakeups one fair claim reads (see claimFair).
+// Most due wakeups one fair claim reads, and most it folds beyond them (see claimFair).
 const FAIR_WINDOW = 256;
+const FOLD_AHEAD = 8192;
 const decayed = (u: { ms: number; at: number } | undefined, now: number) => (u ? u.ms * 0.5 ** ((now - u.at) / USAGE_HALF_LIFE_MS) : 0);
 
 /**
@@ -328,6 +329,11 @@ export class Worker {
     // folded: one stays for each workspace that still has ready jobs, and a workspace whose ready
     // jobs are gone gets one at its next job's run_at. A claim reads at most FAIR_WINDOW of them,
     // going on where the last full one stopped, so every workspace with ready jobs is reached in turn.
+    // A backlog is a wakeup per job: the claim also folds up to FOLD_AHEAD due wakeups of the same
+    // workspaces further on, or backlogs interleaved with each other would fill window after window
+    // and a workspace whose job just became ready would wait for the claims to walk through them.
+    // Only wakeups this claim sees go (a job made ready after it began brings a wakeup it does not
+    // see), and only when the workspace keeps one or has nothing ready, as for the window's own.
     const from = lane.wakeFrom;
     const { rows: found } = await this.ctx.db.query<{
       read: number;
@@ -349,7 +355,15 @@ export class Worker {
          FROM heads h
        ),
        folded AS (
-         DELETE FROM job_wakeups WHERE id = ANY(ARRAY(SELECT id FROM due EXCEPT SELECT wakeup FROM ws WHERE next <= now())) RETURNING id
+         DELETE FROM job_wakeups WHERE id = ANY(
+           ARRAY(SELECT id FROM due EXCEPT SELECT wakeup FROM ws WHERE next <= now())
+           || ARRAY(
+             SELECT w.id FROM job_wakeups w JOIN ws ON ws.id = w.workspace_id
+             WHERE w.lane = $1 AND w.run_at <= now() AND (w.run_at, w.id) > ($2::timestamptz, $3::bigint) AND w.id <> ALL(ARRAY(SELECT id FROM due))
+             LIMIT $5
+             FOR UPDATE OF w SKIP LOCKED
+           )
+         ) RETURNING id
        ),
        later AS (
          INSERT INTO job_wakeups (lane, workspace_id, run_at) SELECT $1, id, next FROM ws WHERE next > now()
@@ -362,14 +376,16 @@ export class Worker {
             'running', (SELECT count(*) FROM jobs r WHERE r.lane = $1 AND r.status = 'running' AND r.workspace_id = w.id),
             'account', (SELECT m.user_id FROM memberships m WHERE m.workspace_id = w.id AND m.role = 'owner' ORDER BY m.created_at LIMIT 1)))
           FROM ws w WHERE w.next <= now()) AS owners`,
-      [lane.name, from?.at ?? '-infinity', from?.id ?? '0', FAIR_WINDOW],
+      [lane.name, from?.at ?? '-infinity', from?.id ?? '0', FAIR_WINDOW, FOLD_AHEAD],
     );
     // After a full window the next claim reads on from it, and the pump does so right away when this
     // one folded wakeups away (a burst, or the leftovers of jobs already run): each such pass consumes
-    // some. A window that was not full reached the end: the next claim starts over.
+    // some. A window that was not full reached the end: the next claim starts over, also right away
+    // when this one began further on (the wakeups kept behind it are likely all there is left, the
+    // ones ahead having been folded).
     const full = (found[0]?.read ?? 0) >= FAIR_WINDOW;
     lane.wakeFrom = full ? found[0].last : null;
-    lane.more = full && found[0].folded > 0;
+    lane.more = full ? found[0].folded > 0 : from !== null;
     this.wakeupsFolded += found[0]?.folded ?? 0;
     const owners = found[0]?.owners ?? [];
     const now = Date.now();

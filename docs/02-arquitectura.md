@@ -162,7 +162,11 @@ en cuanto se libera un lugar, así que un trabajo lento no detiene a los demás.
   trabajos listos, cada carril lee `job_wakeups` (una fila cada vez que un trabajo de un
   espacio se puede tomar, escrita por un trigger sobre `jobs`), no todos los espacios con
   trabajos en cola: los que solo tienen trabajos para más adelante (programados a meses,
-  webhooks esperando su reintento) no le cuestan nada a cada toma.
+  webhooks esperando su reintento) no le cuestan nada a cada toma. Cada toma lee como
+  máximo 256 de esas filas y, de los espacios que encontró, junta también las que tienen
+  más adelante: así el rezago de unos cuantos espacios intercalados no llena ventana tras
+  ventana, y un espacio cuyo trabajo acaba de quedar listo recibe uno de los siguientes
+  lugares que se liberen.
 - **Un contacto a la vez.** `automation.inbound` y `ai.reply` de un mismo contacto
   comparten `serial_key` (`contact:<id>`) y nunca corren al mismo tiempo: leen el estado
   del bot o la conversación y luego actúan sobre ella. Solo el primer trabajo pendiente de

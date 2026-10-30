@@ -220,6 +220,10 @@ Si vienes de una versión sin la migración `007_review_five` (por ejemplo `2577
   quedar debajo). La exportación CSV se envía por partes, ahora ordenada por teléfono, sin
   detener la instancia aunque el espacio sea grande.
 
+Si vienes de una versión sin la migración `008_review_six` (por ejemplo `d560456`): la
+`008` solo agrega un índice a `job_wakeups` para que el worker reparta mejor los lugares
+cuando varios espacios tienen trabajos acumulados; no requiere nada de tu parte.
+
 #### Verificar los números de espacios prepagados
 
 Para cada número desactivado, abre el espacio (**Administración → Abrir**) y, en
